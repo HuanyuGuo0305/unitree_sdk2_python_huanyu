@@ -1,0 +1,38 @@
+policy_path: "exported_policy/b2_locomotion/policy.onnx"
+
+# default angles in policy order
+
+# FL_hip_joint, FR_hip_joint, RL_hip_joint, RR_hip_joint
+# FL_thigh_joint, FR_thigh_joint, RL_thigh_joint, RR_thigh_joint
+# FL_calf_joint, FR_calf_joint, RL_calf_joint, RR_calf_joint
+
+default_angles: [
+   0.1, -0.1,  0.1, -0.1,   
+   0.8,  0.8,  1.0,  1.0,   
+  -1.5, -1.5, -1.5, -1.5    
+]
+
+# PD gains in policy order
+kps: [
+  150.0, 150.0, 150.0,
+  150.0, 150.0, 150.0,
+  150.0, 150.0, 150.0,
+  150.0, 150.0, 150.0
+]
+
+kds: [
+  5.0, 5.0, 5.0,
+  5.0, 5.0, 5.0,
+  5.0, 5.0, 5.0,
+  5.0, 5.0, 5.0
+]
+
+num_actions: 12          
+action_scale: 0.25     
+num_obs: 45
+num_history: 5
+num_commands: 3
+
+simulation_dt: 0.005
+control_decimation: 4
+control_dt: 0.02

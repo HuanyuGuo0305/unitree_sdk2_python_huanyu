@@ -86,7 +86,7 @@ class B2Controller:
         print("ONNX input :", self.input_name, self.session.get_inputs()[0].shape)
         print("ONNX output:", self.output_name, self.session.get_outputs()[0].shape)
 
-        # 4) States / Buffer
+        # 4) Controller / States / Buffer
         self.remote_controller = RemoteController()
 
         self.actions = np.zeros(self.num_actions, dtype=np.float32)
@@ -136,8 +136,8 @@ class B2Controller:
     def low_state_handler(self, msg: LowStateGo):
         """Called every time robot published its lowstate message through rt/lowstate channel."""
         self.low_state = msg
-        self.level_flag_ = msg.level_flag
-        self.remote_controller.set(self.low_state.wireless_remote)
+        self.level_flag_ = msg.level_flag  # 0xFF means all good    
+        self.remote_controller.set(msg.wireless_remote)
     
     def wait_for_low_state(self):
         """Block until the first lowstate message is received."""

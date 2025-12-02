@@ -1,6 +1,13 @@
 """
 B2 sim2real deloyment script for locomotion tasks.
 """
+import os
+import sys
+
+# Ensure the repository root (parent of `deploy`) is on sys.path so
+# sibling packages like `utils` are importable when running this script
+# directly from the `deploy/` directory.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
 import time
@@ -38,11 +45,13 @@ class B2Controller:
 
         # In policy order
         self.default_angles = np.array(config["default_angles"], dtype=np.float32)
+        self.squat_angles = np.array(config["squat_angles"], dtype=np.float32)
         self.kps = np.array(config["kps"], dtype=np.float32)
         self.kds = np.array(config["kds"], dtype=np.float32)
+        self.kps_pos = np.array(config["kps_pos"], dtype=np.float32)
+        self.kds_pos = np.array(config["kds_pos"], dtype=np.float32)
         self.num_actions = config["num_actions"]
         self.action_scale = np.array(config["action_scale"], dtype=np.float32)
-        self.num_obs = config["num_obs"]
         self.num_history = config.get("num_history", 5)
         self.num_commands = config["num_commands"]
         if "control_dt" in config:
@@ -63,8 +72,8 @@ class B2Controller:
         hardware_joint_names = [
             "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
             "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+            "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
             "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
-            "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint"
         ]
 
         self.hardware_to_policy_joint_indices = [
@@ -78,6 +87,8 @@ class B2Controller:
 
         self.kps_hw = self.kps[self.policy_to_hardware_joint_indices]
         self.kds_hw = self.kds[self.policy_to_hardware_joint_indices]
+        self.kps_pos_hw = self.kps_pos[self.policy_to_hardware_joint_indices]
+        self.kds_pos_hw = self.kds_pos[self.policy_to_hardware_joint_indices]
         
         # 3) ONNX session
         self.session = ort.InferenceSession(self.policy_path)
@@ -101,6 +112,7 @@ class B2Controller:
         self.joint_vel = np.zeros(self.num_actions, dtype=np.float32)
 
         self.default_joint_pos = self.default_angles.copy()  # In policy order
+        self.squat_joint_pos = self.squat_angles.copy()    # In policy order
 
         # History buffer
         self.history_length = self.num_history
@@ -234,7 +246,36 @@ class B2Controller:
             self.send_cmd()
             time.sleep(self.control_dt)
         print("[B2Controller] START pressed, exiting zero torque state.")
-    
+
+    def move_to_squat_pose(self, duration: float = 2.0):
+        print("[B2Controller] Moving to squat pose...")
+        num_steps = int(duration / self.control_dt)
+        
+        init_dof_pos_hw = np.zeros(self.num_dof, dtype=np.float32)
+        for i in range(self.num_dof):
+            init_dof_pos_hw[i] = self.low_state.motor_state[i].q
+        
+        init_dof_pos_policy = init_dof_pos_hw[self.hardware_to_policy_joint_indices]
+
+        for step in range(num_steps):
+            alpha = (step + 1) / num_steps
+            target_dof_pos_policy = (
+                init_dof_pos_policy * (1.0 - alpha) + self.squat_joint_pos * alpha
+            )
+            target_dof_pos_hw = target_dof_pos_policy[self.policy_to_hardware_joint_indices]
+            
+            for i in range(self.num_dof):
+                self.low_cmd.motor_cmd[i].q = float(target_dof_pos_hw[i])
+                self.low_cmd.motor_cmd[i].qd = 0.0
+                self.low_cmd.motor_cmd[i].kp = float(self.kps_pos_hw[i])
+                self.low_cmd.motor_cmd[i].kd = float(self.kds_pos_hw[i])
+                self.low_cmd.motor_cmd[i].tau = 0.0
+
+            self.send_cmd()
+            time.sleep(self.control_dt)
+
+        print("[B2Controller] Reached squat pose.")
+
     def move_to_default_pose(self, duration: float = 2.0):
         print("[B2Controller] Moving to default pose...")
         num_steps = int(duration / self.control_dt)
@@ -255,8 +296,8 @@ class B2Controller:
             for i in range(self.num_dof):
                 self.low_cmd.motor_cmd[i].q = float(target_dof_pos_hw[i])
                 self.low_cmd.motor_cmd[i].qd = 0.0
-                self.low_cmd.motor_cmd[i].kp = float(self.kps_hw[i])
-                self.low_cmd.motor_cmd[i].kd = float(self.kds_hw[i])
+                self.low_cmd.motor_cmd[i].kp = float(self.kps_pos_hw[i])
+                self.low_cmd.motor_cmd[i].kd = float(self.kds_pos_hw[i])
                 self.low_cmd.motor_cmd[i].tau = 0.0
 
             self.send_cmd()
@@ -264,6 +305,25 @@ class B2Controller:
 
         print("[B2Controller] Reached default pose.")
     
+    def squat_pos_state(self):
+        """Stay at squat pose until A button is pressed."""
+        print("[B2Controller] Holding squat pose. Press A to go to default pose...")
+        target_dof_pos_policy = self.squat_angles.copy()
+        target_dof_pos_hw = target_dof_pos_policy[self.policy_to_hardware_joint_indices]
+
+        while self.remote_controller.button[KeyMap.A] != 1:
+            for i in range(self.num_dof):
+                self.low_cmd.motor_cmd[i].q = float(target_dof_pos_hw[i])
+                self.low_cmd.motor_cmd[i].qd = 0.0
+                self.low_cmd.motor_cmd[i].kp = float(self.kps_pos_hw[i])
+                self.low_cmd.motor_cmd[i].kd = float(self.kds_pos_hw[i])
+                self.low_cmd.motor_cmd[i].tau = 0.0
+            self.send_cmd()
+            time.sleep(self.control_dt)
+
+        print("[B2Controller] A pressed, go to default.")
+
+
     def default_pos_state(self):
         """Stay at default pose until A button is pressed."""
         print("[B2Controller] Holding default pose. Press A to start RL locomotion...")
@@ -274,8 +334,8 @@ class B2Controller:
             for i in range(self.num_dof):
                 self.low_cmd.motor_cmd[i].q = float(target_dof_pos_hw[i])
                 self.low_cmd.motor_cmd[i].qd = 0.0
-                self.low_cmd.motor_cmd[i].kp = float(self.kps_hw[i])
-                self.low_cmd.motor_cmd[i].kd = float(self.kds_hw[i])
+                self.low_cmd.motor_cmd[i].kp = float(self.kps_pos_hw[i])
+                self.low_cmd.motor_cmd[i].kd = float(self.kds_pos_hw[i])
                 self.low_cmd.motor_cmd[i].tau = 0.0
             self.send_cmd()
             time.sleep(self.control_dt)
@@ -292,13 +352,6 @@ class B2Controller:
         - map action to joint targets
         - send lowcmd
         """
-
-        if getattr(self, "level_flag_", 0) != 0xFF:
-            create_zero_cmd(self.low_cmd)
-            self.send_cmd()
-            time.sleep(self.control_dt)
-            print("[B2Controller] Level flag not OK, sending zero torque command.")
-            return
 
         # 1) Read sensors
         self._read_sensors_once()
@@ -358,6 +411,12 @@ class B2Controller:
             self.low_cmd.motor_cmd[i].kd = float(self.kds_hw[i])
             self.low_cmd.motor_cmd[i].tau = 0.0
 
+        # # print target_dof_pos_hw
+        # print("control sent:")
+        # print(target_dof_pos_hw)
+        # print("---")
+
+
         # 9) send command
         self.send_cmd()
         self.counter += 1
@@ -388,6 +447,12 @@ if __name__ == "__main__":
 
     # Enter zero torque state, wait for START
     controller.zero_torque_state()
+
+    # Smoothly move to default pose
+    controller.move_to_squat_pose()
+
+    # wait at squat pose, press A to continue
+    controller.squat_pos_state()
 
     # Smoothly move to default pose
     controller.move_to_default_pose()

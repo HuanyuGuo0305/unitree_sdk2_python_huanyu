@@ -1,12 +1,15 @@
 """
 B2 sim2real deloyment script for locomotion tasks.
 """
+
+
 import os
 import sys
-
-# Ensure the repository root (parent of `deploy`) is on sys.path so
-# sibling packages like `utils` are importable when running this script
-# directly from the `deploy/` directory.
+"""
+Ensure the repository root (parent of 'deploy/) is on sys.path 
+so sibling packages like 'utils' are importable when running this
+script directly from the 'deploy/' directory.
+"""
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
@@ -410,12 +413,6 @@ class B2Controller:
             self.low_cmd.motor_cmd[i].kp = float(self.kps_hw[i])
             self.low_cmd.motor_cmd[i].kd = float(self.kds_hw[i])
             self.low_cmd.motor_cmd[i].tau = 0.0
-
-        # # print target_dof_pos_hw
-        # print("control sent:")
-        # print(target_dof_pos_hw)
-        # print("---")
-
 
         # 9) send command
         self.send_cmd()

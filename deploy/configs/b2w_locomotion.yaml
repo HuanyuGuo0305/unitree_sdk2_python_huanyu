@@ -1,0 +1,61 @@
+policy_path: "exported_policies/b2w_locomotion/policy.onnx"
+
+# In policy order
+
+# FL_hip_joint, FR_hip_joint, RL_hip_joint, RR_hip_joint
+# FL_thigh_joint, FR_thigh_joint, RL_thigh_joint, RR_thigh_joint
+# FL_calf_joint, FR_calf_joint, RL_calf_joint, RR_calf_joint
+# FL_wheel_joint, FR_wheel_joint, RL_wheel_joint, RR_wheel_joint
+
+squat_angles: [
+   0.1,  -0.1,   0.1,  -0.1,   
+   1.57,  1.57,  1.57,  1.57,   
+  -2.65, -2.65, -2.65, -2.65,
+   0.0,   0.0,   0.0,   0.0    
+]
+
+default_angles: [
+   0.1, -0.1,  0.1, -0.1,   
+   0.8,  0.8,  1.0,  1.0,   
+  -1.5, -1.5, -1.5, -1.5,
+   0.0,  0.0,  0.0,  0.0    
+]
+
+# PD gains in policy order
+kps: [
+  150.0, 150.0, 150.0, 150.0, 
+  150.0, 150.0, 150.0, 150.0, 
+  150.0, 150.0, 150.0, 150.0,
+    0.0,   0.0,   0.0,   0.0
+]
+
+kds: [
+  5.0, 5.0, 5.0, 5.0, 
+  5.0, 5.0, 5.0, 5.0, 
+  5.0, 5.0, 5.0, 5.0,
+  1.0, 1.0, 1.0, 1.0
+]
+
+kps_pos: [
+  500.0, 500.0, 500.0, 500.0, 
+  500.0, 500.0, 500.0, 500.0, 
+  500.0, 500.0, 500.0, 500.0,
+    0.0,   0.0,   0.0,   0.0
+]
+
+kds_pos: [
+  10.0, 10.0, 10.0, 10.0, 
+  10.0, 10.0, 10.0, 10.0, 
+  10.0, 10.0, 10.0, 10.0,
+   1.0,  1.0,  1.0,  1.0
+]
+
+num_actions: 16
+leg_action_scale: 0.25
+wheel_action_scale: 5.0              
+num_history: 5
+num_commands: 3
+
+simulation_dt: 0.005
+control_decimation: 4
+control_dt: 0.02

@@ -129,7 +129,8 @@ class B2WController:
             self.wheel_kps_hw[hw_idx] = self.kps_hw[hw_idx]
             self.wheel_kds_hw[hw_idx] = self.kds_hw[hw_idx]
         
-        # Wheel: hardware index -> wheel cmd index [0..3]
+        # Wheel: hardware index -> wheel cmd index [0..3] in policy order
+        # {13:0, 12:1, 15:2, 14:3} indexes in hardware order
         self.hw_to_wheel_cmd_indices = {
             self.hardware_joint_names.index(name): idx
             for idx, name in enumerate(self.wheel_joint_names)

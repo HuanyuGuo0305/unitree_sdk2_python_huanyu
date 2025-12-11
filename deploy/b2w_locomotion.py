@@ -33,7 +33,7 @@ from unitree_sdk2py.idl.default import (
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_ as LowCmdGo
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_ as LowStateGo
 
-from utils.command_helper import create_damping_cmd, create_zero_cmd, init_rl_cmd_go
+from utils.command_helper import create_damping_cmd, create_zero_cmd, init_rl_cmd_go, InitLowCmd
 from utils.remote_controller import RemoteController, KeyMap
 from utils.math import quat_rotate_inverse_numpy as quat_rotate_inverse_np
 
@@ -190,7 +190,8 @@ class B2WController:
         self.wait_for_low_state()
 
         # Initialize cmd
-        init_rl_cmd_go(self.low_cmd)
+        # init_rl_cmd_go(self.low_cmd)
+        InitLowCmd(self.low_cmd)
 
         # Initialize history buffer
         self._init_history_with_current_state()
@@ -325,14 +326,14 @@ class B2WController:
                 # Legs: position control
                 if i in self.leg_hardware_indices:  # first 12 joints
                     self.low_cmd.motor_cmd[i].q = float(target_dof_pos_hw[i])
-                    self.low_cmd.motor_cmd[i].qd = 0.0
+                    self.low_cmd.motor_cmd[i].dq = 0.0
                     self.low_cmd.motor_cmd[i].kp = float(self.kps_pos_hw[i])
                     self.low_cmd.motor_cmd[i].kd = float(self.kds_pos_hw[i])
                     self.low_cmd.motor_cmd[i].tau = 0.0
                 # Wheels: keep stopped
                 else:
                     self.low_cmd.motor_cmd[i].q = 0.0
-                    self.low_cmd.motor_cmd[i].qd = 0.0
+                    self.low_cmd.motor_cmd[i].dq = 0.0
                     self.low_cmd.motor_cmd[i].kp = float(self.wheel_kps_hw[i])
                     self.low_cmd.motor_cmd[i].kd = float(self.wheel_kds_hw[i])
                     self.low_cmd.motor_cmd[i].tau = 0.0
@@ -363,14 +364,14 @@ class B2WController:
                 # Legs: position control
                 if i in self.leg_hardware_indices:  # first 12 joints
                     self.low_cmd.motor_cmd[i].q = float(target_dof_pos_hw[i])
-                    self.low_cmd.motor_cmd[i].qd = 0.0
+                    self.low_cmd.motor_cmd[i].dq = 0.0
                     self.low_cmd.motor_cmd[i].kp = float(self.kps_pos_hw[i])
                     self.low_cmd.motor_cmd[i].kd = float(self.kds_pos_hw[i])
                     self.low_cmd.motor_cmd[i].tau = 0.0
                 # Wheels: keep stopped
                 else:
                     self.low_cmd.motor_cmd[i].q = 0.0
-                    self.low_cmd.motor_cmd[i].qd = 0.0
+                    self.low_cmd.motor_cmd[i].dq = 0.0
                     self.low_cmd.motor_cmd[i].kp = float(self.wheel_kps_hw[i])
                     self.low_cmd.motor_cmd[i].kd = float(self.wheel_kds_hw[i])
                     self.low_cmd.motor_cmd[i].tau = 0.0
@@ -390,13 +391,13 @@ class B2WController:
             for i in range(self.num_dof):
                 if i in self.leg_hardware_indices:
                     self.low_cmd.motor_cmd[i].q = float(target_dof_pos_hw[i])
-                    self.low_cmd.motor_cmd[i].qd = 0.0
+                    self.low_cmd.motor_cmd[i].dq = 0.0
                     self.low_cmd.motor_cmd[i].kp = float(self.kps_pos_hw[i])
                     self.low_cmd.motor_cmd[i].kd = float(self.kds_pos_hw[i])
                     self.low_cmd.motor_cmd[i].tau = 0.0
                 else:
                     self.low_cmd.motor_cmd[i].q = 0.0
-                    self.low_cmd.motor_cmd[i].qd = 0.0
+                    self.low_cmd.motor_cmd[i].dq = 0.0
                     self.low_cmd.motor_cmd[i].kp = float(self.wheel_kps_hw[i])
                     self.low_cmd.motor_cmd[i].kd = float(self.wheel_kds_hw[i])
                     self.low_cmd.motor_cmd[i].tau = 0.0
@@ -415,13 +416,13 @@ class B2WController:
             for i in range(self.num_dof):
                 if i in self.leg_hardware_indices:
                     self.low_cmd.motor_cmd[i].q = float(target_dof_pos_hw[i])
-                    self.low_cmd.motor_cmd[i].qd = 0.0
+                    self.low_cmd.motor_cmd[i].dq = 0.0
                     self.low_cmd.motor_cmd[i].kp = float(self.kps_pos_hw[i])
                     self.low_cmd.motor_cmd[i].kd = float(self.kds_pos_hw[i])
                     self.low_cmd.motor_cmd[i].tau = 0.0
                 else:
                     self.low_cmd.motor_cmd[i].q = 0.0
-                    self.low_cmd.motor_cmd[i].qd = 0.0
+                    self.low_cmd.motor_cmd[i].dq = 0.0
                     self.low_cmd.motor_cmd[i].kp = float(self.wheel_kps_hw[i])
                     self.low_cmd.motor_cmd[i].kd = float(self.wheel_kds_hw[i])
                     self.low_cmd.motor_cmd[i].tau = 0.0
@@ -507,7 +508,7 @@ class B2WController:
             # Legs: postition control
             if i in self.leg_hardware_indices:
                 self.low_cmd.motor_cmd[i].q = float(target_dof_pos_hw[i])
-                self.low_cmd.motor_cmd[i].qd = 0.0
+                self.low_cmd.motor_cmd[i].dq = 0.0
                 self.low_cmd.motor_cmd[i].kp = float(self.kps_hw[i])
                 self.low_cmd.motor_cmd[i].kd = float(self.kds_hw[i])
                 self.low_cmd.motor_cmd[i].tau = 0.0
@@ -518,7 +519,7 @@ class B2WController:
                 vel_cmd = float(self.wheel_vel_cmds[wheel_idx])  # desired wheel velocity
 
                 self.low_cmd.motor_cmd[i].q = 0.0
-                self.low_cmd.motor_cmd[i].qd = vel_cmd
+                self.low_cmd.motor_cmd[i].dq = vel_cmd
                 self.low_cmd.motor_cmd[i].kp = float(self.wheel_kps_hw[i])
                 self.low_cmd.motor_cmd[i].kd = float(self.wheel_kds_hw[i])
                 self.low_cmd.motor_cmd[i].tau = 0.0

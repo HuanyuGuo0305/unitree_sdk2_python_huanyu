@@ -1,6 +1,6 @@
 # Paths
 policy_path: "exported_policies/b2wz1_locomanipulation/policy.onnx"
-ee_command_path: "utilities/tools/reachable_kp0kp1kp2_lb.npy"
+ee_command_path: "utils/reachable_kp0kp1kp2_lb.npy"
 
 # Path to z1_sdk/lib that contains:
 #   unitree_arm_interface.cpython-*.so

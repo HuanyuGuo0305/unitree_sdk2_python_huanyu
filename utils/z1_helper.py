@@ -31,13 +31,13 @@ def resolve_path(path_str: str, project_root: str) -> str:
 
 def rotmat_from_rpy_xyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
     """
-    Build rotation matrix from roll-pitch-yaw.
+    Build a rotation matrix from roll-pitch-yaw.
 
-    Convention used here:
+    Convention:
         R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
 
-    This is the common fixed-axis roll-pitch-yaw composition and is safer for
-    configuration-driven extrinsics.
+    This is the standard fixed-axis XYZ-roll-pitch-yaw composition used
+    for configuration-driven extrinsics.
     """
     sr, cr = np.sin(roll), np.cos(roll)
     sp, cp = np.sin(pitch), np.cos(pitch)
@@ -69,7 +69,9 @@ class PresampledKeypointsInterpolateCommandLBSim:
     """
     Single-environment NumPy version of PresampledKeypointsInterpolateCommandLB.
 
-    This is intentionally kept numerically aligned with the MuJoCo sim2sim helper.
+    This helper is intentionally kept numerically aligned with the MuJoCo
+    sim2sim helper so that EE command generation remains consistent between
+    simulation and deployment.
     """
 
     def __init__(
@@ -168,13 +170,24 @@ class PresampledKeypointsInterpolateCommandLBSim:
 
 class Z1ArmAdapter:
     """
-    Thin helper around Unitree Z1 Python binding.
+    Thin helper around the modified Unitree Z1 Python binding.
 
-    Design goals:
-    - Keep deployment loop close to official `example_lowcmd.py`
-    - Use SDK FK (`forwardKinematics(q, 6)`) as the raw EE frame
-    - Apply a fixed transform from SDK EE frame -> policy EE frame (gripperStator)
-    - Keep manual `sendRecv()` in the 50 Hz main control loop
+    Main design goals:
+    1. Keep arm FK / state reading in the same helper as before.
+    2. Change the command semantics so they are much closer to the training
+       control law used in sim2sim:
+            - external target q
+            - external kp / kd
+            - qd_cmd usually zero
+            - tau_ff usually zero
+    3. Avoid the old deployment behavior:
+            - qd_cmd from finite difference of target q
+            - tau_cmd from inverseDynamics(...)
+       because that behaves more like trajectory tracking than the training-time
+       PD controller.
+    4. Support different gain sets for:
+            - startup / hold / move-to-default
+            - runtime policy control
     """
 
     def __init__(self, cfg: dict, project_root: str):
@@ -190,21 +203,62 @@ class Z1ArmAdapter:
         self.ee_index = int(cfg.get("z1_fk_ee_index", 6))
         self.control_dt = float(cfg["control_dt"])
 
-        # Fixed transform: B2W base_link -> arm_base
+        # Fixed transforms used by policy EE computation
+        # base_link -> arm_base
         self.arm_base_pos_in_base = np.array(cfg["arm_base_offset_pos"], dtype=np.float32).reshape(3,)
         arm_base_rpy = np.array(cfg["arm_base_offset_rpy"], dtype=np.float32).reshape(3,)
         self.arm_base_rot_in_base = rotmat_from_rpy_xyz(*arm_base_rpy)
 
-        # Fixed transform: SDK EE frame -> policy EE frame (gripperStator)
+        # SDK_EE -> policy_EE (for example gripperStator)
         self.sdk_ee_to_policy_pos = np.array(cfg["z1_fk_to_policy_ee_pos"], dtype=np.float32).reshape(3,)
         sdk_ee_to_policy_rpy = np.array(cfg["z1_fk_to_policy_ee_rpy"], dtype=np.float32).reshape(3,)
         self.sdk_ee_to_policy_rot = rotmat_from_rpy_xyz(*sdk_ee_to_policy_rpy)
 
+        # Default commanded pose
         self.default_arm_pos = np.array(cfg["default_arm_pos"], dtype=np.float32).reshape(6,)
         self.default_gripper_pos = float(cfg["default_gripper_pos"])
 
+        # Explicit external gains for startup / runtime
+        self.arm_kps_startup = np.array(
+            cfg.get("arm_kps_startup", [60.0, 80.0, 60.0, 40.0, 30.0, 20.0]),
+            dtype=np.float32,
+        ).reshape(6,)
+        self.arm_kds_startup = np.array(
+            cfg.get("arm_kds_startup", [4.0, 5.0, 4.0, 3.0, 2.0, 2.0]),
+            dtype=np.float32,
+        ).reshape(6,)
+        self.arm_kps_runtime = np.array(
+            cfg.get("arm_kps_runtime", [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]),
+            dtype=np.float32,
+        ).reshape(6,)
+        self.arm_kds_runtime = np.array(
+            cfg.get("arm_kds_runtime", [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]),
+            dtype=np.float32,
+        ).reshape(6,)
+
+        # ------------------------------------------------------------------
+        # Command mode options
+        #
+        # arm_qd_mode:
+        #   "zero"        -> qd_cmd = 0
+        #   "finite_diff" -> qd_cmd = (q_cmd - prev_q_cmd) / dt
+        #
+        # arm_tau_mode:
+        #   "zero"        -> tau_ff = 0
+        #   "gravity"     -> inverseDynamics(q, 0, 0, 0)
+        #   "full_id"     -> inverseDynamics(q, qd_cmd, 0, 0)
+        #
+        # For training alignment, the recommended default is:
+        #   arm_qd_mode  = "zero"
+        #   arm_tau_mode = "zero"
+        # ------------------------------------------------------------------
+        self.arm_qd_mode = str(cfg.get("arm_qd_mode", "zero"))
+        self.arm_tau_mode = str(cfg.get("arm_tau_mode", "zero"))
+
+        # Runtime state cache
         self.arm = None
         self.arm_model = None
+        self.lowcmd = None
 
         self.q = np.zeros(6, dtype=np.float32)
         self.qd = np.zeros(6, dtype=np.float32)
@@ -213,18 +267,39 @@ class Z1ArmAdapter:
 
         self.prev_q_cmd = self.default_arm_pos.copy()
 
+        # Track the last applied gains so we only push them when changed.
+        self._last_applied_kp = None
+        self._last_applied_kd = None
+
         print(f"[Z1ArmAdapter] z1_sdk_lib = {z1_sdk_lib}")
 
+    # Connection / state
     def connect(self):
-        """Create the Python arm object and switch to LOWCMD FSM."""
+        """
+        Create the Python arm object and switch to LOWCMD FSM.
+
+        This helper assumes the lowcmd-capable Python binding has already been
+        rebuilt so that:
+            arm._ctrlComp.lowcmd
+        is accessible from Python.
+        """
         self.arm = self.unitree_arm_interface.ArmInterface(self.has_gripper)
         self.arm_model = self.arm._ctrlComp.armModel
+        self.lowcmd = self.arm._ctrlComp.lowcmd
 
-        # Align with official lowcmd example:
-        # switch FSM to LOWCMD, then do manual sendRecv() in user loop.
+        # Binding / interface checks should happen BEFORE any lowcmd-dependent call.
+        if self.arm_model is None:
+            raise RuntimeError("Z1 armModel is not accessible from Python binding.")
+        if self.lowcmd is None:
+            raise RuntimeError("Z1 lowcmd is not accessible from Python binding.")
+        if not hasattr(self.lowcmd, "setControlGain"):
+            raise RuntimeError("Z1 lowcmd binding does not expose setControlGain().")
+
+        # Enter LOWCMD mode following the official low-level workflow.
         self.arm.setFsmLowcmd()
 
-        # Pull several packets so lowstate is fresh.
+        # Pull a few packets so the lowstate becomes fresh and the communication
+        # path is warm before the first real control command is sent.
         for _ in range(20):
             self.arm.sendRecv()
             time.sleep(0.002)
@@ -232,11 +307,22 @@ class Z1ArmAdapter:
         self.read_state()
         self.prev_q_cmd = self.q.copy()
 
+        # Apply startup gains immediately so any subsequent hold/move command
+        # uses explicit external gains rather than whatever stale values may
+        # already be inside lowcmd.
+        self.set_control_gain(self.arm_kps_startup, self.arm_kds_startup)
+
         print("[Z1ArmAdapter] Connected.")
         print(f"[Z1ArmAdapter] FSM = {self.arm.getCurrentState()}")
 
     def read_state(self):
-        """Update cached arm lowstate."""
+        """
+        Update cached arm lowstate.
+
+        Important:
+        - This performs one sendRecv() call.
+        - The main controller should decide how often this is called.
+        """
         self.arm.sendRecv()
 
         self.q = np.asarray(self.arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
@@ -249,53 +335,157 @@ class Z1ArmAdapter:
         else:
             self.gripper_q = 0.0
 
+    # Low-level gain management
+    def set_control_gain(self, kp: np.ndarray, kd: np.ndarray):
+        """
+        Push explicit external gains into lowcmd.
+
+        This is the key change that makes the real arm closer to the training
+        controller. The electric motor-side controller will then use these gains
+        together with the q / qd / tau command sent by setArmCmd().
+        """
+        kp = np.asarray(kp, dtype=np.float32).reshape(6,)
+        kd = np.asarray(kd, dtype=np.float32).reshape(6,)
+
+        # Avoid unnecessary repeated gain writes.
+        if (
+            self._last_applied_kp is not None
+            and self._last_applied_kd is not None
+            and np.allclose(kp, self._last_applied_kp)
+            and np.allclose(kd, self._last_applied_kd)
+        ):
+            return
+
+        # The pybind-exposed API accepts Python lists / sequences.
+        self.lowcmd.setControlGain(
+            [float(x) for x in kp],
+            [float(x) for x in kd],
+        )
+
+        self._last_applied_kp = kp.copy()
+        self._last_applied_kd = kd.copy()
+
+    def _get_gain_pair(self, use_startup_gains: bool) -> Tuple[np.ndarray, np.ndarray]:
+        if use_startup_gains:
+            return self.arm_kps_startup, self.arm_kds_startup
+        return self.arm_kps_runtime, self.arm_kds_runtime
+
+    # Command shaping
     def _protect_joint_cmd(self, q_cmd: np.ndarray, qd_cmd: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Use SDK joint protection if available.
+        Apply SDK joint protection if available.
 
-        The binding returns a pair `(q_safe, qd_safe)`.
+        The binding returns a pair:
+            (q_safe, qd_safe)
         """
         try:
             q_safe, qd_safe = self.arm_model.jointProtect(q_cmd.copy(), qd_cmd.copy())
-            return np.asarray(q_safe, dtype=np.float32).reshape(6,), np.asarray(qd_safe, dtype=np.float32).reshape(6,)
+            return (
+                np.asarray(q_safe, dtype=np.float32).reshape(6,),
+                np.asarray(qd_safe, dtype=np.float32).reshape(6,),
+            )
         except Exception:
             return q_cmd, qd_cmd
 
-    def send_arm_command(self, q_cmd: np.ndarray, gripper_q_cmd: float):
+    def _compute_qd_cmd(self, q_cmd: np.ndarray) -> np.ndarray:
         """
-        Send one lowcmd step to Z1.
+        Compute desired joint velocity according to the configured mode.
 
-        This follows the official example style:
-        - set q
-        - set qd
-        - set tau via inverseDynamics(q, qd, 0, 0)
-        - set gripper
-        - sendRecv()
+        Recommended training-aligned mode:
+            qd_cmd = 0
         """
-        q_cmd = np.asarray(q_cmd, dtype=np.float32).reshape(6,)
-        qd_cmd = ((q_cmd - self.prev_q_cmd) / self.control_dt).astype(np.float32)
+        if self.arm_qd_mode == "zero":
+            return np.zeros(6, dtype=np.float32)
 
-        q_cmd, qd_cmd = self._protect_joint_cmd(q_cmd, qd_cmd)
+        if self.arm_qd_mode == "finite_diff":
+            return ((q_cmd - self.prev_q_cmd) / self.control_dt).astype(np.float32)
+
+        raise ValueError(f"Unsupported arm_qd_mode: {self.arm_qd_mode}")
+
+    def _compute_tau_ff(self, q_cmd: np.ndarray, qd_cmd: np.ndarray) -> np.ndarray:
+        """
+        Compute the feed-forward torque according to the configured mode.
+
+        Recommended training-aligned mode:
+            tau_ff = 0
+        """
+        if self.arm_tau_mode == "zero":
+            return np.zeros(6, dtype=np.float32)
 
         qdd_cmd = np.zeros(6, dtype=np.float32)
         ftip = np.zeros(6, dtype=np.float32)
-        tau_cmd = np.asarray(
-            self.arm_model.inverseDynamics(q_cmd, qd_cmd, qdd_cmd, ftip),
-            dtype=np.float32,
-        ).reshape(6,)
 
+        if self.arm_tau_mode == "gravity":
+            return np.asarray(
+                self.arm_model.inverseDynamics(
+                    q_cmd,
+                    np.zeros(6, dtype=np.float32),
+                    qdd_cmd,
+                    ftip,
+                ),
+                dtype=np.float32,
+            ).reshape(6,)
+
+        if self.arm_tau_mode == "full_id":
+            return np.asarray(
+                self.arm_model.inverseDynamics(q_cmd, qd_cmd, qdd_cmd, ftip),
+                dtype=np.float32,
+            ).reshape(6,)
+
+        raise ValueError(f"Unsupported arm_tau_mode: {self.arm_tau_mode}")
+
+    # Main lowcmd send
+    def send_arm_command(self, q_cmd: np.ndarray, gripper_q_cmd: float, use_startup_gains: bool = False):
+        """
+        Send one lowcmd step to Z1 using explicit external gains.
+
+        Control semantics:
+        - q_cmd      : desired joint positions
+        - qd_cmd     : usually zero for training alignment
+        - tau_ff     : usually zero for training alignment
+        - kp / kd    : explicitly pushed through lowcmd.setControlGain()
+
+        This is intentionally closer to the MuJoCo sim2sim controller than the
+        old "trajectory-style" helper that used:
+            qd_cmd = finite difference of q target
+            tau_ff = inverse dynamics
+        """
+        q_cmd = np.asarray(q_cmd, dtype=np.float32).reshape(6,)
+        qd_cmd = self._compute_qd_cmd(q_cmd)
+
+        # Apply SDK protection before sending.
+        q_cmd, qd_cmd = self._protect_joint_cmd(q_cmd, qd_cmd)
+
+        # Compute feed-forward torque.
+        tau_ff = self._compute_tau_ff(q_cmd, qd_cmd)
+
+        # Push gains first so the command is interpreted under the intended
+        # controller stiffness / damping.
+        kp_cmd, kd_cmd = self._get_gain_pair(use_startup_gains=use_startup_gains)
+        self.set_control_gain(kp_cmd, kd_cmd)
+
+        # Fill the ArmInterface command fields.
         self.arm.q = q_cmd
         self.arm.qd = qd_cmd
-        self.arm.tau = tau_cmd
+        self.arm.tau = tau_ff
         self.arm.gripperQ = float(gripper_q_cmd)
 
+        # Send one low-level step.
         self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
         self.arm.setGripperCmd(float(gripper_q_cmd), 0.0, 0.0)
         self.arm.sendRecv()
 
         self.prev_q_cmd = q_cmd.copy()
 
-    def move_to_pose(self, target_q: np.ndarray, duration: float):
+    # Startup helpers
+    def move_to_pose(self, target_q: np.ndarray, duration: float, use_startup_gains: bool = True):
+        """
+        Move smoothly to a target joint pose using linear interpolation in
+        joint space, with explicit external startup gains.
+
+        This is only for startup / transitions. Runtime policy control should
+        call send_arm_command() directly once per tick.
+        """
         self.read_state()
         q0 = self.q.copy()
         target_q = np.asarray(target_q, dtype=np.float32).reshape(6,)
@@ -304,38 +494,58 @@ class Z1ArmAdapter:
         for step in range(num_steps):
             alpha = float(step + 1) / float(num_steps)
             q_cmd = (1.0 - alpha) * q0 + alpha * target_q
-            self.send_arm_command(q_cmd, self.default_gripper_pos)
+            self.send_arm_command(
+                q_cmd=q_cmd,
+                gripper_q_cmd=self.default_gripper_pos,
+                use_startup_gains=use_startup_gains,
+            )
             time.sleep(self.control_dt)
 
         self.read_state()
         self.prev_q_cmd = self.q.copy()
 
     def hold_default_step(self):
-        """Send one hold step at default pose."""
-        self.send_arm_command(self.default_arm_pos, self.default_gripper_pos)
+        """
+        Send one hold step at the default arm pose using startup gains.
+        """
+        self.send_arm_command(
+            q_cmd=self.default_arm_pos,
+            gripper_q_cmd=self.default_gripper_pos,
+            use_startup_gains=True,
+        )
 
     def safe_back_to_start(self):
         """
         Optional SDK-provided recovery motion.
 
-        For the first deployment version, do nothing by default to avoid triggering
-        an extra uncontrolled motion at shutdown.
+        Intentionally left as a no-op in this deployment helper, so shutdown
+        does not trigger an extra uncontrolled arm motion.
         """
         pass
 
+    # FK / policy EE conversion
     def compute_policy_ee_pose_in_base(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Return policy EE pose in B2W base_link frame.
+        Return the policy EE pose in B2W base_link frame.
 
         Steps:
-        1) SDK FK: forwardKinematics(q, ee_index) -> SDK EE pose in arm_base frame
-        2) Apply fixed transform SDK_EE -> policy_EE
-        3) Apply fixed transform arm_base -> base_link
+        1) SDK FK:
+              forwardKinematics(q, ee_index)
+           gives the SDK EE pose in arm_base frame.
+        2) Apply the fixed transform:
+              SDK_EE -> policy_EE
+        3) Apply the fixed transform:
+              arm_base -> base_link
         """
-        # Important: do not call read_state() here.
-        # State reading is handled by the main controller once per tick.
+        # Important:
+        # do not call read_state() here.
+        # State reading is owned by the main deployment controller so the timing
+        # remains consistent and easy to reason about.
 
-        T_sdk = np.asarray(self.arm_model.forwardKinematics(self.q, self.ee_index), dtype=np.float32).reshape(4, 4)
+        T_sdk = np.asarray(
+            self.arm_model.forwardKinematics(self.q, self.ee_index),
+            dtype=np.float32,
+        ).reshape(4, 4)
 
         R_sdk = T_sdk[:3, :3]
         p_sdk = T_sdk[:3, 3]
@@ -362,8 +572,9 @@ def compute_ee_current_kp_lb(
     """
     Compute current EE keypoints in level-base (LB) frame.
 
-    We do not need global base position. Because LB shares the same origin as base_link,
-    only the orientation change body->LB matters.
+    Because the LB frame shares the same origin as base_link, we do not need a
+    global base position here. We only need the orientation change from body
+    frame to level-base frame.
     """
     base_quat_wxyz = quat_unique_wxyz(quat_normalize_wxyz(base_quat_wxyz))
 

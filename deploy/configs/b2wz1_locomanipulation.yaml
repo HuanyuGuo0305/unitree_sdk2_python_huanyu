@@ -10,13 +10,9 @@ z1_sdk_lib: "../z1_sdk/lib"
 # Timing
 control_dt: 0.02
 
-startup_hold_s: 1.0
-startup_blend_s: 2.0
-
 squat_transition_s: 2.0
 default_transition_s: 2.0
-arm_default_transition_s: 2.0
-
+arm_default_transition_s: 2.5
 
 # Dimensions
 history_length: 3
@@ -33,49 +29,31 @@ command_scale: [0.8, 0.8, 0.6]
 command_deadband_lin: 0.2
 command_deadband_ang: 0.2
 
-# Default poses
-# Policy leg order:
-#   [FL_hip, FR_hip, RL_hip, RR_hip,
-#    FL_thigh, FR_thigh, RL_thigh, RR_thigh,
-#    FL_calf, FR_calf, RL_calf, RR_calf]
-default_leg_pos_policy: [
+# B2W default / squat pose in POLICY order (16)
+# Policy order:
+#   FL_hip, FR_hip, RL_hip, RR_hip,
+#   FL_thigh, FR_thigh, RL_thigh, RR_thigh,
+#   FL_calf, FR_calf, RL_calf, RR_calf,
+#   FL_wheel, FR_wheel, RL_wheel, RR_wheel
+squat_b2w_pos_policy: [
+   0.1,  -0.1,   0.1,  -0.1,
+   1.57,  1.57,  1.57,  1.57,
+  -2.65, -2.65, -2.65, -2.65,
+   0.0,   0.0,   0.0,   0.0
+]
+
+default_b2w_pos_policy: [
    0.1, -0.1,  0.1, -0.1,
    0.8,  0.8,  1.0,  1.0,
-  -1.5, -1.5, -1.5, -1.5
+  -1.5, -1.5, -1.5, -1.5,
+   0.0,  0.0,  0.0,  0.0
 ]
 
-# B2W hardware leg order:
-#   [FR_hip, FR_thigh, FR_calf,
-#    FL_hip, FL_thigh, FL_calf,
-#    RR_hip, RR_thigh, RR_calf,
-#    RL_hip, RL_thigh, RL_calf]
-default_leg_pos_hw: [
-  -0.1, 0.8, -1.5,
-   0.1, 0.8, -1.5,
-  -0.1, 1.0, -1.5,
-   0.1, 1.0, -1.5
-]
-
-# Startup squat pose in B2W hardware leg order:
-#   [FR_hip, FR_thigh, FR_calf,
-#    FL_hip, FL_thigh, FL_calf,
-#    RR_hip, RR_thigh, RR_calf,
-#    RL_hip, RL_thigh, RL_calf]
-squat_leg_pos_hw: [
-  -0.1, 1.57, -2.65,
-   0.1, 1.57, -2.65,
-  -0.1, 1.57, -2.65,
-   0.1, 1.57, -2.65
-]
-
-# Z1 arm default joint pose:
-#   [joint1, joint2, joint3, joint4, joint5, joint6]
+# Arm defaults
 default_arm_pos: [0.0, 1.48, -1.0, -0.54, 0.0, 0.0]
-
-# Gripper is fixed and not controlled by policy
 default_gripper_pos: 0.0
 
-# Optional combined default in policy obs order:
+# Observation default in policy obs order: leg(12) + arm(6)
 default_joint_pos_policy: [
    0.1, -0.1,  0.1, -0.1,
    0.8,  0.8,  1.0,  1.0,
@@ -83,45 +61,34 @@ default_joint_pos_policy: [
    0.0,  1.48, -1.0, -0.54, 0.0, 0.0
 ]
 
-# B2W gains
-# RL gains: follow training
-# PD gains: stronger startup / hold support on real robot
-#
-# Hardware order:
-#   FR_hip, FR_thigh, FR_calf,
-#   FL_hip, FL_thigh, FL_calf,
-#   RR_hip, RR_thigh, RR_calf,
-#   RL_hip, RL_thigh, RL_calf,
-#   FR_wheel, FL_wheel, RR_wheel, RL_wheel
+# B2W gains in POLICY order (16), aligned with locomotion deployment
+# RL gains
 kps_rl: [
-  160.0, 160.0, 160.0,
-  160.0, 160.0, 160.0,
-  160.0, 160.0, 160.0,
-  160.0, 160.0, 160.0,
+  160.0, 160.0, 160.0, 160.0,
+  160.0, 160.0, 160.0, 160.0,
+  160.0, 160.0, 160.0, 160.0,
     0.0,   0.0,   0.0,   0.0
 ]
 
 kds_rl: [
-   5.0,   5.0,   5.0,
-   5.0,   5.0,   5.0,
-   5.0,   5.0,   5.0,
-   5.0,   5.0,   5.0,
-  10.0,  10.0,  10.0,  10.0
+   5.0,  5.0,  5.0,  5.0,
+   5.0,  5.0,  5.0,  5.0,
+   5.0,  5.0,  5.0,  5.0,
+  10.0, 10.0, 10.0, 10.0
 ]
 
+# PD gains for startup / stand-hold
 kps_pd: [
-  500.0, 500.0, 500.0,
-  500.0, 500.0, 500.0,
-  500.0, 500.0, 500.0,
-  500.0, 500.0, 500.0,
+  500.0, 500.0, 500.0, 500.0,
+  500.0, 500.0, 500.0, 500.0,
+  500.0, 500.0, 500.0, 500.0,
     0.0,   0.0,   0.0,   0.0
 ]
 
 kds_pd: [
-  10.0, 10.0, 10.0,
-  10.0, 10.0, 10.0,
-  10.0, 10.0, 10.0,
-  10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0,
   10.0, 10.0, 10.0, 10.0
 ]
 
@@ -132,6 +99,22 @@ leg_action_scale: 0.25
 arm_action_scale: [0.25, 0.40, 0.25, 0.25, 0.25, 0.20]
 wheel_action_scale: 4.0
 
+# Z1 explicit lowcmd gains
+# Note:
+#   These are Z1 lowcmd gains, NOT MuJoCo external PD gains.
+#   Because the lowcmd motor-side torque is approximately:
+#       tau = kp * 25.6 * (qd - q) + kd * 0.0128 * (dqd - dq) + tau_f
+#   the numerical gain values here should not be copied directly from sim.
+arm_kps_startup: [60.0, 80.0, 60.0, 40.0, 30.0, 20.0]
+arm_kds_startup: [4.0, 5.0, 4.0, 3.0, 2.0, 2.0]
+
+arm_kps_runtime: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
+arm_kds_runtime: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
+
+# Recommended training-aligned default:
+arm_qd_mode: "zero"   # zero | finite_diff
+arm_tau_mode: "zero"  # zero | gravity | full_id
+
 # Z1 SDK / arm kinematics
 z1_has_gripper: true
 z1_fk_ee_index: 6
@@ -140,9 +123,7 @@ z1_fk_ee_index: 6
 arm_base_offset_pos: [0.190, 0.0, 0.0952]
 arm_base_offset_rpy: [0.0, 0.0, 0.0]
 
-# Fixed transform: SDK EE -> policy EE (gripperStator)
-# First implementation: assume SDK index=6 is close to link06/tool frame,
-# then move forward by the fixed gripperStator offset from URDF.
+# Fixed transform: SDK EE -> policy EE
 z1_fk_to_policy_ee_pos: [0.051, 0.0, 0.0]
 z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
 

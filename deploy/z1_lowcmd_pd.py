@@ -1,18 +1,3 @@
-"""
-Simple Z1 low-level external PD test.
-
-Purpose:
-- Verify that the modified Python binding exposes lowcmd.setControlGain()
-- Verify that external PD style command pipeline works
-- Move Z1 to default_arm_pos and hold it there
-
-Run from repository root:
-
-    python3 deploy/z1_lowlevel_pd.py deploy/configs/b2wz1_locomanipulation.yaml
-
-    python3 deploy/z1_lowlevel_pd.py deploy/configs/b2wz1_locomanipulation.yaml --hold
-"""
-
 import os
 import sys
 import time
@@ -24,90 +9,108 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from utils.z1_helper import Z1ArmAdapter
+
+def resolve_path(path_str: str, project_root: str) -> str:
+    if os.path.isabs(path_str):
+        return path_str
+    return os.path.abspath(os.path.join(project_root, path_str))
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("config", type=str, help="Path to yaml config")
-    parser.add_argument("--move-duration", type=float, default=3.0, help="Move-to-default duration in seconds")
-    parser.add_argument("--hold", action="store_true", help="Hold default pose until Ctrl+C")
+    parser.add_argument("config", type=str)
+    parser.add_argument("--kp", type=float, default=60.0)
+    parser.add_argument("--kd", type=float, default=6.0)
+    parser.add_argument("--duration", type=int, default=1000)
     args = parser.parse_args()
 
-    cfg_path = args.config
-    if not os.path.isabs(cfg_path):
-        cfg_path = os.path.abspath(os.path.join(PROJECT_ROOT, cfg_path))
-
-    with open(cfg_path, "r") as f:
+    with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
 
-    z1 = Z1ArmAdapter(cfg, PROJECT_ROOT)
+    z1_sdk_lib = resolve_path(cfg["z1_sdk_lib"], PROJECT_ROOT)
+    if z1_sdk_lib not in sys.path:
+        sys.path.insert(0, z1_sdk_lib)
+
+    import unitree_arm_interface
+
+    np.set_printoptions(precision=4, suppress=True)
+
+    has_gripper = bool(cfg.get("z1_has_gripper", True))
+    target_pos = np.array(cfg["default_arm_pos"], dtype=np.float32).reshape(6,)
+    target_gripper = float(cfg.get("default_gripper_pos", 0.0))
 
     print("=" * 80)
-    print("Z1 low-level external PD test")
-    print("=" * 80)
-    print(f"Config              : {cfg_path}")
-    print(f"Control dt          : {cfg['control_dt']}")
-    print(f"Default arm pos     : {cfg['default_arm_pos']}")
-    print(f"Startup kp          : {cfg.get('arm_kps_startup')}")
-    print(f"Startup kd          : {cfg.get('arm_kds_startup')}")
-    print(f"Runtime kp          : {cfg.get('arm_kps_runtime')}")
-    print(f"Runtime kd          : {cfg.get('arm_kds_runtime')}")
-    print(f"arm_qd_mode         : {cfg.get('arm_qd_mode', 'zero')}")
-    print(f"arm_tau_mode        : {cfg.get('arm_tau_mode', 'zero')}")
+    print("[TEST] official example + external gain")
+    print("[TEST] z1_sdk_lib     =", z1_sdk_lib)
+    print("[TEST] target_pos     =", target_pos)
+    print("[TEST] target_gripper =", target_gripper)
+    print("[TEST] kp             =", args.kp)
+    print("[TEST] kd             =", args.kd)
     print("=" * 80)
 
-    z1.connect()
+    arm = unitree_arm_interface.ArmInterface(hasGripper=has_gripper)
+    armModel = arm._ctrlComp.armModel
+    arm.setFsmLowcmd()
 
-    print("[Z1Test] Reading initial state...")
-    z1.read_state()
-    print(f"[Z1Test] q_init = {np.array2string(z1.q, precision=4, suppress_small=True)}")
-    print(f"[Z1Test] qd_init = {np.array2string(z1.qd, precision=4, suppress_small=True)}")
+    duration = args.duration
+    dt = float(arm._ctrlComp.dt)
 
-    print("[Z1Test] Moving to default arm pose using startup gains...")
-    z1.move_to_pose(
-        target_q=np.array(cfg["default_arm_pos"], dtype=np.float32),
-        duration=float(args.move_duration),
-        use_startup_gains=True,
-    )
+    last_pos = np.array(arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
+    kp = [float(args.kp)] * 6 + [20.0]
+    kd = [float(args.kd)] * 6 + [2000.0]
 
-    print("[Z1Test] Reached default pose. Reading back state...")
-    z1.read_state()
-    err = np.array(cfg["default_arm_pos"], dtype=np.float32) - z1.q
-    print(f"[Z1Test] q_now  = {np.array2string(z1.q, precision=4, suppress_small=True)}")
-    print(f"[Z1Test] q_err  = {np.array2string(err, precision=4, suppress_small=True)}")
-    print(f"[Z1Test] max|err| = {np.max(np.abs(err)):.6f}")
+    print("[TEST] dt      =", dt)
+    print("[TEST] FSM     =", arm.getCurrentState())
+    print("[TEST] q_init  =", last_pos)
+    print("[TEST] q_delta =", target_pos - last_pos)
 
-    if not args.hold:
-        print("[Z1Test] Done.")
-        return
+    input("[TEST] Press Enter to start...")
 
-    print("[Z1Test] Holding default pose with startup gains. Press Ctrl+C to stop.")
-    try:
-        counter = 0
-        while True:
-            z1.send_arm_command(
-                q_cmd=np.array(cfg["default_arm_pos"], dtype=np.float32),
-                gripper_q_cmd=float(cfg["default_gripper_pos"]),
-                use_startup_gains=True,
+    arm._ctrlComp.lowcmd.setControlGain(kp, kd)
+
+    for i in range(duration):
+        alpha = float(i) / float(duration)
+
+        q_cmd = last_pos * (1.0 - alpha) + target_pos * alpha
+        qd_cmd = np.zeros(6, dtype=np.float32)
+        tau_cmd = np.zeros(6, dtype=np.float32)
+
+        arm.q = q_cmd
+        arm.qd = qd_cmd
+        arm.tau = tau_cmd
+        arm.gripperQ = target_gripper
+
+        arm.setArmCmd(arm.q, arm.qd, arm.tau)
+        arm.setGripperCmd(arm.gripperQ, arm.gripperQd, arm.gripperTau)
+        arm.sendRecv()
+
+        fsm = arm.getCurrentState()
+
+        if (i % 20 == 0) or (i == duration - 1) or (fsm != unitree_arm_interface.ArmFSMState.LOWCMD):
+            q_meas = np.array(arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
+            qd_meas = np.array(arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
+            tau_meas = np.array(arm.lowstate.getTau(), dtype=np.float32).reshape(6,)
+            err = q_cmd - q_meas
+
+            print(
+                f"[{i+1:04d}/{duration}] "
+                f"FSM={fsm} | "
+                f"q_cmd={np.round(q_cmd, 3)} | "
+                f"q_meas={np.round(q_meas, 3)} | "
+                f"err={np.round(err, 3)} | "
+                f"qd_meas={np.round(qd_meas, 3)} | "
+                f"tau_meas={np.round(tau_meas, 3)}"
             )
 
-            counter += 1
-            if counter % 50 == 0:
-                z1.read_state()
-                err = np.array(cfg["default_arm_pos"], dtype=np.float32) - z1.q
-                print(
-                    f"[Z1Test {counter:5d}] "
-                    f"max|err|={np.max(np.abs(err)):.6f} | "
-                    f"q={np.array2string(z1.q, precision=4, suppress_small=True)}"
-                )
+        if fsm != unitree_arm_interface.ArmFSMState.LOWCMD:
+            print(f"[ERROR] FSM dropped to {fsm} at step {i+1}")
+            break
 
-            time.sleep(float(cfg["control_dt"]))
+        time.sleep(dt)
 
-    except KeyboardInterrupt:
-        print("[Z1Test] KeyboardInterrupt received.")
-
-    print("[Z1Test] Exit.")
+    arm.loopOn()
+    arm.backToStart()
+    arm.loopOff()
 
 
 if __name__ == "__main__":

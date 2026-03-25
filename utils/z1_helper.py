@@ -202,6 +202,9 @@ class Z1ArmAdapter:
         self.has_gripper = bool(cfg.get("z1_has_gripper", True))
         self.ee_index = int(cfg.get("z1_fk_ee_index", 6))
         self.control_dt = float(cfg["control_dt"])
+        self.arm_control_dt = float(cfg.get("z1_control_dt", 0.002))
+        self.gripper_kp = float(cfg.get("z1_gripper_kp", 20.0))
+        self.gripper_kd = float(cfg.get("z1_gripper_kd", 2000.0))
 
         # Fixed transforms used by policy EE computation
         # base_link -> arm_base
@@ -235,6 +238,9 @@ class Z1ArmAdapter:
             cfg.get("arm_kds_runtime", [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]),
             dtype=np.float32,
         ).reshape(6,)
+
+        self.debug_print = bool(cfg.get("z1_debug_print", False))
+        self._debug_counter = 0
 
         # ------------------------------------------------------------------
         # Command mode options
@@ -314,6 +320,17 @@ class Z1ArmAdapter:
 
         print("[Z1ArmAdapter] Connected.")
         print(f"[Z1ArmAdapter] FSM = {self.arm.getCurrentState()}")
+    
+    def get_arm_dt(self) -> float:
+        """
+        Return the actual low-level control dt used by the Z1 SDK.
+        """
+        if self.arm is None:
+            return self.arm_control_dt
+        try:
+            return float(self.arm._ctrlComp.dt)
+        except Exception:
+            return self.arm_control_dt
 
     def read_state(self):
         """
@@ -340,9 +357,11 @@ class Z1ArmAdapter:
         """
         Push explicit external gains into lowcmd.
 
-        This is the key change that makes the real arm closer to the training
-        controller. The electric motor-side controller will then use these gains
-        together with the q / qd / tau command sent by setArmCmd().
+        Important:
+        - lowcmd.setControlGain() must NOT be spammed every tick at the binding layer.
+        - We therefore cache the last applied gains and only write when they change.
+        - The lowcmd gain vector is 7-dim in practice:
+            6 arm joints + 1 gripper channel.
         """
         kp = np.asarray(kp, dtype=np.float32).reshape(6,)
         kd = np.asarray(kd, dtype=np.float32).reshape(6,)
@@ -356,11 +375,12 @@ class Z1ArmAdapter:
         ):
             return
 
-        # The pybind-exposed API accepts Python lists / sequences.
-        self.lowcmd.setControlGain(
-            [float(x) for x in kp],
-            [float(x) for x in kd],
-        )
+        # 7-dim lowcmd gains: 6 joints + 1 gripper channel.
+        # These gripper defaults match the behavior you observed in testing.
+        kp_full = [float(x) for x in kp] + [self.gripper_kp]
+        kd_full = [float(x) for x in kd] + [self.gripper_kd]
+
+        self.lowcmd.setControlGain(kp_full, kd_full)
 
         self._last_applied_kp = kp.copy()
         self._last_applied_kd = kd.copy()
@@ -398,7 +418,7 @@ class Z1ArmAdapter:
             return np.zeros(6, dtype=np.float32)
 
         if self.arm_qd_mode == "finite_diff":
-            return ((q_cmd - self.prev_q_cmd) / self.control_dt).astype(np.float32)
+            return ((q_cmd - self.prev_q_cmd) / self.get_arm_dt()).astype(np.float32)
 
         raise ValueError(f"Unsupported arm_qd_mode: {self.arm_qd_mode}")
 
@@ -443,12 +463,8 @@ class Z1ArmAdapter:
         - q_cmd      : desired joint positions
         - qd_cmd     : usually zero for training alignment
         - tau_ff     : usually zero for training alignment
-        - kp / kd    : explicitly pushed through lowcmd.setControlGain()
-
-        This is intentionally closer to the MuJoCo sim2sim controller than the
-        old "trajectory-style" helper that used:
-            qd_cmd = finite difference of q target
-            tau_ff = inverse dynamics
+        - kp / kd    : explicitly pushed through lowcmd.setControlGain(),
+                    but only when changed
         """
         q_cmd = np.asarray(q_cmd, dtype=np.float32).reshape(6,)
         qd_cmd = self._compute_qd_cmd(q_cmd)
@@ -459,8 +475,7 @@ class Z1ArmAdapter:
         # Compute feed-forward torque.
         tau_ff = self._compute_tau_ff(q_cmd, qd_cmd)
 
-        # Push gains first so the command is interpreted under the intended
-        # controller stiffness / damping.
+        # Gains are configuration-like: only pushed when changed.
         kp_cmd, kd_cmd = self._get_gain_pair(use_startup_gains=use_startup_gains)
         self.set_control_gain(kp_cmd, kd_cmd)
 
@@ -472,10 +487,77 @@ class Z1ArmAdapter:
 
         # Send one low-level step.
         self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
-        self.arm.setGripperCmd(float(gripper_q_cmd), 0.0, 0.0)
+        self.arm.setGripperCmd(
+            float(gripper_q_cmd),
+            self.arm.gripperQd,
+            self.arm.gripperTau,
+        )
         self.arm.sendRecv()
 
         self.prev_q_cmd = q_cmd.copy()
+
+        self._debug_counter += 1
+        if self.debug_print and (self._debug_counter % 100 == 0):
+            print(
+                "[Z1ArmAdapter] Sending arm command:",
+                "q_cmd =", q_cmd,
+                "qd_cmd =", qd_cmd,
+                "tau_ff =", tau_ff,
+                "gripper_q_cmd =", gripper_q_cmd,
+                "kp =", kp_cmd,
+                "kd =", kd_cmd,
+            )
+    def hold_target_once(
+        self,
+        q_target: np.ndarray,
+        gripper_q_target: float,
+        use_startup_gains: bool = False,
+    ):
+        """
+        Send one low-level command that holds the given arm target.
+        """
+        self.send_arm_command(
+            q_cmd=q_target,
+            gripper_q_cmd=gripper_q_target,
+            use_startup_gains=use_startup_gains,
+        )
+    
+    def hold_target_for_duration(
+        self,
+        q_target: np.ndarray,
+        gripper_q_target: float,
+        duration_s: float,
+        use_startup_gains: bool = False,
+        step_callback=None,
+    ):
+        """
+        Hold a fixed arm target for a given duration using the Z1 low-level rate.
+
+        The target itself is not updated inside this function. This is intended
+        for the case where a higher-level controller updates targets at a slower
+        rate (e.g. 50 Hz), while the arm lowcmd is sent at a faster rate
+        (e.g. 500 Hz).
+        """
+        q_target = np.asarray(q_target, dtype=np.float32).reshape(6,)
+        dt = self.get_arm_dt()
+        num_steps = max(1, int(round(duration_s / dt)))
+
+        for step in range(num_steps):
+            self.hold_target_once(
+                q_target=q_target,
+                gripper_q_target=gripper_q_target,
+                use_startup_gains=use_startup_gains,
+            )
+
+            fsm = self.arm.getCurrentState()
+            if fsm != self.unitree_arm_interface.ArmFSMState.LOWCMD:
+                print(f"[Z1ArmAdapter][ERROR] FSM dropped to {fsm} during hold_target_for_duration at step {step+1}")
+                break
+
+            if step_callback is not None:
+                step_callback()
+
+            time.sleep(dt)
 
     # Startup helpers
     def move_to_pose(self, target_q: np.ndarray, duration: float, use_startup_gains: bool = True):
@@ -490,7 +572,8 @@ class Z1ArmAdapter:
         q0 = self.q.copy()
         target_q = np.asarray(target_q, dtype=np.float32).reshape(6,)
 
-        num_steps = max(1, int(round(duration / self.control_dt)))
+        dt = self.get_arm_dt()
+        num_steps = max(1, int(round(duration / dt)))
         for step in range(num_steps):
             alpha = float(step + 1) / float(num_steps)
             q_cmd = (1.0 - alpha) * q0 + alpha * target_q
@@ -499,10 +582,109 @@ class Z1ArmAdapter:
                 gripper_q_cmd=self.default_gripper_pos,
                 use_startup_gains=use_startup_gains,
             )
-            time.sleep(self.control_dt)
+            time.sleep(dt)
 
         self.read_state()
         self.prev_q_cmd = self.q.copy()
+    
+    def move_to_default_like_min_test(
+        self,
+        duration_s: float,
+        kp: np.ndarray,
+        kd: np.ndarray,
+        step_callback=None,
+    ):
+        """
+        Move the arm to default pose using the exact low-level pattern that was
+        validated by the standalone minimum test script.
+
+        Optional:
+            step_callback:
+                A function called once per arm control step, typically used to keep
+                the leg robot holding a default pose while the arm is moving.
+        """
+        self.read_state()
+        q0 = self.q.copy()
+        target_q = self.default_arm_pos.copy()
+        target_gripper = float(self.default_gripper_pos)
+
+        dt = float(self.arm._ctrlComp.dt)
+        num_steps = max(1, int(round(duration_s / dt)))
+
+        kp = np.asarray(kp, dtype=np.float32).reshape(6,)
+        kd = np.asarray(kd, dtype=np.float32).reshape(6,)
+
+        kp_full = [float(x) for x in kp] + [self.gripper_kp]
+        kd_full = [float(x) for x in kd] + [self.gripper_kd]
+
+        print("[Z1ArmAdapter] move_to_default_like_min_test")
+        print("[Z1ArmAdapter] q0       =", np.round(q0, 4))
+        print("[Z1ArmAdapter] target_q =", np.round(target_q, 4))
+        print("[Z1ArmAdapter] dt       =", dt)
+        print("[Z1ArmAdapter] steps    =", num_steps)
+        print("[Z1ArmAdapter] kp_full  =", kp_full)
+        print("[Z1ArmAdapter] kd_full  =", kd_full)
+
+        # Re-enter LOWCMD before motion.
+        self.arm.setFsmLowcmd()
+        time.sleep(0.02)
+
+        # Warm up communication.
+        for _ in range(10):
+            self.arm.sendRecv()
+            time.sleep(dt)
+
+        # Apply gains once before the motion loop.
+        self.arm._ctrlComp.lowcmd.setControlGain(kp_full, kd_full)
+
+        for step in range(num_steps):
+            alpha = float(step) / float(num_steps)
+
+            q_cmd = q0 * (1.0 - alpha) + target_q * alpha
+            qd_cmd = np.zeros(6, dtype=np.float32)
+            tau_cmd = np.zeros(6, dtype=np.float32)
+
+            self.arm.q = q_cmd
+            self.arm.qd = qd_cmd
+            self.arm.tau = tau_cmd
+            self.arm.gripperQ = target_gripper
+
+            self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
+            self.arm.setGripperCmd(self.arm.gripperQ, self.arm.gripperQd, self.arm.gripperTau)
+            self.arm.sendRecv()
+
+            # Keep the leg robot holding default pose if requested.
+            if step_callback is not None:
+                step_callback()
+
+            fsm = self.arm.getCurrentState()
+
+            if (step % 20 == 0) or (step == num_steps - 1) or (fsm != self.unitree_arm_interface.ArmFSMState.LOWCMD):
+                q_meas = np.array(self.arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
+                qd_meas = np.array(self.arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
+                tau_meas = np.array(self.arm.lowstate.getTau(), dtype=np.float32).reshape(6,)
+                err = q_cmd - q_meas
+
+                print(
+                    f"[Z1-MINLIKE {step+1:04d}/{num_steps}] "
+                    f"FSM={fsm} | "
+                    f"q_cmd={np.round(q_cmd, 3)} | "
+                    f"q_meas={np.round(q_meas, 3)} | "
+                    f"err={np.round(err, 3)} | "
+                    f"qd_meas={np.round(qd_meas, 3)} | "
+                    f"tau_meas={np.round(tau_meas, 3)}"
+                )
+
+            if fsm != self.unitree_arm_interface.ArmFSMState.LOWCMD:
+                print(f"[Z1ArmAdapter][ERROR] FSM dropped to {fsm} at step {step+1}")
+                break
+
+            time.sleep(dt)
+
+        self.read_state()
+        self.prev_q_cmd = self.q.copy()
+
+        print("[Z1ArmAdapter] final q =", np.round(self.q, 4))
 
     def hold_default_step(self):
         """

@@ -5,10 +5,13 @@ ee_command_path: "utils/reachable_kp0kp1kp2_lb.npy"
 # Path to z1_sdk/lib that contains:
 #   unitree_arm_interface.cpython-*.so
 #   libZ1_SDK_x86_64.so
-z1_sdk_lib: "../z1_sdk/lib"
+z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"
 
-# Timing
+# High-level policy / deployment rate
 control_dt: 0.02
+
+# Z1 low-level command rate
+z1_control_dt: 0.002
 
 squat_transition_s: 2.0
 default_transition_s: 2.0
@@ -105,11 +108,15 @@ wheel_action_scale: 4.0
 #   Because the lowcmd motor-side torque is approximately:
 #       tau = kp * 25.6 * (qd - q) + kd * 0.0128 * (dqd - dq) + tau_f
 #   the numerical gain values here should not be copied directly from sim.
-arm_kps_startup: [60.0, 80.0, 60.0, 40.0, 30.0, 20.0]
-arm_kds_startup: [4.0, 5.0, 4.0, 3.0, 2.0, 2.0]
+arm_kps_startup: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
+arm_kds_startup: [ 3.0,  3.0,  3.0,  3.0,  3.0,  3.0]
 
 arm_kps_runtime: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
 arm_kds_runtime: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
+
+# Gripper lowcmd gain
+z1_gripper_kp: 20.0
+z1_gripper_kd: 2000.0
 
 # Recommended training-aligned default:
 arm_qd_mode: "zero"   # zero | finite_diff

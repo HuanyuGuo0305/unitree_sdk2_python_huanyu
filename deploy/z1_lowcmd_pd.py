@@ -19,8 +19,8 @@ def resolve_path(path_str: str, project_root: str) -> str:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("config", type=str)
-    parser.add_argument("--kp", type=float, default=60.0)
-    parser.add_argument("--kd", type=float, default=6.0)
+    parser.add_argument("--kp", type=float, default=40.0)
+    parser.add_argument("--kd", type=float, default=3.0)
     parser.add_argument("--duration", type=int, default=1000)
     args = parser.parse_args()
 

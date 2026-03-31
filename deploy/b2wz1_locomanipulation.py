@@ -104,6 +104,11 @@ class B2WZ1LocoManipController:
 
         self.leg_action_scale = float(self.cfg["leg_action_scale"])
         self.arm_action_scale = np.array(self.cfg["arm_action_scale"], dtype=np.float32).reshape(6,)
+        # Maximum allowed arm target change per policy step (rad)
+        self.arm_policy_step_max = np.array(
+            self.cfg.get("arm_policy_step_max", [0.08, 0.08, 0.08, 0.10, 0.10, 0.10]),
+            dtype=np.float32,
+        ).reshape(6,)
         self.wheel_action_scale = float(self.cfg["wheel_action_scale"])
 
         # Arm defaults
@@ -472,6 +477,19 @@ class B2WZ1LocoManipController:
         - Wheels remain stopped
         """
         self._write_b2w_pose_cmd_policy(self.default_b2w_pos_policy, use_pd_gains=True)
+    
+    def _limit_arm_target_step(self, raw_target: np.ndarray) -> np.ndarray:
+        """
+        Limit the change of arm target relative to the previously commanded target.
+        This reduces sudden target jumps at the policy rate.
+        """
+        raw_target = np.asarray(raw_target, dtype=np.float32).reshape(6,)
+
+        delta = raw_target - self.z1.prev_q_cmd
+        delta = np.clip(delta, -self.arm_policy_step_max, self.arm_policy_step_max)
+
+        limited_target = self.z1.prev_q_cmd + delta
+        return limited_target.astype(np.float32)
 
     # Startup states
     def zero_torque_state(self):
@@ -523,9 +541,8 @@ class B2WZ1LocoManipController:
             self.send_b2w_cmd()
 
             # Hold arm at current pose before intentional arm startup motion.
-            self.z1.read_state()
             self.z1.send_arm_command(
-                self.z1.q.copy(),
+                self.z1.prev_q_cmd.copy(),
                 self.default_gripper_pos,
                 use_startup_gains=True,
             )
@@ -542,9 +559,8 @@ class B2WZ1LocoManipController:
             )
             self.send_b2w_cmd()
 
-            self.z1.read_state()
             self.z1.send_arm_command(
-                self.z1.q.copy(),
+                self.z1.prev_q_cmd.copy(),
                 self.default_gripper_pos,
                 use_startup_gains=True,
             )
@@ -561,8 +577,9 @@ class B2WZ1LocoManipController:
             )
             self.send_b2w_cmd()
 
-            self.z1.hold_target_for_duration(
-                q_target=self.default_arm_pos,
+            self.z1.track_target_for_duration(
+                q_start=self.z1.prev_q_cmd.copy(),
+                q_target=self.default_arm_pos.copy(),
                 gripper_q_target=self.default_gripper_pos,
                 duration_s=self.control_dt,
                 use_startup_gains=True,
@@ -662,13 +679,16 @@ class B2WZ1LocoManipController:
 
         elif self.mode == "full-policy":
             self.leg_target = self.default_leg_pos_policy + self.leg_action_scale * leg_act
-            self.arm_target = self.default_arm_pos + self.arm_action_scale * arm_act
+
+            raw_arm_target = self.default_arm_pos + self.arm_action_scale * arm_act
+            self.arm_target = self._limit_arm_target_step(raw_arm_target)
+
             self.wheel_cmd[:] = self.wheel_action_scale * wheel_act
 
             self._write_b2w_rl_cmd(
                 leg_target_policy=self.leg_target,
                 wheel_cmd_policy=self.wheel_cmd,
-            )
+    )
 
         else:
             raise ValueError(f"Unsupported mode: {self.mode}")
@@ -676,10 +696,15 @@ class B2WZ1LocoManipController:
         # 7) Send B2W lowcmd once at policy rate
         self.send_b2w_cmd()
 
-        # 8) Hold Z1 target at arm low-level rate within one policy interval
+        # 8) Smoothly track Z1 target at arm low-level rate within one policy interval
         arm_use_startup_gains = (self.mode in ["pd-stand"])
-        self.z1.hold_target_for_duration(
-            q_target=self.arm_target,
+
+        q_start = self.z1.prev_q_cmd.copy()
+        q_target = self.arm_target.copy()
+
+        self.z1.track_target_for_duration(
+            q_start=q_start,
+            q_target=q_target,
             gripper_q_target=self.default_gripper_pos,
             duration_s=self.control_dt,
             use_startup_gains=arm_use_startup_gains,

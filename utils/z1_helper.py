@@ -558,6 +558,49 @@ class Z1ArmAdapter:
                 step_callback()
 
             time.sleep(dt)
+    
+    def track_target_for_duration(
+        self,
+        q_start: np.ndarray,
+        q_target: np.ndarray,
+        gripper_q_target: float,
+        duration_s: float,
+        use_startup_gains: bool = False,
+        step_callback=None,
+    ):
+        """
+        Smoothly track from q_start to q_target at the arm low-level rate.
+
+        This replaces zero-order hold of a fixed target inside one policy interval
+        with a linearly interpolated reference trajectory.
+        """
+        q_start = np.asarray(q_start, dtype=np.float32).reshape(6,)
+        q_target = np.asarray(q_target, dtype=np.float32).reshape(6,)
+
+        dt = self.get_arm_dt()
+        num_steps = max(1, int(round(duration_s / dt)))
+
+        for step in range(num_steps):
+            alpha = float(step + 1) / float(num_steps)
+
+            # Linear interpolation from previous command to current target
+            q_cmd = (1.0 - alpha) * q_start + alpha * q_target
+
+            self.send_arm_command(
+                q_cmd=q_cmd,
+                gripper_q_cmd=gripper_q_target,
+                use_startup_gains=use_startup_gains,
+            )
+
+            fsm = self.arm.getCurrentState()
+            if fsm != self.unitree_arm_interface.ArmFSMState.LOWCMD:
+                print(f"[Z1ArmAdapter][ERROR] FSM dropped to {fsm} during track_target_for_duration at step {step+1}")
+                break
+
+            if step_callback is not None:
+                step_callback()
+
+            time.sleep(dt)
 
     # Startup helpers
     def move_to_pose(self, target_q: np.ndarray, duration: float, use_startup_gains: bool = True):

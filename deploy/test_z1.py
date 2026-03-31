@@ -183,9 +183,9 @@ def build_cmd_msg(
     ):
         raise ValueError("All command arrays must have length NUM_MOTORS")
 
-    cmds = []
+    motor_cmd = []
     for i in range(NUM_MOTORS):
-        cmds.append(
+        motor_cmd.append(
             build_motor_cmd(
                 mode=mode_cmd[i],
                 q=q_cmd[i],
@@ -196,7 +196,7 @@ def build_cmd_msg(
             )
         )
 
-    return MotorCmds_(cmds=cmds)
+    return MotorCmds_(motor_cmd=motor_cmd)
 
 
 def format_vec(v: List[float], n: int = 6) -> str:

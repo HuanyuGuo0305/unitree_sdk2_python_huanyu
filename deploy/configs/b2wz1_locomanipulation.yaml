@@ -100,6 +100,7 @@ kds_pd: [
 #   leg(12) + arm(6) + wheel(4)
 leg_action_scale: 0.25
 arm_action_scale: [0.25, 0.40, 0.25, 0.25, 0.25, 0.20]
+arm_policy_step_max: [0.08, 0.08, 0.08, 0.10, 0.10, 0.10]
 wheel_action_scale: 4.0
 
 # Z1 explicit lowcmd gains

@@ -532,7 +532,7 @@ class B2WZ1LocoManipController:
         print("[B2WZ1] Reached target B2W pose.")
 
     def hold_squat_until_A(self):
-        print("[B2WZ1] Holding squat pose. Press A to continue to leg default...")
+        print("[B2WZ1] Holding squat pose with arm at default. Press A to continue to leg default...")
         while self.remote_controller.button[KeyMap.A] != 1:
             self._write_b2w_pose_cmd_policy(
                 target_b2w_pos_policy=self.squat_b2w_pos_policy,
@@ -540,9 +540,9 @@ class B2WZ1LocoManipController:
             )
             self.send_b2w_cmd()
 
-            # Hold arm at current pose before intentional arm startup motion.
+            # Keep the arm at default pose while B2W holds squat.
             self.z1.send_arm_command(
-                self.z1.prev_q_cmd.copy(),
+                self.default_arm_pos.copy(),
                 self.default_gripper_pos,
                 use_startup_gains=True,
             )
@@ -551,7 +551,7 @@ class B2WZ1LocoManipController:
         print("[B2WZ1] A pressed.")
 
     def hold_leg_default_until_A(self):
-        print("[B2WZ1] Holding leg default pose (arm holds current pose). Press A to move arm to default...")
+        print("[B2WZ1] Holding leg default pose with arm at default. Press A to continue...")
         while self.remote_controller.button[KeyMap.A] != 1:
             self._write_b2w_pose_cmd_policy(
                 target_b2w_pos_policy=self.default_b2w_pos_policy,
@@ -560,10 +560,28 @@ class B2WZ1LocoManipController:
             self.send_b2w_cmd()
 
             self.z1.send_arm_command(
-                self.z1.prev_q_cmd.copy(),
+                self.default_arm_pos.copy(),
                 self.default_gripper_pos,
                 use_startup_gains=True,
             )
+            time.sleep(self.control_dt)
+
+        print("[B2WZ1] A pressed.")
+    
+    def hold_arm_default_until_A(self):
+        print("[B2WZ1] Holding arm default pose while B2W stays still. Press A to continue to squat...")
+
+        while self.remote_controller.button[KeyMap.A] != 1:
+            # Keep B2W quiet during the arm-only hold phase.
+            create_zero_cmd(self.low_cmd)
+            self.send_b2w_cmd()
+
+            self.z1.send_arm_command(
+                self.default_arm_pos.copy(),
+                self.default_gripper_pos,
+                use_startup_gains=True,
+            )
+
             time.sleep(self.control_dt)
 
         print("[B2WZ1] A pressed.")
@@ -577,13 +595,13 @@ class B2WZ1LocoManipController:
             )
             self.send_b2w_cmd()
 
-            self.z1.track_target_for_duration(
-                q_start=self.z1.prev_q_cmd.copy(),
-                q_target=self.default_arm_pos.copy(),
-                gripper_q_target=self.default_gripper_pos,
-                duration_s=self.control_dt,
+            self.z1.send_arm_command(
+                self.default_arm_pos.copy(),
+                self.default_gripper_pos,
                 use_startup_gains=True,
             )
+
+            time.sleep(self.control_dt)
 
         print("[B2WZ1] A pressed. Start main loop.")
 
@@ -699,12 +717,8 @@ class B2WZ1LocoManipController:
         # 8) Smoothly track Z1 target at arm low-level rate within one policy interval
         arm_use_startup_gains = (self.mode in ["pd-stand"])
 
-        q_start = self.z1.prev_q_cmd.copy()
-        q_target = self.arm_target.copy()
-
-        self.z1.track_target_for_duration(
-            q_start=q_start,
-            q_target=q_target,
+        self.z1.set_target(
+            q_target=self.arm_target.copy(),
             gripper_q_target=self.default_gripper_pos,
             duration_s=self.control_dt,
             use_startup_gains=arm_use_startup_gains,
@@ -746,8 +760,20 @@ class B2WZ1LocoManipController:
     def run(self):
         self.setup()
 
-        # Startup sequence for all modes
         self.zero_torque_state()
+
+        print("[B2WZ1] Moving arm to default before any B2W startup motion...")
+        self.z1.move_to_default_like_min_test(
+            duration_s=float(self.cfg["arm_default_transition_s"]),
+            kp=self.z1.arm_kps_startup,
+            kd=self.z1.arm_kds_startup,
+            step_callback=None,
+        )
+
+        self.z1.prev_q_cmd = self.default_arm_pos.copy()
+        self.z1.prev_gripper_q_cmd = float(self.default_gripper_pos)
+
+        self.hold_arm_default_until_A()
 
         self.move_b2w_to_pose_policy(
             target_b2w_pos_policy=self.squat_b2w_pos_policy,
@@ -763,43 +789,14 @@ class B2WZ1LocoManipController:
 
         self.hold_leg_default_until_A()
 
-        print("[B2WZ1] Moving arm to default while keeping legs at default...")
-
-        self._arm_move_keep_leg_counter = 0
-
-        arm_dt = self.z1.get_arm_dt()
-        b2w_hold_dt = self.control_dt   # 0.02 s
-        steps_per_b2w_hold = max(1, int(round(b2w_hold_dt / arm_dt)))
-
-        self._arm_move_keep_leg_counter = 0
-
-        def hold_b2w_default_decimated():
-            self._arm_move_keep_leg_counter += 1
-
-            if self._arm_move_keep_leg_counter % steps_per_b2w_hold != 0:
-                return
-
-            self._write_b2w_pose_cmd_policy(
-                target_b2w_pos_policy=self.default_b2w_pos_policy,
-                use_pd_gains=True,
-            )
-            self.send_b2w_cmd()
-
-            print("[B2WZ1] Holding leg default during arm startup move...")
-
-        self.z1.move_to_default_like_min_test(
-            duration_s=float(self.cfg["arm_default_transition_s"]),
-            kp=self.z1.arm_kps_startup,
-            kd=self.z1.arm_kds_startup,
-            step_callback=hold_b2w_default_decimated,
-        )
-
-        self.z1.read_state()
-        self.z1.prev_q_cmd = self.z1.q.copy()
-
         self.hold_all_default_until_A()
 
-        # Re-initialize runtime state at actual loop start
+        self.z1.start_realtime_loop(
+            initial_q_target=self.default_arm_pos,
+            gripper_q_target=self.default_gripper_pos,
+            use_startup_gains=(self.mode == "pd-stand"),
+        )
+
         print("[B2WZ1] Re-initializing observation history at loop start pose...")
 
         self._read_all_sensors_once()
@@ -834,14 +831,21 @@ class B2WZ1LocoManipController:
 
         try:
             while True:
+                loop_t0 = time.perf_counter()
+
                 self.step()
 
                 if self.remote_controller.button[KeyMap.select] == 1:
                     print("[B2WZ1] SELECT pressed. Exit control loop.")
                     break
 
+                elapsed = time.perf_counter() - loop_t0
+                time.sleep(max(0.0, self.control_dt - elapsed))
+
         except KeyboardInterrupt:
             print("[B2WZ1] KeyboardInterrupt received.")
+
+        self.z1.stop_realtime_loop()
 
         create_damping_cmd(self.low_cmd)
         self.send_b2w_cmd()

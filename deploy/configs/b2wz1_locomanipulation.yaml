@@ -15,7 +15,7 @@ z1_control_dt: 0.002
 
 squat_transition_s: 2.0
 default_transition_s: 2.0
-arm_default_transition_s: 2.5
+arm_default_transition_s: 4.0
 
 # Dimensions
 history_length: 3

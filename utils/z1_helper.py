@@ -168,26 +168,22 @@ class PresampledKeypointsInterpolateCommandLBSim:
         )
 
 
+import threading
+
+
 class Z1ArmAdapter:
     """
     Thin helper around the modified Unitree Z1 Python binding.
 
-    Main design goals:
-    1. Keep arm FK / state reading in the same helper as before.
-    2. Change the command semantics so they are much closer to the training
-       control law used in sim2sim:
-            - external target q
-            - external kp / kd
-            - qd_cmd usually zero
-            - tau_ff usually zero
-    3. Avoid the old deployment behavior:
-            - qd_cmd from finite difference of target q
-            - tau_cmd from inverseDynamics(...)
-       because that behaves more like trajectory tracking than the training-time
-       PD controller.
-    4. Support different gain sets for:
-            - startup / hold / move-to-default
-            - runtime policy control
+    Design goals:
+    1. Keep startup motions compatible with the current blocking implementation.
+    2. Use a dedicated 500 Hz background control loop during runtime.
+    3. Prevent the main thread from blocking the Z1 UDP communication.
+    4. Keep training-aligned command semantics:
+         - position target
+         - optional finite-difference qd
+         - optional feed-forward tau
+         - explicit external gains
     """
 
     def __init__(self, cfg: dict, project_root: str):
@@ -207,21 +203,17 @@ class Z1ArmAdapter:
         self.gripper_kd = float(cfg.get("z1_gripper_kd", 2000.0))
 
         # Fixed transforms used by policy EE computation
-        # base_link -> arm_base
         self.arm_base_pos_in_base = np.array(cfg["arm_base_offset_pos"], dtype=np.float32).reshape(3,)
         arm_base_rpy = np.array(cfg["arm_base_offset_rpy"], dtype=np.float32).reshape(3,)
         self.arm_base_rot_in_base = rotmat_from_rpy_xyz(*arm_base_rpy)
 
-        # SDK_EE -> policy_EE (for example gripperStator)
         self.sdk_ee_to_policy_pos = np.array(cfg["z1_fk_to_policy_ee_pos"], dtype=np.float32).reshape(3,)
         sdk_ee_to_policy_rpy = np.array(cfg["z1_fk_to_policy_ee_rpy"], dtype=np.float32).reshape(3,)
         self.sdk_ee_to_policy_rot = rotmat_from_rpy_xyz(*sdk_ee_to_policy_rpy)
 
-        # Default commanded pose
         self.default_arm_pos = np.array(cfg["default_arm_pos"], dtype=np.float32).reshape(6,)
         self.default_gripper_pos = float(cfg["default_gripper_pos"])
 
-        # Explicit external gains for startup / runtime
         self.arm_kps_startup = np.array(
             cfg.get("arm_kps_startup", [60.0, 80.0, 60.0, 40.0, 30.0, 20.0]),
             dtype=np.float32,
@@ -242,58 +234,68 @@ class Z1ArmAdapter:
         self.debug_print = bool(cfg.get("z1_debug_print", False))
         self._debug_counter = 0
 
-        # ------------------------------------------------------------------
-        # Command mode options
-        #
-        # arm_qd_mode:
-        #   "zero"        -> qd_cmd = 0
-        #   "finite_diff" -> qd_cmd = (q_cmd - prev_q_cmd) / dt
-        #
-        # arm_tau_mode:
-        #   "zero"        -> tau_ff = 0
-        #   "gravity"     -> inverseDynamics(q, 0, 0, 0)
-        #   "full_id"     -> inverseDynamics(q, qd_cmd, 0, 0)
-        #
-        # For training alignment, the recommended default is:
-        #   arm_qd_mode  = "zero"
-        #   arm_tau_mode = "zero"
-        # ------------------------------------------------------------------
         self.arm_qd_mode = str(cfg.get("arm_qd_mode", "zero"))
         self.arm_tau_mode = str(cfg.get("arm_tau_mode", "zero"))
 
-        # Runtime state cache
+        # Runtime communication objects
         self.arm = None
         self.arm_model = None
         self.lowcmd = None
 
+        # Cached measured state
         self.q = np.zeros(6, dtype=np.float32)
         self.qd = np.zeros(6, dtype=np.float32)
         self.tau = np.zeros(6, dtype=np.float32)
         self.gripper_q = 0.0
 
+        # Cached commanded state
         self.prev_q_cmd = self.default_arm_pos.copy()
+        self.prev_gripper_q_cmd = float(self.default_gripper_pos)
 
-        # Track the last applied gains so we only push them when changed.
+        # Last applied gains
         self._last_applied_kp = None
         self._last_applied_kd = None
 
+        # Communication / state locks
+        self._comm_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._target_lock = threading.Lock()
+
+        # Background control loop state
+        self._rt_thread = None
+        self._rt_running = False
+        self._rt_stop_event = threading.Event()
+
+        # Target segment for runtime interpolation
+        self._segment_start_q = self.default_arm_pos.copy()
+        self._segment_end_q = self.default_arm_pos.copy()
+        self._segment_start_gripper = float(self.default_gripper_pos)
+        self._segment_end_gripper = float(self.default_gripper_pos)
+        self._segment_start_time = 0.0
+        self._segment_duration = self.control_dt
+        self._segment_use_startup_gains = False
+
+        # FSM cache
+        self._fsm_state = None
+        self._last_fsm_error_print_time = 0.0
+
         print(f"[Z1ArmAdapter] z1_sdk_lib = {z1_sdk_lib}")
 
+    # --------------------------------------------------------------------------
     # Connection / state
+    # --------------------------------------------------------------------------
+
     def connect(self):
         """
         Create the Python arm object and switch to LOWCMD FSM.
 
-        This helper assumes the lowcmd-capable Python binding has already been
-        rebuilt so that:
-            arm._ctrlComp.lowcmd
-        is accessible from Python.
+        This method does not start the background loop yet.
+        Startup motions can still use the blocking helpers before runtime begins.
         """
         self.arm = self.unitree_arm_interface.ArmInterface(self.has_gripper)
         self.arm_model = self.arm._ctrlComp.armModel
         self.lowcmd = self.arm._ctrlComp.lowcmd
 
-        # Binding / interface checks should happen BEFORE any lowcmd-dependent call.
         if self.arm_model is None:
             raise RuntimeError("Z1 armModel is not accessible from Python binding.")
         if self.lowcmd is None:
@@ -301,26 +303,22 @@ class Z1ArmAdapter:
         if not hasattr(self.lowcmd, "setControlGain"):
             raise RuntimeError("Z1 lowcmd binding does not expose setControlGain().")
 
-        # Enter LOWCMD mode following the official low-level workflow.
         self.arm.setFsmLowcmd()
 
-        # Pull a few packets so the lowstate becomes fresh and the communication
-        # path is warm before the first real control command is sent.
+        # Warm up communication and refresh lowstate.
         for _ in range(20):
             self.arm.sendRecv()
             time.sleep(0.002)
 
-        self.read_state()
+        self._read_state_from_sdk_once()
         self.prev_q_cmd = self.q.copy()
+        self.prev_gripper_q_cmd = float(self.gripper_q)
 
-        # Apply startup gains immediately so any subsequent hold/move command
-        # uses explicit external gains rather than whatever stale values may
-        # already be inside lowcmd.
         self.set_control_gain(self.arm_kps_startup, self.arm_kds_startup)
 
         print("[Z1ArmAdapter] Connected.")
         print(f"[Z1ArmAdapter] FSM = {self.arm.getCurrentState()}")
-    
+
     def get_arm_dt(self) -> float:
         """
         Return the actual low-level control dt used by the Z1 SDK.
@@ -332,16 +330,12 @@ class Z1ArmAdapter:
         except Exception:
             return self.arm_control_dt
 
-    def read_state(self):
+    def _read_state_from_sdk_once(self):
         """
-        Update cached arm lowstate.
-
-        Important:
-        - This performs one sendRecv() call.
-        - The main controller should decide how often this is called.
+        Read the latest state from SDK and update local cache.
+        This method must only be called while holding the communication lock,
+        or when no background loop is running.
         """
-        self.arm.sendRecv()
-
         self.q = np.asarray(self.arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
         self.qd = np.asarray(self.arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
         self.tau = np.asarray(self.arm.lowstate.getTau(), dtype=np.float32).reshape(6,)
@@ -352,21 +346,49 @@ class Z1ArmAdapter:
         else:
             self.gripper_q = 0.0
 
+        self._fsm_state = self.arm.getCurrentState()
+
+    def read_state(self):
+        """
+        Refresh or return cached arm state.
+
+        Behavior:
+        - If the realtime loop is NOT running, this method performs one sendRecv().
+        - If the realtime loop IS running, this method only returns the cached state.
+        """
+        if not self.is_realtime_loop_running():
+            with self._comm_lock:
+                self.arm.sendRecv()
+                self._read_state_from_sdk_once()
+
+        with self._state_lock:
+            return {
+                "q": self.q.copy(),
+                "qd": self.qd.copy(),
+                "tau": self.tau.copy(),
+                "gripper_q": float(self.gripper_q),
+                "fsm": self._fsm_state,
+            }
+
+    def get_fsm_state(self):
+        """
+        Return the cached FSM state.
+        """
+        return self._fsm_state
+
+    # --------------------------------------------------------------------------
     # Low-level gain management
+    # --------------------------------------------------------------------------
+
     def set_control_gain(self, kp: np.ndarray, kd: np.ndarray):
         """
         Push explicit external gains into lowcmd.
 
-        Important:
-        - lowcmd.setControlGain() must NOT be spammed every tick at the binding layer.
-        - We therefore cache the last applied gains and only write when they change.
-        - The lowcmd gain vector is 7-dim in practice:
-            6 arm joints + 1 gripper channel.
+        Gains are only pushed when changed.
         """
         kp = np.asarray(kp, dtype=np.float32).reshape(6,)
         kd = np.asarray(kd, dtype=np.float32).reshape(6,)
 
-        # Avoid unnecessary repeated gain writes.
         if (
             self._last_applied_kp is not None
             and self._last_applied_kd is not None
@@ -375,8 +397,6 @@ class Z1ArmAdapter:
         ):
             return
 
-        # 7-dim lowcmd gains: 6 joints + 1 gripper channel.
-        # These gripper defaults match the behavior you observed in testing.
         kp_full = [float(x) for x in kp] + [self.gripper_kp]
         kd_full = [float(x) for x in kd] + [self.gripper_kd]
 
@@ -390,13 +410,13 @@ class Z1ArmAdapter:
             return self.arm_kps_startup, self.arm_kds_startup
         return self.arm_kps_runtime, self.arm_kds_runtime
 
+    # --------------------------------------------------------------------------
     # Command shaping
+    # --------------------------------------------------------------------------
+
     def _protect_joint_cmd(self, q_cmd: np.ndarray, qd_cmd: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Apply SDK joint protection if available.
-
-        The binding returns a pair:
-            (q_safe, qd_safe)
         """
         try:
             q_safe, qd_safe = self.arm_model.jointProtect(q_cmd.copy(), qd_cmd.copy())
@@ -410,9 +430,6 @@ class Z1ArmAdapter:
     def _compute_qd_cmd(self, q_cmd: np.ndarray) -> np.ndarray:
         """
         Compute desired joint velocity according to the configured mode.
-
-        Recommended training-aligned mode:
-            qd_cmd = 0
         """
         if self.arm_qd_mode == "zero":
             return np.zeros(6, dtype=np.float32)
@@ -424,10 +441,7 @@ class Z1ArmAdapter:
 
     def _compute_tau_ff(self, q_cmd: np.ndarray, qd_cmd: np.ndarray) -> np.ndarray:
         """
-        Compute the feed-forward torque according to the configured mode.
-
-        Recommended training-aligned mode:
-            tau_ff = 0
+        Compute feed-forward torque according to the configured mode.
         """
         if self.arm_tau_mode == "zero":
             return np.zeros(6, dtype=np.float32)
@@ -454,38 +468,30 @@ class Z1ArmAdapter:
 
         raise ValueError(f"Unsupported arm_tau_mode: {self.arm_tau_mode}")
 
-    # Main lowcmd send
-    def send_arm_command(self, q_cmd: np.ndarray, gripper_q_cmd: float, use_startup_gains: bool = False):
-        """
-        Send one lowcmd step to Z1 using explicit external gains.
+    # --------------------------------------------------------------------------
+    # Immediate one-step send (used by startup or internal realtime loop)
+    # --------------------------------------------------------------------------
 
-        Control semantics:
-        - q_cmd      : desired joint positions
-        - qd_cmd     : usually zero for training alignment
-        - tau_ff     : usually zero for training alignment
-        - kp / kd    : explicitly pushed through lowcmd.setControlGain(),
-                    but only when changed
+    def _send_arm_command_once(self, q_cmd: np.ndarray, gripper_q_cmd: float, use_startup_gains: bool = False):
+        """
+        Send one low-level command to Z1 and refresh the cached state.
+
+        This method assumes the caller already owns the communication timing.
         """
         q_cmd = np.asarray(q_cmd, dtype=np.float32).reshape(6,)
         qd_cmd = self._compute_qd_cmd(q_cmd)
 
-        # Apply SDK protection before sending.
         q_cmd, qd_cmd = self._protect_joint_cmd(q_cmd, qd_cmd)
-
-        # Compute feed-forward torque.
         tau_ff = self._compute_tau_ff(q_cmd, qd_cmd)
 
-        # Gains are configuration-like: only pushed when changed.
         kp_cmd, kd_cmd = self._get_gain_pair(use_startup_gains=use_startup_gains)
         self.set_control_gain(kp_cmd, kd_cmd)
 
-        # Fill the ArmInterface command fields.
         self.arm.q = q_cmd
         self.arm.qd = qd_cmd
         self.arm.tau = tau_ff
         self.arm.gripperQ = float(gripper_q_cmd)
 
-        # Send one low-level step.
         self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
         self.arm.setGripperCmd(
             float(gripper_q_cmd),
@@ -494,7 +500,10 @@ class Z1ArmAdapter:
         )
         self.arm.sendRecv()
 
-        self.prev_q_cmd = q_cmd.copy()
+        with self._state_lock:
+            self._read_state_from_sdk_once()
+            self.prev_q_cmd = q_cmd.copy()
+            self.prev_gripper_q_cmd = float(gripper_q_cmd)
 
         self._debug_counter += 1
         if self.debug_print and (self._debug_counter % 100 == 0):
@@ -506,7 +515,168 @@ class Z1ArmAdapter:
                 "gripper_q_cmd =", gripper_q_cmd,
                 "kp =", kp_cmd,
                 "kd =", kd_cmd,
+                "fsm =", self._fsm_state,
             )
+
+    def send_arm_command(self, q_cmd: np.ndarray, gripper_q_cmd: float, use_startup_gains: bool = False):
+        """
+        Public one-step send.
+
+        Notes:
+        - If the realtime loop is NOT running, this sends immediately.
+        - If the realtime loop IS running, do NOT use this from the main thread.
+          Update the runtime target through set_target() instead.
+        """
+        if self.is_realtime_loop_running():
+            raise RuntimeError("send_arm_command() must not be called from the main thread while realtime loop is running.")
+
+        with self._comm_lock:
+            self._send_arm_command_once(
+                q_cmd=q_cmd,
+                gripper_q_cmd=gripper_q_cmd,
+                use_startup_gains=use_startup_gains,
+            )
+
+    # --------------------------------------------------------------------------
+    # Realtime loop
+    # --------------------------------------------------------------------------
+
+    def is_realtime_loop_running(self) -> bool:
+        return self._rt_running and (self._rt_thread is not None) and self._rt_thread.is_alive()
+
+    def start_realtime_loop(
+        self,
+        initial_q_target: np.ndarray = None,
+        gripper_q_target: float = None,
+        use_startup_gains: bool = False,
+    ):
+        """
+        Start a dedicated 500 Hz control thread.
+
+        After this starts:
+        - The background thread owns sendRecv().
+        - The main thread should only update targets through set_target().
+        """
+        if self.is_realtime_loop_running():
+            return
+
+        if initial_q_target is None:
+            initial_q_target = self.prev_q_cmd.copy()
+        if gripper_q_target is None:
+            gripper_q_target = float(self.prev_gripper_q_cmd)
+
+        initial_q_target = np.asarray(initial_q_target, dtype=np.float32).reshape(6,)
+        gripper_q_target = float(gripper_q_target)
+
+        now = time.perf_counter()
+        with self._target_lock:
+            self._segment_start_q = self.prev_q_cmd.copy()
+            self._segment_end_q = initial_q_target.copy()
+            self._segment_start_gripper = float(self.prev_gripper_q_cmd)
+            self._segment_end_gripper = gripper_q_target
+            self._segment_start_time = now
+            self._segment_duration = max(self.control_dt, self.get_arm_dt())
+            self._segment_use_startup_gains = bool(use_startup_gains)
+
+        self._rt_stop_event.clear()
+        self._rt_running = True
+        self._rt_thread = threading.Thread(target=self._realtime_loop, daemon=True)
+        self._rt_thread.start()
+
+        print("[Z1ArmAdapter] Realtime loop started.")
+
+    def stop_realtime_loop(self):
+        """
+        Stop the dedicated realtime thread.
+        """
+        if not self.is_realtime_loop_running():
+            self._rt_running = False
+            return
+
+        self._rt_stop_event.set()
+        self._rt_thread.join(timeout=2.0)
+        self._rt_running = False
+        self._rt_thread = None
+
+        print("[Z1ArmAdapter] Realtime loop stopped.")
+
+    def set_target(
+        self,
+        q_target: np.ndarray,
+        gripper_q_target: float,
+        duration_s: float,
+        use_startup_gains: bool = False,
+    ):
+        """
+        Update the runtime interpolation target.
+
+        This method is non-blocking and intended to be called from the main thread.
+        """
+        q_target = np.asarray(q_target, dtype=np.float32).reshape(6,)
+        gripper_q_target = float(gripper_q_target)
+        duration_s = max(float(duration_s), self.get_arm_dt())
+
+        now = time.perf_counter()
+        with self._target_lock:
+            self._segment_start_q = self.prev_q_cmd.copy()
+            self._segment_end_q = q_target.copy()
+            self._segment_start_gripper = float(self.prev_gripper_q_cmd)
+            self._segment_end_gripper = gripper_q_target
+            self._segment_start_time = now
+            self._segment_duration = duration_s
+            self._segment_use_startup_gains = bool(use_startup_gains)
+
+    def _realtime_loop(self):
+        """
+        Dedicated realtime loop that owns sendRecv() during runtime.
+        """
+        dt = self.get_arm_dt()
+        next_tick = time.perf_counter()
+
+        while not self._rt_stop_event.is_set():
+            now = time.perf_counter()
+
+            with self._target_lock:
+                seg_q0 = self._segment_start_q.copy()
+                seg_q1 = self._segment_end_q.copy()
+                seg_g0 = float(self._segment_start_gripper)
+                seg_g1 = float(self._segment_end_gripper)
+                seg_t0 = float(self._segment_start_time)
+                seg_dt = float(self._segment_duration)
+                seg_use_startup = bool(self._segment_use_startup_gains)
+
+            alpha = 1.0
+            if seg_dt > 1e-6:
+                alpha = np.clip((now - seg_t0) / seg_dt, 0.0, 1.0)
+
+            q_cmd = (1.0 - alpha) * seg_q0 + alpha * seg_q1
+            gripper_cmd = (1.0 - alpha) * seg_g0 + alpha * seg_g1
+
+            with self._comm_lock:
+                self._send_arm_command_once(
+                    q_cmd=q_cmd,
+                    gripper_q_cmd=gripper_cmd,
+                    use_startup_gains=seg_use_startup,
+                )
+
+            fsm = self._fsm_state
+            if fsm != self.unitree_arm_interface.ArmFSMState.LOWCMD:
+                t_now = time.time()
+                if t_now - self._last_fsm_error_print_time > 0.5:
+                    print(f"[Z1ArmAdapter][ERROR] FSM dropped to {fsm} in realtime loop.")
+                    self._last_fsm_error_print_time = t_now
+
+            next_tick += dt
+            sleep_time = next_tick - time.perf_counter()
+            if sleep_time > 0.0:
+                time.sleep(sleep_time)
+            else:
+                next_tick = time.perf_counter()
+
+    # --------------------------------------------------------------------------
+    # Compatibility wrappers
+    # --------------------------------------------------------------------------
+
     def hold_target_once(
         self,
         q_target: np.ndarray,
@@ -521,7 +691,7 @@ class Z1ArmAdapter:
             gripper_q_cmd=gripper_q_target,
             use_startup_gains=use_startup_gains,
         )
-    
+
     def hold_target_for_duration(
         self,
         q_target: np.ndarray,
@@ -531,13 +701,21 @@ class Z1ArmAdapter:
         step_callback=None,
     ):
         """
-        Hold a fixed arm target for a given duration using the Z1 low-level rate.
+        Compatibility wrapper.
 
-        The target itself is not updated inside this function. This is intended
-        for the case where a higher-level controller updates targets at a slower
-        rate (e.g. 50 Hz), while the arm lowcmd is sent at a faster rate
-        (e.g. 500 Hz).
+        Behavior:
+        - If realtime loop is not running: blocking implementation.
+        - If realtime loop is running: non-blocking target update.
         """
+        if self.is_realtime_loop_running():
+            self.set_target(
+                q_target=q_target,
+                gripper_q_target=gripper_q_target,
+                duration_s=duration_s,
+                use_startup_gains=use_startup_gains,
+            )
+            return
+
         q_target = np.asarray(q_target, dtype=np.float32).reshape(6,)
         dt = self.get_arm_dt()
         num_steps = max(1, int(round(duration_s / dt)))
@@ -558,7 +736,7 @@ class Z1ArmAdapter:
                 step_callback()
 
             time.sleep(dt)
-    
+
     def track_target_for_duration(
         self,
         q_start: np.ndarray,
@@ -569,11 +747,21 @@ class Z1ArmAdapter:
         step_callback=None,
     ):
         """
-        Smoothly track from q_start to q_target at the arm low-level rate.
+        Compatibility wrapper.
 
-        This replaces zero-order hold of a fixed target inside one policy interval
-        with a linearly interpolated reference trajectory.
+        Behavior:
+        - If realtime loop is not running: blocking implementation.
+        - If realtime loop is running: non-blocking target update.
         """
+        if self.is_realtime_loop_running():
+            self.set_target(
+                q_target=q_target,
+                gripper_q_target=gripper_q_target,
+                duration_s=duration_s,
+                use_startup_gains=use_startup_gains,
+            )
+            return
+
         q_start = np.asarray(q_start, dtype=np.float32).reshape(6,)
         q_target = np.asarray(q_target, dtype=np.float32).reshape(6,)
 
@@ -582,8 +770,6 @@ class Z1ArmAdapter:
 
         for step in range(num_steps):
             alpha = float(step + 1) / float(num_steps)
-
-            # Linear interpolation from previous command to current target
             q_cmd = (1.0 - alpha) * q_start + alpha * q_target
 
             self.send_arm_command(
@@ -602,15 +788,20 @@ class Z1ArmAdapter:
 
             time.sleep(dt)
 
+    # --------------------------------------------------------------------------
     # Startup helpers
+    # --------------------------------------------------------------------------
+
     def move_to_pose(self, target_q: np.ndarray, duration: float, use_startup_gains: bool = True):
         """
-        Move smoothly to a target joint pose using linear interpolation in
-        joint space, with explicit external startup gains.
+        Move smoothly to a target joint pose using linear interpolation.
 
-        This is only for startup / transitions. Runtime policy control should
-        call send_arm_command() directly once per tick.
+        This method is intended for startup or transition phases before the
+        runtime realtime loop starts.
         """
+        if self.is_realtime_loop_running():
+            raise RuntimeError("move_to_pose() must not be used after realtime loop starts.")
+
         self.read_state()
         q0 = self.q.copy()
         target_q = np.asarray(target_q, dtype=np.float32).reshape(6,)
@@ -629,7 +820,7 @@ class Z1ArmAdapter:
 
         self.read_state()
         self.prev_q_cmd = self.q.copy()
-    
+
     def move_to_default_like_min_test(
         self,
         duration_s: float,
@@ -641,11 +832,11 @@ class Z1ArmAdapter:
         Move the arm to default pose using the exact low-level pattern that was
         validated by the standalone minimum test script.
 
-        Optional:
-            step_callback:
-                A function called once per arm control step, typically used to keep
-                the leg robot holding a default pose while the arm is moving.
+        This method must only be used before the realtime loop starts.
         """
+        if self.is_realtime_loop_running():
+            raise RuntimeError("move_to_default_like_min_test() must not be used after realtime loop starts.")
+
         self.read_state()
         q0 = self.q.copy()
         target_q = self.default_arm_pos.copy()
@@ -668,16 +859,13 @@ class Z1ArmAdapter:
         print("[Z1ArmAdapter] kp_full  =", kp_full)
         print("[Z1ArmAdapter] kd_full  =", kd_full)
 
-        # Re-enter LOWCMD before motion.
         self.arm.setFsmLowcmd()
         time.sleep(0.02)
 
-        # Warm up communication.
         for _ in range(10):
             self.arm.sendRecv()
             time.sleep(dt)
 
-        # Apply gains once before the motion loop.
         self.arm._ctrlComp.lowcmd.setControlGain(kp_full, kd_full)
 
         for step in range(num_steps):
@@ -696,7 +884,8 @@ class Z1ArmAdapter:
             self.arm.setGripperCmd(self.arm.gripperQ, self.arm.gripperQd, self.arm.gripperTau)
             self.arm.sendRecv()
 
-            # Keep the leg robot holding default pose if requested.
+            self._read_state_from_sdk_once()
+
             if step_callback is not None:
                 step_callback()
 
@@ -726,6 +915,7 @@ class Z1ArmAdapter:
 
         self.read_state()
         self.prev_q_cmd = self.q.copy()
+        self.prev_gripper_q_cmd = float(self.gripper_q)
 
         print("[Z1ArmAdapter] final q =", np.round(self.q, 4))
 
@@ -742,44 +932,34 @@ class Z1ArmAdapter:
     def safe_back_to_start(self):
         """
         Optional SDK-provided recovery motion.
-
-        Intentionally left as a no-op in this deployment helper, so shutdown
-        does not trigger an extra uncontrolled arm motion.
         """
         pass
 
+    # --------------------------------------------------------------------------
     # FK / policy EE conversion
+    # --------------------------------------------------------------------------
+
     def compute_policy_ee_pose_in_base(self) -> Tuple[np.ndarray, np.ndarray]:
         """
         Return the policy EE pose in B2W base_link frame.
 
-        Steps:
-        1) SDK FK:
-              forwardKinematics(q, ee_index)
-           gives the SDK EE pose in arm_base frame.
-        2) Apply the fixed transform:
-              SDK_EE -> policy_EE
-        3) Apply the fixed transform:
-              arm_base -> base_link
+        State reading is not performed here.
+        The method uses the cached q updated by either read_state() or the
+        background realtime loop.
         """
-        # Important:
-        # do not call read_state() here.
-        # State reading is owned by the main deployment controller so the timing
-        # remains consistent and easy to reason about.
+        q_fk = self.q.copy()
 
         T_sdk = np.asarray(
-            self.arm_model.forwardKinematics(self.q, self.ee_index),
+            self.arm_model.forwardKinematics(q_fk, self.ee_index),
             dtype=np.float32,
         ).reshape(4, 4)
 
         R_sdk = T_sdk[:3, :3]
         p_sdk = T_sdk[:3, 3]
 
-        # SDK EE -> policy EE
         R_policy_in_arm = (R_sdk @ self.sdk_ee_to_policy_rot).astype(np.float32)
         p_policy_in_arm = (p_sdk + R_sdk @ self.sdk_ee_to_policy_pos).astype(np.float32)
 
-        # arm_base -> base_link
         R_policy_in_base = (self.arm_base_rot_in_base @ R_policy_in_arm).astype(np.float32)
         p_policy_in_base = (
             self.arm_base_pos_in_base + self.arm_base_rot_in_base @ p_policy_in_arm

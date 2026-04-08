@@ -100,7 +100,6 @@ kds_pd: [
 #   leg(12) + arm(6) + wheel(4)
 leg_action_scale: 0.25
 arm_action_scale: [0.25, 0.40, 0.25, 0.25, 0.25, 0.20]
-arm_policy_step_max: [0.08, 0.08, 0.08, 0.10, 0.10, 0.10]
 wheel_action_scale: 4.0
 
 # Z1 explicit lowcmd gains
@@ -115,13 +114,12 @@ arm_kds_startup: [ 3.0,  3.0,  3.0,  3.0,  3.0,  3.0]
 arm_kps_runtime: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
 arm_kds_runtime: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
 
+z1_runtime_tau_clip: [33, 66, 33, 33, 33, 33]
+z1_runtime_target_step_clip: [0.02, 0.025, 0.02, 0.03, 0.03, 0.03]
+
 # Gripper lowcmd gain
 z1_gripper_kp: 20.0
 z1_gripper_kd: 2000.0
-
-# Recommended training-aligned default:
-arm_qd_mode: "zero"   # zero | finite_diff
-arm_tau_mode: "zero"  # zero | gravity | full_id
 
 # Z1 SDK / arm kinematics
 z1_has_gripper: true

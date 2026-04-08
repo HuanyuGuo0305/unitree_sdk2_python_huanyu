@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import importlib
+import threading
 from typing import Tuple
 
 import numpy as np
@@ -35,9 +36,6 @@ def rotmat_from_rpy_xyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
 
     Convention:
         R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
-
-    This is the standard fixed-axis XYZ-roll-pitch-yaw composition used
-    for configuration-driven extrinsics.
     """
     sr, cr = np.sin(roll), np.cos(roll)
     sp, cp = np.sin(pitch), np.cos(pitch)
@@ -68,10 +66,6 @@ def rotmat_from_rpy_xyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
 class PresampledKeypointsInterpolateCommandLBSim:
     """
     Single-environment NumPy version of PresampledKeypointsInterpolateCommandLB.
-
-    This helper is intentionally kept numerically aligned with the MuJoCo
-    sim2sim helper so that EE command generation remains consistent between
-    simulation and deployment.
     """
 
     def __init__(
@@ -168,22 +162,16 @@ class PresampledKeypointsInterpolateCommandLBSim:
         )
 
 
-import threading
-
-
 class Z1ArmAdapter:
     """
-    Thin helper around the modified Unitree Z1 Python binding.
+    Z1 arm helper with:
 
-    Design goals:
-    1. Keep startup motions compatible with the current blocking implementation.
-    2. Use a dedicated 500 Hz background control loop during runtime.
-    3. Prevent the main thread from blocking the Z1 UDP communication.
-    4. Keep training-aligned command semantics:
-         - position target
-         - optional finite-difference qd
-         - optional feed-forward tau
-         - explicit external gains
+    1. blocking startup motion helpers
+    2. dedicated 500 Hz runtime lowcmd loop
+    3. runtime semantics:
+         q_cmd   = policy target
+         qd_cmd  = 0
+         tau_cmd = PD(q_target - q_meas, 0 - qd_meas)
     """
 
     def __init__(self, cfg: dict, project_root: str):
@@ -211,17 +199,21 @@ class Z1ArmAdapter:
         sdk_ee_to_policy_rpy = np.array(cfg["z1_fk_to_policy_ee_rpy"], dtype=np.float32).reshape(3,)
         self.sdk_ee_to_policy_rot = rotmat_from_rpy_xyz(*sdk_ee_to_policy_rpy)
 
+        # Default target
         self.default_arm_pos = np.array(cfg["default_arm_pos"], dtype=np.float32).reshape(6,)
         self.default_gripper_pos = float(cfg["default_gripper_pos"])
 
+        # Startup gains
         self.arm_kps_startup = np.array(
-            cfg.get("arm_kps_startup", [60.0, 80.0, 60.0, 40.0, 30.0, 20.0]),
+            cfg.get("arm_kps_startup", [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]),
             dtype=np.float32,
         ).reshape(6,)
         self.arm_kds_startup = np.array(
-            cfg.get("arm_kds_startup", [4.0, 5.0, 4.0, 3.0, 2.0, 2.0]),
+            cfg.get("arm_kds_startup", [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]),
             dtype=np.float32,
         ).reshape(6,)
+
+        # Runtime gains
         self.arm_kps_runtime = np.array(
             cfg.get("arm_kps_runtime", [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]),
             dtype=np.float32,
@@ -232,66 +224,56 @@ class Z1ArmAdapter:
         ).reshape(6,)
 
         self.debug_print = bool(cfg.get("z1_debug_print", False))
-        self._debug_counter = 0
+        self.runtime_tau_clip = np.array(
+            cfg.get("z1_runtime_tau_clip", [60.0, 60.0, 60.0, 30.0, 20.0, 20.0]),
+            dtype=np.float32,
+        ).reshape(6,)
+        self.runtime_target_step_clip = np.array(
+            cfg.get("z1_runtime_target_step_clip", [0.03, 0.03, 0.03, 0.04, 0.04, 0.04]),
+            dtype=np.float32,
+        ).reshape(6,)
 
-        self.arm_qd_mode = str(cfg.get("arm_qd_mode", "zero"))
-        self.arm_tau_mode = str(cfg.get("arm_tau_mode", "zero"))
-
-        # Runtime communication objects
+        # communication objects
         self.arm = None
         self.arm_model = None
         self.lowcmd = None
 
-        # Cached measured state
+        # measured state cache
         self.q = np.zeros(6, dtype=np.float32)
         self.qd = np.zeros(6, dtype=np.float32)
         self.tau = np.zeros(6, dtype=np.float32)
         self.gripper_q = 0.0
 
-        # Cached commanded state
+        # last command cache
         self.prev_q_cmd = self.default_arm_pos.copy()
         self.prev_gripper_q_cmd = float(self.default_gripper_pos)
 
-        # Last applied gains
         self._last_applied_kp = None
         self._last_applied_kd = None
+        self._debug_counter = 0
+        self._fsm_state = None
+        self._last_fsm_error_print_time = 0.0
 
-        # Communication / state locks
+        # locks
         self._comm_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._target_lock = threading.Lock()
 
-        # Background control loop state
+        # realtime loop
         self._rt_thread = None
-        self._rt_running = False
         self._rt_stop_event = threading.Event()
+        self._rt_running = False
 
-        # Target segment for runtime interpolation
-        self._segment_start_q = self.default_arm_pos.copy()
-        self._segment_end_q = self.default_arm_pos.copy()
-        self._segment_start_gripper = float(self.default_gripper_pos)
-        self._segment_end_gripper = float(self.default_gripper_pos)
-        self._segment_start_time = 0.0
-        self._segment_duration = self.control_dt
-        self._segment_use_startup_gains = False
-
-        # FSM cache
-        self._fsm_state = None
-        self._last_fsm_error_print_time = 0.0
+        # high-level shared target
+        self._rt_q_target = self.default_arm_pos.copy()
+        self._rt_gripper_target = float(self.default_gripper_pos)
+        self._rt_use_startup_gains = False
 
         print(f"[Z1ArmAdapter] z1_sdk_lib = {z1_sdk_lib}")
 
-    # --------------------------------------------------------------------------
     # Connection / state
-    # --------------------------------------------------------------------------
 
     def connect(self):
-        """
-        Create the Python arm object and switch to LOWCMD FSM.
-
-        This method does not start the background loop yet.
-        Startup motions can still use the blocking helpers before runtime begins.
-        """
         self.arm = self.unitree_arm_interface.ArmInterface(self.has_gripper)
         self.arm_model = self.arm._ctrlComp.armModel
         self.lowcmd = self.arm._ctrlComp.lowcmd
@@ -305,12 +287,12 @@ class Z1ArmAdapter:
 
         self.arm.setFsmLowcmd()
 
-        # Warm up communication and refresh lowstate.
         for _ in range(20):
             self.arm.sendRecv()
             time.sleep(0.002)
 
         self._read_state_from_sdk_once()
+
         self.prev_q_cmd = self.q.copy()
         self.prev_gripper_q_cmd = float(self.gripper_q)
 
@@ -320,9 +302,6 @@ class Z1ArmAdapter:
         print(f"[Z1ArmAdapter] FSM = {self.arm.getCurrentState()}")
 
     def get_arm_dt(self) -> float:
-        """
-        Return the actual low-level control dt used by the Z1 SDK.
-        """
         if self.arm is None:
             return self.arm_control_dt
         try:
@@ -331,11 +310,6 @@ class Z1ArmAdapter:
             return self.arm_control_dt
 
     def _read_state_from_sdk_once(self):
-        """
-        Read the latest state from SDK and update local cache.
-        This method must only be called while holding the communication lock,
-        or when no background loop is running.
-        """
         self.q = np.asarray(self.arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
         self.qd = np.asarray(self.arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
         self.tau = np.asarray(self.arm.lowstate.getTau(), dtype=np.float32).reshape(6,)
@@ -349,13 +323,6 @@ class Z1ArmAdapter:
         self._fsm_state = self.arm.getCurrentState()
 
     def read_state(self):
-        """
-        Refresh or return cached arm state.
-
-        Behavior:
-        - If the realtime loop is NOT running, this method performs one sendRecv().
-        - If the realtime loop IS running, this method only returns the cached state.
-        """
         if not self.is_realtime_loop_running():
             with self._comm_lock:
                 self.arm.sendRecv()
@@ -371,21 +338,11 @@ class Z1ArmAdapter:
             }
 
     def get_fsm_state(self):
-        """
-        Return the cached FSM state.
-        """
         return self._fsm_state
 
-    # --------------------------------------------------------------------------
-    # Low-level gain management
-    # --------------------------------------------------------------------------
+    # Gain management
 
     def set_control_gain(self, kp: np.ndarray, kd: np.ndarray):
-        """
-        Push explicit external gains into lowcmd.
-
-        Gains are only pushed when changed.
-        """
         kp = np.asarray(kp, dtype=np.float32).reshape(6,)
         kd = np.asarray(kd, dtype=np.float32).reshape(6,)
 
@@ -399,25 +356,24 @@ class Z1ArmAdapter:
 
         kp_full = [float(x) for x in kp] + [self.gripper_kp]
         kd_full = [float(x) for x in kd] + [self.gripper_kd]
-
         self.lowcmd.setControlGain(kp_full, kd_full)
 
         self._last_applied_kp = kp.copy()
         self._last_applied_kd = kd.copy()
 
-    def _get_gain_pair(self, use_startup_gains: bool) -> Tuple[np.ndarray, np.ndarray]:
+    def _get_lowcmd_gain_pair(self, use_startup_gains: bool) -> Tuple[np.ndarray, np.ndarray]:
+        if use_startup_gains:
+            return self.arm_kps_startup, self.arm_kds_startup
+        return np.zeros(6, dtype=np.float32), np.zeros(6, dtype=np.float32)
+
+    def _get_external_pd_gain_pair(self, use_startup_gains: bool) -> Tuple[np.ndarray, np.ndarray]:
         if use_startup_gains:
             return self.arm_kps_startup, self.arm_kds_startup
         return self.arm_kps_runtime, self.arm_kds_runtime
 
-    # --------------------------------------------------------------------------
-    # Command shaping
-    # --------------------------------------------------------------------------
+    # Helper functions
 
     def _protect_joint_cmd(self, q_cmd: np.ndarray, qd_cmd: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Apply SDK joint protection if available.
-        """
         try:
             q_safe, qd_safe = self.arm_model.jointProtect(q_cmd.copy(), qd_cmd.copy())
             return (
@@ -427,69 +383,49 @@ class Z1ArmAdapter:
         except Exception:
             return q_cmd, qd_cmd
 
-    def _compute_qd_cmd(self, q_cmd: np.ndarray) -> np.ndarray:
-        """
-        Compute desired joint velocity according to the configured mode.
-        """
-        if self.arm_qd_mode == "zero":
-            return np.zeros(6, dtype=np.float32)
+    def _compute_runtime_tau(
+        self,
+        q_target: np.ndarray,
+        qd_target: np.ndarray,
+        q_meas: np.ndarray,
+        qd_meas: np.ndarray,
+        use_startup_gains: bool,
+    ) -> np.ndarray:
+        kp, kd = self._get_external_pd_gain_pair(use_startup_gains)
+        tau_cmd = kp * (q_target - q_meas) + kd * (qd_target - qd_meas)
+        tau_cmd = np.clip(tau_cmd, -self.runtime_tau_clip, self.runtime_tau_clip)
+        return tau_cmd.astype(np.float32)
 
-        if self.arm_qd_mode == "finite_diff":
-            return ((q_cmd - self.prev_q_cmd) / self.get_arm_dt()).astype(np.float32)
+    # Immediate one-step send
 
-        raise ValueError(f"Unsupported arm_qd_mode: {self.arm_qd_mode}")
-
-    def _compute_tau_ff(self, q_cmd: np.ndarray, qd_cmd: np.ndarray) -> np.ndarray:
-        """
-        Compute feed-forward torque according to the configured mode.
-        """
-        if self.arm_tau_mode == "zero":
-            return np.zeros(6, dtype=np.float32)
-
-        qdd_cmd = np.zeros(6, dtype=np.float32)
-        ftip = np.zeros(6, dtype=np.float32)
-
-        if self.arm_tau_mode == "gravity":
-            return np.asarray(
-                self.arm_model.inverseDynamics(
-                    q_cmd,
-                    np.zeros(6, dtype=np.float32),
-                    qdd_cmd,
-                    ftip,
-                ),
-                dtype=np.float32,
-            ).reshape(6,)
-
-        if self.arm_tau_mode == "full_id":
-            return np.asarray(
-                self.arm_model.inverseDynamics(q_cmd, qd_cmd, qdd_cmd, ftip),
-                dtype=np.float32,
-            ).reshape(6,)
-
-        raise ValueError(f"Unsupported arm_tau_mode: {self.arm_tau_mode}")
-
-    # --------------------------------------------------------------------------
-    # Immediate one-step send (used by startup or internal realtime loop)
-    # --------------------------------------------------------------------------
-
-    def _send_arm_command_once(self, q_cmd: np.ndarray, gripper_q_cmd: float, use_startup_gains: bool = False):
-        """
-        Send one low-level command to Z1 and refresh the cached state.
-
-        This method assumes the caller already owns the communication timing.
-        """
+    def _send_arm_command_once(
+        self,
+        q_cmd: np.ndarray,
+        gripper_q_cmd: float,
+        use_startup_gains: bool = False,
+        qd_cmd: np.ndarray = None,
+        tau_cmd: np.ndarray = None,
+    ):
         q_cmd = np.asarray(q_cmd, dtype=np.float32).reshape(6,)
-        qd_cmd = self._compute_qd_cmd(q_cmd)
+
+        if qd_cmd is None:
+            qd_cmd = np.zeros(6, dtype=np.float32)
+        else:
+            qd_cmd = np.asarray(qd_cmd, dtype=np.float32).reshape(6,)
+
+        if tau_cmd is None:
+            tau_cmd = np.zeros(6, dtype=np.float32)
+        else:
+            tau_cmd = np.asarray(tau_cmd, dtype=np.float32).reshape(6,)
 
         q_cmd, qd_cmd = self._protect_joint_cmd(q_cmd, qd_cmd)
-        tau_ff = self._compute_tau_ff(q_cmd, qd_cmd)
 
-        kp_cmd, kd_cmd = self._get_gain_pair(use_startup_gains=use_startup_gains)
+        kp_cmd, kd_cmd = self._get_lowcmd_gain_pair(use_startup_gains=use_startup_gains)
         self.set_control_gain(kp_cmd, kd_cmd)
 
         self.arm.q = q_cmd
         self.arm.qd = qd_cmd
-        self.arm.tau = tau_ff
+        self.arm.tau = tau_cmd
         self.arm.gripperQ = float(gripper_q_cmd)
 
         self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
@@ -508,38 +444,41 @@ class Z1ArmAdapter:
         self._debug_counter += 1
         if self.debug_print and (self._debug_counter % 100 == 0):
             print(
-                "[Z1ArmAdapter] Sending arm command:",
-                "q_cmd =", q_cmd,
-                "qd_cmd =", qd_cmd,
-                "tau_ff =", tau_ff,
-                "gripper_q_cmd =", gripper_q_cmd,
-                "kp =", kp_cmd,
-                "kd =", kd_cmd,
+                "[Z1ArmAdapter] send_once:",
+                "q_cmd =", np.round(q_cmd, 4),
+                "qd_cmd =", np.round(qd_cmd, 4),
+                "tau_cmd =", np.round(tau_cmd, 4),
                 "fsm =", self._fsm_state,
             )
 
     def send_arm_command(self, q_cmd: np.ndarray, gripper_q_cmd: float, use_startup_gains: bool = False):
-        """
-        Public one-step send.
-
-        Notes:
-        - If the realtime loop is NOT running, this sends immediately.
-        - If the realtime loop IS running, do NOT use this from the main thread.
-          Update the runtime target through set_target() instead.
-        """
         if self.is_realtime_loop_running():
-            raise RuntimeError("send_arm_command() must not be called from the main thread while realtime loop is running.")
+            raise RuntimeError("send_arm_command() must not be called while realtime loop is running.")
+
+        q_cmd = np.asarray(q_cmd, dtype=np.float32).reshape(6,)
+        qd_cmd = np.zeros(6, dtype=np.float32)
 
         with self._comm_lock:
+            q_meas = np.asarray(self.arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
+            qd_meas = np.asarray(self.arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
+
+            tau_cmd = self._compute_runtime_tau(
+                q_target=q_cmd,
+                qd_target=qd_cmd,
+                q_meas=q_meas,
+                qd_meas=qd_meas,
+                use_startup_gains=use_startup_gains,
+            )
+
             self._send_arm_command_once(
                 q_cmd=q_cmd,
                 gripper_q_cmd=gripper_q_cmd,
                 use_startup_gains=use_startup_gains,
+                qd_cmd=qd_cmd,
+                tau_cmd=tau_cmd,
             )
 
-    # --------------------------------------------------------------------------
-    # Realtime loop
-    # --------------------------------------------------------------------------
+    # Runtime realtime loop
 
     def is_realtime_loop_running(self) -> bool:
         return self._rt_running and (self._rt_thread is not None) and self._rt_thread.is_alive()
@@ -550,13 +489,6 @@ class Z1ArmAdapter:
         gripper_q_target: float = None,
         use_startup_gains: bool = False,
     ):
-        """
-        Start a dedicated 500 Hz control thread.
-
-        After this starts:
-        - The background thread owns sendRecv().
-        - The main thread should only update targets through set_target().
-        """
         if self.is_realtime_loop_running():
             return
 
@@ -564,19 +496,16 @@ class Z1ArmAdapter:
             initial_q_target = self.prev_q_cmd.copy()
         if gripper_q_target is None:
             gripper_q_target = float(self.prev_gripper_q_cmd)
+        
+        self.read_state()
+        self.prev_q_cmd = self.q.copy()
+        self.prev_gripper_q_cmd = float(self.gripper_q)
 
-        initial_q_target = np.asarray(initial_q_target, dtype=np.float32).reshape(6,)
-        gripper_q_target = float(gripper_q_target)
-
-        now = time.perf_counter()
         with self._target_lock:
-            self._segment_start_q = self.prev_q_cmd.copy()
-            self._segment_end_q = initial_q_target.copy()
-            self._segment_start_gripper = float(self.prev_gripper_q_cmd)
-            self._segment_end_gripper = gripper_q_target
-            self._segment_start_time = now
-            self._segment_duration = max(self.control_dt, self.get_arm_dt())
-            self._segment_use_startup_gains = bool(use_startup_gains)
+            self._rt_q_target = np.asarray(initial_q_target, dtype=np.float32).reshape(6,)
+            self._rt_gripper_target = float(gripper_q_target)
+            self._rt_use_startup_gains = bool(use_startup_gains)
+        
 
         self._rt_stop_event.clear()
         self._rt_running = True
@@ -586,9 +515,6 @@ class Z1ArmAdapter:
         print("[Z1ArmAdapter] Realtime loop started.")
 
     def stop_realtime_loop(self):
-        """
-        Stop the dedicated realtime thread.
-        """
         if not self.is_realtime_loop_running():
             self._rt_running = False
             return
@@ -607,56 +533,48 @@ class Z1ArmAdapter:
         duration_s: float,
         use_startup_gains: bool = False,
     ):
-        """
-        Update the runtime interpolation target.
-
-        This method is non-blocking and intended to be called from the main thread.
-        """
         q_target = np.asarray(q_target, dtype=np.float32).reshape(6,)
-        gripper_q_target = float(gripper_q_target)
-        duration_s = max(float(duration_s), self.get_arm_dt())
 
-        now = time.perf_counter()
         with self._target_lock:
-            self._segment_start_q = self.prev_q_cmd.copy()
-            self._segment_end_q = q_target.copy()
-            self._segment_start_gripper = float(self.prev_gripper_q_cmd)
-            self._segment_end_gripper = gripper_q_target
-            self._segment_start_time = now
-            self._segment_duration = duration_s
-            self._segment_use_startup_gains = bool(use_startup_gains)
+            self._rt_q_target = q_target.copy()
+            self._rt_gripper_target = float(gripper_q_target)
+            self._rt_use_startup_gains = bool(use_startup_gains)
 
     def _realtime_loop(self):
-        """
-        Dedicated realtime loop that owns sendRecv() during runtime.
-        """
         dt = self.get_arm_dt()
         next_tick = time.perf_counter()
 
         while not self._rt_stop_event.is_set():
-            now = time.perf_counter()
-
             with self._target_lock:
-                seg_q0 = self._segment_start_q.copy()
-                seg_q1 = self._segment_end_q.copy()
-                seg_g0 = float(self._segment_start_gripper)
-                seg_g1 = float(self._segment_end_gripper)
-                seg_t0 = float(self._segment_start_time)
-                seg_dt = float(self._segment_duration)
-                seg_use_startup = bool(self._segment_use_startup_gains)
-
-            alpha = 1.0
-            if seg_dt > 1e-6:
-                alpha = np.clip((now - seg_t0) / seg_dt, 0.0, 1.0)
-
-            q_cmd = (1.0 - alpha) * seg_q0 + alpha * seg_q1
-            gripper_cmd = (1.0 - alpha) * seg_g0 + alpha * seg_g1
+                q_target = self._rt_q_target.copy()
+                gripper_target = float(self._rt_gripper_target)
+                use_startup_gains = bool(self._rt_use_startup_gains)
 
             with self._comm_lock:
+                q_meas = np.asarray(self.arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
+                qd_meas = np.asarray(self.arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
+
+                q_target_limited = self.prev_q_cmd + np.clip(
+                    q_target - self.prev_q_cmd,
+                    -self.runtime_target_step_clip,
+                    self.runtime_target_step_clip,
+                )
+
+                qd_cmd = np.zeros(6, dtype=np.float32)
+                tau_cmd = self._compute_runtime_tau(
+                    q_target=q_target_limited,
+                    qd_target=qd_cmd,
+                    q_meas=q_meas,
+                    qd_meas=qd_meas,
+                    use_startup_gains=use_startup_gains,
+                )
+
                 self._send_arm_command_once(
-                    q_cmd=q_cmd,
-                    gripper_q_cmd=gripper_cmd,
-                    use_startup_gains=seg_use_startup,
+                    q_cmd=q_target_limited,
+                    gripper_q_cmd=gripper_target,
+                    use_startup_gains=use_startup_gains,
+                    qd_cmd=qd_cmd,
+                    tau_cmd=tau_cmd,
                 )
 
             fsm = self._fsm_state
@@ -673,9 +591,7 @@ class Z1ArmAdapter:
             else:
                 next_tick = time.perf_counter()
 
-    # --------------------------------------------------------------------------
     # Compatibility wrappers
-    # --------------------------------------------------------------------------
 
     def hold_target_once(
         self,
@@ -683,9 +599,6 @@ class Z1ArmAdapter:
         gripper_q_target: float,
         use_startup_gains: bool = False,
     ):
-        """
-        Send one low-level command that holds the given arm target.
-        """
         self.send_arm_command(
             q_cmd=q_target,
             gripper_q_cmd=gripper_q_target,
@@ -700,13 +613,6 @@ class Z1ArmAdapter:
         use_startup_gains: bool = False,
         step_callback=None,
     ):
-        """
-        Compatibility wrapper.
-
-        Behavior:
-        - If realtime loop is not running: blocking implementation.
-        - If realtime loop is running: non-blocking target update.
-        """
         if self.is_realtime_loop_running():
             self.set_target(
                 q_target=q_target,
@@ -746,13 +652,6 @@ class Z1ArmAdapter:
         use_startup_gains: bool = False,
         step_callback=None,
     ):
-        """
-        Compatibility wrapper.
-
-        Behavior:
-        - If realtime loop is not running: blocking implementation.
-        - If realtime loop is running: non-blocking target update.
-        """
         if self.is_realtime_loop_running():
             self.set_target(
                 q_target=q_target,
@@ -788,17 +687,9 @@ class Z1ArmAdapter:
 
             time.sleep(dt)
 
-    # --------------------------------------------------------------------------
     # Startup helpers
-    # --------------------------------------------------------------------------
 
     def move_to_pose(self, target_q: np.ndarray, duration: float, use_startup_gains: bool = True):
-        """
-        Move smoothly to a target joint pose using linear interpolation.
-
-        This method is intended for startup or transition phases before the
-        runtime realtime loop starts.
-        """
         if self.is_realtime_loop_running():
             raise RuntimeError("move_to_pose() must not be used after realtime loop starts.")
 
@@ -829,10 +720,7 @@ class Z1ArmAdapter:
         step_callback=None,
     ):
         """
-        Move the arm to default pose using the exact low-level pattern that was
-        validated by the standalone minimum test script.
-
-        This method must only be used before the realtime loop starts.
+        Startup motion that stays close to your validated standalone script.
         """
         if self.is_realtime_loop_running():
             raise RuntimeError("move_to_default_like_min_test() must not be used after realtime loop starts.")
@@ -873,7 +761,27 @@ class Z1ArmAdapter:
 
             q_cmd = q0 * (1.0 - alpha) + target_q * alpha
             qd_cmd = np.zeros(6, dtype=np.float32)
-            tau_cmd = np.zeros(6, dtype=np.float32)
+
+            # 这里保留“更稳定”的做法：PD + ID
+            q_meas = np.asarray(self.arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
+            qd_meas = np.asarray(self.arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
+
+            tau_pd = kp * (q_cmd - q_meas) + kd * (qd_cmd - qd_meas)
+            try:
+                tau_ff = np.asarray(
+                    self.arm_model.inverseDynamics(
+                        q_cmd.astype(np.float32),
+                        qd_cmd.astype(np.float32),
+                        np.zeros(6, dtype=np.float32),
+                        np.zeros(6, dtype=np.float32),
+                    ),
+                    dtype=np.float32,
+                ).reshape(6,)
+            except Exception:
+                tau_ff = np.zeros(6, dtype=np.float32)
+
+            tau_cmd = tau_pd + tau_ff
+            tau_cmd = np.clip(tau_cmd, -self.runtime_tau_clip, self.runtime_tau_clip)
 
             self.arm.q = q_cmd
             self.arm.qd = qd_cmd
@@ -920,9 +828,6 @@ class Z1ArmAdapter:
         print("[Z1ArmAdapter] final q =", np.round(self.q, 4))
 
     def hold_default_step(self):
-        """
-        Send one hold step at the default arm pose using startup gains.
-        """
         self.send_arm_command(
             q_cmd=self.default_arm_pos,
             gripper_q_cmd=self.default_gripper_pos,
@@ -930,23 +835,11 @@ class Z1ArmAdapter:
         )
 
     def safe_back_to_start(self):
-        """
-        Optional SDK-provided recovery motion.
-        """
         pass
 
-    # --------------------------------------------------------------------------
     # FK / policy EE conversion
-    # --------------------------------------------------------------------------
 
     def compute_policy_ee_pose_in_base(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Return the policy EE pose in B2W base_link frame.
-
-        State reading is not performed here.
-        The method uses the cached q updated by either read_state() or the
-        background realtime loop.
-        """
         q_fk = self.q.copy()
 
         T_sdk = np.asarray(
@@ -976,10 +869,6 @@ def compute_ee_current_kp_lb(
 ) -> np.ndarray:
     """
     Compute current EE keypoints in level-base (LB) frame.
-
-    Because the LB frame shares the same origin as base_link, we do not need a
-    global base position here. We only need the orientation change from body
-    frame to level-base frame.
     """
     base_quat_wxyz = quat_unique_wxyz(quat_normalize_wxyz(base_quat_wxyz))
 
@@ -990,15 +879,12 @@ def compute_ee_current_kp_lb(
     lb_quat_w = quat_from_yaw_wxyz(yaw)
     lb_quat_w = quat_unique_wxyz(quat_normalize_wxyz(lb_quat_w))
 
-    # Convert orientation from base frame to level-base frame:
-    # q_lb_ee = q_lb_w^{-1} * q_w_b * q_b_ee
     ee_quat_lb = quat_mul_wxyz(
         quat_conjugate_wxyz(lb_quat_w),
         quat_mul_wxyz(base_quat_wxyz, ee_quat_b),
     )
     ee_quat_lb = quat_unique_wxyz(quat_normalize_wxyz(ee_quat_lb))
 
-    # Convert position from base frame to level-base frame.
     ee_pos_w = quat_apply_wxyz(base_quat_wxyz, ee_pos_b)
     ee_pos_lb = quat_apply_inverse_wxyz(lb_quat_w, ee_pos_w)
 

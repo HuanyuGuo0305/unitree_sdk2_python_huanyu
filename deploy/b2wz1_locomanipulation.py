@@ -105,10 +105,6 @@ class B2WZ1LocoManipController:
         self.leg_action_scale = float(self.cfg["leg_action_scale"])
         self.arm_action_scale = np.array(self.cfg["arm_action_scale"], dtype=np.float32).reshape(6,)
         # Maximum allowed arm target change per policy step (rad)
-        self.arm_policy_step_max = np.array(
-            self.cfg.get("arm_policy_step_max", [0.08, 0.08, 0.08, 0.10, 0.10, 0.10]),
-            dtype=np.float32,
-        ).reshape(6,)
         self.wheel_action_scale = float(self.cfg["wheel_action_scale"])
 
         # Arm defaults
@@ -477,19 +473,6 @@ class B2WZ1LocoManipController:
         - Wheels remain stopped
         """
         self._write_b2w_pose_cmd_policy(self.default_b2w_pos_policy, use_pd_gains=True)
-    
-    def _limit_arm_target_step(self, raw_target: np.ndarray) -> np.ndarray:
-        """
-        Limit the change of arm target relative to the previously commanded target.
-        This reduces sudden target jumps at the policy rate.
-        """
-        raw_target = np.asarray(raw_target, dtype=np.float32).reshape(6,)
-
-        delta = raw_target - self.z1.prev_q_cmd
-        delta = np.clip(delta, -self.arm_policy_step_max, self.arm_policy_step_max)
-
-        limited_target = self.z1.prev_q_cmd + delta
-        return limited_target.astype(np.float32)
 
     # Startup states
     def zero_torque_state(self):
@@ -500,14 +483,12 @@ class B2WZ1LocoManipController:
             time.sleep(self.control_dt)
         print("[B2WZ1] START pressed. Exit zero torque state.")
 
-    def move_b2w_to_pose_policy(self, target_b2w_pos_policy: np.ndarray, duration: float):
-        """
-        Startup B2W transition, intentionally aligned with the successful locomotion deployment:
-        - read current hardware q
-        - convert to policy order
-        - interpolate in policy order
-        - convert back to hardware order when writing commands
-        """
+    def move_b2w_to_pose_policy(
+        self,
+        target_b2w_pos_policy: np.ndarray,
+        duration: float,
+        hold_arm: bool = False,
+    ):
         print("[B2WZ1] Moving B2W to target pose...")
         target_b2w_pos_policy = np.asarray(target_b2w_pos_policy, dtype=np.float32).reshape(16,)
         num_steps = max(1, int(round(duration / self.control_dt)))
@@ -527,46 +508,17 @@ class B2WZ1LocoManipController:
                 use_pd_gains=True,
             )
             self.send_b2w_cmd()
+
+            if hold_arm:
+                self.z1.send_arm_command(
+                    self.default_arm_pos.copy(),
+                    self.default_gripper_pos,
+                    use_startup_gains=True,
+                )
+
             time.sleep(self.control_dt)
 
         print("[B2WZ1] Reached target B2W pose.")
-
-    def hold_squat_until_A(self):
-        print("[B2WZ1] Holding squat pose with arm at default. Press A to continue to leg default...")
-        while self.remote_controller.button[KeyMap.A] != 1:
-            self._write_b2w_pose_cmd_policy(
-                target_b2w_pos_policy=self.squat_b2w_pos_policy,
-                use_pd_gains=True,
-            )
-            self.send_b2w_cmd()
-
-            # Keep the arm at default pose while B2W holds squat.
-            self.z1.send_arm_command(
-                self.default_arm_pos.copy(),
-                self.default_gripper_pos,
-                use_startup_gains=True,
-            )
-            time.sleep(self.control_dt)
-
-        print("[B2WZ1] A pressed.")
-
-    def hold_leg_default_until_A(self):
-        print("[B2WZ1] Holding leg default pose with arm at default. Press A to continue...")
-        while self.remote_controller.button[KeyMap.A] != 1:
-            self._write_b2w_pose_cmd_policy(
-                target_b2w_pos_policy=self.default_b2w_pos_policy,
-                use_pd_gains=True,
-            )
-            self.send_b2w_cmd()
-
-            self.z1.send_arm_command(
-                self.default_arm_pos.copy(),
-                self.default_gripper_pos,
-                use_startup_gains=True,
-            )
-            time.sleep(self.control_dt)
-
-        print("[B2WZ1] A pressed.")
     
     def hold_arm_default_until_A(self):
         print("[B2WZ1] Holding arm default pose while B2W stays still. Press A to continue to squat...")
@@ -698,15 +650,15 @@ class B2WZ1LocoManipController:
         elif self.mode == "full-policy":
             self.leg_target = self.default_leg_pos_policy + self.leg_action_scale * leg_act
 
-            raw_arm_target = self.default_arm_pos + self.arm_action_scale * arm_act
-            self.arm_target = self._limit_arm_target_step(raw_arm_target)
+            self.arm_target = self.default_arm_pos + self.arm_action_scale * arm_act
+            self.arm_target = np.asarray(self.arm_target, dtype=np.float32).reshape(6,)
 
             self.wheel_cmd[:] = self.wheel_action_scale * wheel_act
 
             self._write_b2w_rl_cmd(
                 leg_target_policy=self.leg_target,
                 wheel_cmd_policy=self.wheel_cmd,
-    )
+            )
 
         else:
             raise ValueError(f"Unsupported mode: {self.mode}")
@@ -770,32 +722,33 @@ class B2WZ1LocoManipController:
             step_callback=None,
         )
 
-        self.z1.prev_q_cmd = self.default_arm_pos.copy()
-        self.z1.prev_gripper_q_cmd = float(self.default_gripper_pos)
+        self.z1.read_state()
+        self.z1.prev_q_cmd = self.z1.q.copy()
+        self.z1.prev_gripper_q_cmd = float(self.z1.gripper_q)
 
         self.hold_arm_default_until_A()
 
         self.move_b2w_to_pose_policy(
             target_b2w_pos_policy=self.squat_b2w_pos_policy,
             duration=float(self.cfg["squat_transition_s"]),
+            hold_arm=True,
         )
-
-        self.hold_squat_until_A()
 
         self.move_b2w_to_pose_policy(
             target_b2w_pos_policy=self.default_b2w_pos_policy,
             duration=float(self.cfg["default_transition_s"]),
+            hold_arm=True,
         )
-
-        self.hold_leg_default_until_A()
 
         self.hold_all_default_until_A()
 
         self.z1.start_realtime_loop(
-            initial_q_target=self.default_arm_pos,
+            initial_q_target=self.default_arm_pos.copy(),
             gripper_q_target=self.default_gripper_pos,
             use_startup_gains=(self.mode == "pd-stand"),
         )
+
+        time.sleep(0.05)
 
         print("[B2WZ1] Re-initializing observation history at loop start pose...")
 

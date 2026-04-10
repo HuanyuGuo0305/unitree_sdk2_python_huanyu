@@ -256,6 +256,9 @@ class B2WZ1LocoManipController:
         self.counter = 0
         self.policy_tick = 0
 
+        self.arm_policy_warmup_s = float(self.cfg.get("arm_policy_warmup_s", 4.0))
+        self.arm_policy_warmup_steps = max(1, int(round(self.arm_policy_warmup_s / self.control_dt)))
+
     def _resolve_path(self, path_str: str) -> str:
         if os.path.isabs(path_str):
             return path_str
@@ -510,7 +513,7 @@ class B2WZ1LocoManipController:
             self.send_b2w_cmd()
 
             if hold_arm:
-                self.z1.send_arm_command(
+                self.z1.send_arm_command_lowcmd_only(
                     self.default_arm_pos.copy(),
                     self.default_gripper_pos,
                     use_startup_gains=True,
@@ -528,7 +531,7 @@ class B2WZ1LocoManipController:
             create_zero_cmd(self.low_cmd)
             self.send_b2w_cmd()
 
-            self.z1.send_arm_command(
+            self.z1.send_arm_command_lowcmd_only(
                 self.default_arm_pos.copy(),
                 self.default_gripper_pos,
                 use_startup_gains=True,
@@ -547,7 +550,7 @@ class B2WZ1LocoManipController:
             )
             self.send_b2w_cmd()
 
-            self.z1.send_arm_command(
+            self.z1.send_arm_command_lowcmd_only(
                 self.default_arm_pos.copy(),
                 self.default_gripper_pos,
                 use_startup_gains=True,
@@ -650,8 +653,15 @@ class B2WZ1LocoManipController:
         elif self.mode == "full-policy":
             self.leg_target = self.default_leg_pos_policy + self.leg_action_scale * leg_act
 
-            self.arm_target = self.default_arm_pos + self.arm_action_scale * arm_act
-            self.arm_target = np.asarray(self.arm_target, dtype=np.float32).reshape(6,)
+            arm_target_policy = self.default_arm_pos + self.arm_action_scale * arm_act
+            arm_target_policy = np.asarray(arm_target_policy, dtype=np.float32).reshape(6,)
+
+            # Warm up arm target blending at the beginning of full-policy runtime
+            warmup_alpha = min(1.0, float(self.policy_tick) / float(self.arm_policy_warmup_steps))
+            self.arm_target = (
+                (1.0 - warmup_alpha) * self.default_arm_pos
+                + warmup_alpha * arm_target_policy
+            ).astype(np.float32)
 
             self.wheel_cmd[:] = self.wheel_action_scale * wheel_act
 
@@ -681,13 +691,29 @@ class B2WZ1LocoManipController:
         self.policy_tick += 1
 
         if self.counter % 100 == 0:
+            if self.mode == "full-policy":
+                warmup_alpha_dbg = min(1.0, float(self.policy_tick) / float(self.arm_policy_warmup_steps))
+            else:
+                warmup_alpha_dbg = 1.0
+
             print(
                 f"[{self.counter:5d}] "
                 f"mode={self.mode} | "
                 f"cmd={self.base_command} | "
+                f"warmup_alpha={warmup_alpha_dbg:.2f} | "
                 f"leg_act=[{leg_act.min():+.2f},{leg_act.max():+.2f}] | "
                 f"arm_act=[{arm_act.min():+.2f},{arm_act.max():+.2f}] | "
+                f"arm_tgt=[{self.arm_target.min():+.2f},{self.arm_target.max():+.2f}] | "
                 f"wheel_act=[{wheel_act.min():+.2f},{wheel_act.max():+.2f}]"
+            )
+
+            ee_cur_lb = self.compute_ee_current_kp_lb()
+            ee_err_lb = self.ee_cmd_lb_current - ee_cur_lb
+            print(
+                "[EE-OBS] "
+                f"ee_cmd={np.round(self.ee_cmd_lb_current, 3)} | "
+                f"ee_cur={np.round(ee_cur_lb, 3)} | "
+                f"ee_err={np.round(ee_err_lb, 3)}"
             )
 
     # Main run
@@ -715,10 +741,8 @@ class B2WZ1LocoManipController:
         self.zero_torque_state()
 
         print("[B2WZ1] Moving arm to default before any B2W startup motion...")
-        self.z1.move_to_default_like_min_test(
+        self.z1.move_to_default_like_official(
             duration_s=float(self.cfg["arm_default_transition_s"]),
-            kp=self.z1.arm_kps_startup,
-            kd=self.z1.arm_kds_startup,
             step_callback=None,
         )
 

@@ -164,14 +164,14 @@ class PresampledKeypointsInterpolateCommandLBSim:
 
 class Z1ArmAdapter:
     """
-    Z1 arm helper with:
+    Z1 arm helper.
 
-    1. blocking startup motion helpers
-    2. dedicated 500 Hz runtime lowcmd loop
-    3. runtime semantics:
-         q_cmd   = policy target
-         qd_cmd  = 0
-         tau_cmd = PD(q_target - q_meas, 0 - qd_meas)
+    Startup path:
+        - official-style lowcmd trajectory motion with inverse dynamics feedforward
+        - lowcmd-only pose hold for waiting / transitional phases
+
+    Runtime path:
+        - kept unchanged for now
     """
 
     def __init__(self, cfg: dict, project_root: str):
@@ -214,12 +214,23 @@ class Z1ArmAdapter:
         ).reshape(6,)
 
         # Runtime gains
-        self.arm_kps_runtime = np.array(
-            cfg.get("arm_kps_runtime", [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]),
+        # Runtime FF torque gains: joint-space equivalent PD gains
+        self.arm_kps_runtime_ff = np.array(
+            cfg.get("arm_kps_runtime_ff", [20.0, 20.0, 20.0, 20.0, 20.0, 20.0]),
             dtype=np.float32,
         ).reshape(6,)
-        self.arm_kds_runtime = np.array(
-            cfg.get("arm_kds_runtime", [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]),
+        self.arm_kds_runtime_ff = np.array(
+            cfg.get("arm_kds_runtime_ff", [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]),
+            dtype=np.float32,
+        ).reshape(6,)
+
+        # Runtime motor-side lowcmd gains: raw lowcmd values
+        self.arm_kps_runtime_motor = np.array(
+            cfg.get("arm_kps_runtime_motor", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            dtype=np.float32,
+        ).reshape(6,)
+        self.arm_kds_runtime_motor = np.array(
+            cfg.get("arm_kds_runtime_motor", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
             dtype=np.float32,
         ).reshape(6,)
 
@@ -232,7 +243,7 @@ class Z1ArmAdapter:
             cfg.get("z1_runtime_target_step_clip", [0.03, 0.03, 0.03, 0.04, 0.04, 0.04]),
             dtype=np.float32,
         ).reshape(6,)
-        
+
         self._rt_debug_print_every = int(cfg.get("z1_rt_debug_print_every", 200))
         self._rt_loop_counter = 0
 
@@ -273,8 +284,26 @@ class Z1ArmAdapter:
         self._rt_use_startup_gains = False
 
         print(f"[Z1ArmAdapter] z1_sdk_lib = {z1_sdk_lib}")
+    
+    def _print_runtime_gain_summary(self):
+        kp_eq_motor = 25.6 * self.arm_kps_runtime_motor
+        kd_eq_motor = 0.0128 * self.arm_kds_runtime_motor
+        kp_eq_total = kp_eq_motor + self.arm_kps_runtime_ff
+        kd_eq_total = kd_eq_motor + self.arm_kds_runtime_ff
 
+        print("[Z1ArmAdapter] Runtime gain summary")
+        print("  motor kp raw     =", np.round(self.arm_kps_runtime_motor, 4))
+        print("  motor kd raw     =", np.round(self.arm_kds_runtime_motor, 4))
+        print("  motor kp eq      =", np.round(kp_eq_motor, 4))
+        print("  motor kd eq      =", np.round(kd_eq_motor, 4))
+        print("  ff kp eq         =", np.round(self.arm_kps_runtime_ff, 4))
+        print("  ff kd eq         =", np.round(self.arm_kds_runtime_ff, 4))
+        print("  total kp eq      =", np.round(kp_eq_total, 4))
+        print("  total kd eq      =", np.round(kd_eq_total, 4))
+
+    # -------------------------------------------------------------------------
     # Connection / state
+    # -------------------------------------------------------------------------
 
     def connect(self):
         self.arm = self.unitree_arm_interface.ArmInterface(self.has_gripper)
@@ -299,10 +328,9 @@ class Z1ArmAdapter:
         self.prev_q_cmd = self.q.copy()
         self.prev_gripper_q_cmd = float(self.gripper_q)
 
-        # self.set_control_gain(self.arm_kps_startup, self.arm_kds_startup)
-
         print("[Z1ArmAdapter] Connected.")
         print(f"[Z1ArmAdapter] FSM = {self.arm.getCurrentState()}")
+        self._print_runtime_gain_summary()
 
     def get_arm_dt(self) -> float:
         if self.arm is None:
@@ -343,7 +371,9 @@ class Z1ArmAdapter:
     def get_fsm_state(self):
         return self._fsm_state
 
+    # -------------------------------------------------------------------------
     # Gain management
+    # -------------------------------------------------------------------------
 
     def set_control_gain(self, kp: np.ndarray, kd: np.ndarray):
         kp = np.asarray(kp, dtype=np.float32).reshape(6,)
@@ -364,17 +394,9 @@ class Z1ArmAdapter:
         self._last_applied_kp = kp.copy()
         self._last_applied_kd = kd.copy()
 
-    def _get_lowcmd_gain_pair(self, use_startup_gains: bool) -> Tuple[np.ndarray, np.ndarray]:
-        if use_startup_gains:
-            return self.arm_kps_startup, self.arm_kds_startup
-        return np.zeros(6, dtype=np.float32), np.zeros(6, dtype=np.float32)
-
-    def _get_external_pd_gain_pair(self, use_startup_gains: bool) -> Tuple[np.ndarray, np.ndarray]:
-        if use_startup_gains:
-            return self.arm_kps_startup, self.arm_kds_startup
-        return self.arm_kps_runtime, self.arm_kds_runtime
-
+    # -------------------------------------------------------------------------
     # Helper functions
+    # -------------------------------------------------------------------------
 
     def _protect_joint_cmd(self, q_cmd: np.ndarray, qd_cmd: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         try:
@@ -386,30 +408,22 @@ class Z1ArmAdapter:
         except Exception:
             return q_cmd, qd_cmd
 
-    def _compute_runtime_tau(
-        self,
-        q_target: np.ndarray,
-        qd_target: np.ndarray,
-        q_meas: np.ndarray,
-        qd_meas: np.ndarray,
-        use_startup_gains: bool,
-    ) -> np.ndarray:
-        kp, kd = self._get_external_pd_gain_pair(use_startup_gains)
-        tau_cmd = kp * (q_target - q_meas) + kd * (qd_target - qd_meas)
-        tau_cmd = np.clip(tau_cmd, -self.runtime_tau_clip, self.runtime_tau_clip)
-        return tau_cmd.astype(np.float32)
-
+    # -------------------------------------------------------------------------
     # Immediate one-step send
+    # -------------------------------------------------------------------------
 
     def _send_arm_command_once(
         self,
         q_cmd: np.ndarray,
         gripper_q_cmd: float,
-        use_startup_gains: bool = False,
-        qd_cmd: np.ndarray = None,
-        tau_cmd: np.ndarray = None,
+        kp_cmd: np.ndarray,
+        kd_cmd: np.ndarray,
+        qd_cmd: np.ndarray | None = None,
+        tau_cmd: np.ndarray | None = None,
     ):
         q_cmd = np.asarray(q_cmd, dtype=np.float32).reshape(6,)
+        kp_cmd = np.asarray(kp_cmd, dtype=np.float32).reshape(6,)
+        kd_cmd = np.asarray(kd_cmd, dtype=np.float32).reshape(6,)
 
         if qd_cmd is None:
             qd_cmd = np.zeros(6, dtype=np.float32)
@@ -423,7 +437,6 @@ class Z1ArmAdapter:
 
         q_cmd, qd_cmd = self._protect_joint_cmd(q_cmd, qd_cmd)
 
-        kp_cmd, kd_cmd = self._get_lowcmd_gain_pair(use_startup_gains=use_startup_gains)
         self.set_control_gain(kp_cmd, kd_cmd)
 
         self.arm.q = q_cmd
@@ -454,46 +467,24 @@ class Z1ArmAdapter:
                 "fsm =", self._fsm_state,
             )
 
-    def send_arm_command(self, q_cmd: np.ndarray, gripper_q_cmd: float, use_startup_gains: bool = False):
-        if self.is_realtime_loop_running():
-            raise RuntimeError("send_arm_command() must not be called while realtime loop is running.")
+    # -------------------------------------------------------------------------
+    # Startup helpers
+    # -------------------------------------------------------------------------
 
-        q_cmd = np.asarray(q_cmd, dtype=np.float32).reshape(6,)
-        qd_cmd = np.zeros(6, dtype=np.float32)
-
-        with self._comm_lock:
-            q_meas = np.asarray(self.arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
-            qd_meas = np.asarray(self.arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
-
-            tau_cmd = self._compute_runtime_tau(
-                q_target=q_cmd,
-                qd_target=qd_cmd,
-                q_meas=q_meas,
-                qd_meas=qd_meas,
-                use_startup_gains=use_startup_gains,
-            )
-
-            self._send_arm_command_once(
-                q_cmd=q_cmd,
-                gripper_q_cmd=gripper_q_cmd,
-                use_startup_gains=use_startup_gains,
-                qd_cmd=qd_cmd,
-                tau_cmd=tau_cmd,
-            )
-    
-    def send_arm_command_lowcmd_only(
+    def hold_pose_lowcmd(
         self,
         q_cmd: np.ndarray,
         gripper_q_cmd: float,
-        use_startup_gains: bool = True,
     ):
         """
-        Send arm command using lowcmd position control only:
-        - nonzero lowcmd gains
-        - zero external torque
+        Hold a pose using lowcmd position control only:
+        - q = desired pose
+        - qd = 0
+        - tau = 0
+        - lowcmd gains = startup gains
         """
         if self.is_realtime_loop_running():
-            raise RuntimeError("send_arm_command_lowcmd_only() must not be called while realtime loop is running.")
+            raise RuntimeError("hold_pose_lowcmd() must not be called while realtime loop is running.")
 
         q_cmd = np.asarray(q_cmd, dtype=np.float32).reshape(6,)
         qd_cmd = np.zeros(6, dtype=np.float32)
@@ -503,12 +494,146 @@ class Z1ArmAdapter:
             self._send_arm_command_once(
                 q_cmd=q_cmd,
                 gripper_q_cmd=gripper_q_cmd,
-                use_startup_gains=use_startup_gains,
+                kp_cmd=self.arm_kps_startup,
+                kd_cmd=self.arm_kds_startup,
                 qd_cmd=qd_cmd,
                 tau_cmd=tau_cmd,
             )
 
+    def move_to_pose_official(
+        self,
+        target_q: np.ndarray,
+        target_gripper: float,
+        duration_s: float,
+        step_callback=None,
+    ):
+        """
+        Mimic the official Unitree lowcmd example:
+
+        - setFsmLowcmd()
+        - q follows a linear trajectory from current state to target
+        - qd is a constant trajectory velocity
+        - tau is inverse dynamics feedforward only
+        - lowcmd gains for arm joints are explicitly set to zero
+        """
+        if self.is_realtime_loop_running():
+            raise RuntimeError("move_to_pose_official() must not be used after realtime loop starts.")
+
+        self.read_state()
+        q0 = self.q.copy()
+        target_q = np.asarray(target_q, dtype=np.float32).reshape(6,)
+        target_gripper = float(target_gripper)
+
+        dt = float(self.arm._ctrlComp.dt)
+        num_steps = max(1, int(round(duration_s / dt)))
+
+        print("[Z1ArmAdapter] move_to_pose_official")
+        print("[Z1ArmAdapter] q0       =", np.round(q0, 4))
+        print("[Z1ArmAdapter] target_q =", np.round(target_q, 4))
+        print("[Z1ArmAdapter] dt       =", dt)
+        print("[Z1ArmAdapter] steps    =", num_steps)
+
+        self.arm.setFsmLowcmd()
+        time.sleep(0.02)
+
+        for _ in range(10):
+            self.arm.sendRecv()
+            time.sleep(dt)
+
+        # Explicitly use zero lowcmd gains here to match the official lowcmd example.
+        self.set_control_gain(
+            np.zeros(6, dtype=np.float32),
+            np.zeros(6, dtype=np.float32),
+        )
+
+        qd_traj = ((target_q - q0) / max(duration_s, 1e-6)).astype(np.float32)
+
+        for step in range(num_steps):
+            alpha = float(step + 1) / float(num_steps)
+            q_cmd = ((1.0 - alpha) * q0 + alpha * target_q).astype(np.float32)
+            qd_cmd = qd_traj.copy()
+
+            q_cmd_safe, qd_cmd_safe = self._protect_joint_cmd(q_cmd, qd_cmd)
+
+            try:
+                tau_ff = np.asarray(
+                    self.arm_model.inverseDynamics(
+                        q_cmd_safe.astype(np.float32),
+                        qd_cmd_safe.astype(np.float32),
+                        np.zeros(6, dtype=np.float32),
+                        np.zeros(6, dtype=np.float32),
+                    ),
+                    dtype=np.float32,
+                ).reshape(6,)
+            except Exception:
+                tau_ff = np.zeros(6, dtype=np.float32)
+
+            tau_cmd = np.clip(
+                tau_ff,
+                -self.runtime_tau_clip,
+                self.runtime_tau_clip,
+            ).astype(np.float32)
+
+            self.arm.q = q_cmd_safe
+            self.arm.qd = qd_cmd_safe
+            self.arm.tau = tau_cmd
+            self.arm.gripperQ = target_gripper
+
+            self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
+            self.arm.setGripperCmd(
+                self.arm.gripperQ,
+                self.arm.gripperQd,
+                self.arm.gripperTau,
+            )
+            self.arm.sendRecv()
+
+            self._read_state_from_sdk_once()
+
+            if step_callback is not None:
+                step_callback()
+
+            fsm = self.arm.getCurrentState()
+            if (step % 20 == 0) or (step == num_steps - 1) or (fsm != self.unitree_arm_interface.ArmFSMState.LOWCMD):
+                q_meas_dbg = np.asarray(self.arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
+                qd_meas_dbg = np.asarray(self.arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
+                tau_meas_dbg = np.asarray(self.arm.lowstate.getTau(), dtype=np.float32).reshape(6,)
+                err = q_cmd_safe - q_meas_dbg
+
+                print(
+                    f"[Z1-OFFICIAL {step+1:04d}/{num_steps}] "
+                    f"FSM={fsm} | "
+                    f"q_cmd={np.round(q_cmd_safe, 3)} | "
+                    f"q_meas={np.round(q_meas_dbg, 3)} | "
+                    f"err={np.round(err, 3)} | "
+                    f"qd_cmd={np.round(qd_cmd_safe, 3)} | "
+                    f"qd_meas={np.round(qd_meas_dbg, 3)} | "
+                    f"tau_cmd={np.round(tau_cmd, 3)} | "
+                    f"tau_meas={np.round(tau_meas_dbg, 3)}"
+                )
+
+            if fsm != self.unitree_arm_interface.ArmFSMState.LOWCMD:
+                print(f"[Z1ArmAdapter][ERROR] FSM dropped to {fsm} at step {step+1}")
+                break
+
+            time.sleep(dt)
+
+        self.hold_pose_lowcmd(
+            q_cmd=target_q,
+            gripper_q_cmd=target_gripper,
+        )
+
+        self.read_state()
+        self.prev_q_cmd = self.q.copy()
+        self.prev_gripper_q_cmd = float(self.gripper_q)
+
+        print("[Z1ArmAdapter] final q =", np.round(self.q, 4))
+
+    def safe_back_to_start(self):
+        pass
+
+    # -------------------------------------------------------------------------
     # Runtime realtime loop
+    # -------------------------------------------------------------------------
 
     def is_realtime_loop_running(self) -> bool:
         return self._rt_running and (self._rt_thread is not None) and self._rt_thread.is_alive()
@@ -526,7 +651,7 @@ class Z1ArmAdapter:
             initial_q_target = self.prev_q_cmd.copy()
         if gripper_q_target is None:
             gripper_q_target = float(self.prev_gripper_q_cmd)
-        
+
         self.read_state()
         self.prev_q_cmd = self.q.copy()
         self.prev_gripper_q_cmd = float(self.gripper_q)
@@ -535,7 +660,6 @@ class Z1ArmAdapter:
             self._rt_q_target = np.asarray(initial_q_target, dtype=np.float32).reshape(6,)
             self._rt_gripper_target = float(gripper_q_target)
             self._rt_use_startup_gains = bool(use_startup_gains)
-        
 
         self._rt_stop_event.clear()
         self._rt_running = True
@@ -574,10 +698,12 @@ class Z1ArmAdapter:
         dt = self.get_arm_dt()
         next_tick = time.perf_counter()
 
-        # Runtime should use zero lowcmd gains
+        # Runtime uses hybrid control:
+        # - lowcmd motor-side feedback
+        # - external FF torque
         self.set_control_gain(
-            np.zeros(6, dtype=np.float32),
-            np.zeros(6, dtype=np.float32),
+            self.arm_kps_runtime_motor,
+            self.arm_kds_runtime_motor,
         )
 
         self._rt_loop_counter = 0
@@ -588,10 +714,15 @@ class Z1ArmAdapter:
                 gripper_target = float(self._rt_gripper_target)
 
             with self._comm_lock:
+                # re-apply runtime motor gains defensively
+                self.set_control_gain(
+                    self.arm_kps_runtime_motor,
+                    self.arm_kds_runtime_motor,
+                )
+
                 q_meas = np.asarray(self.arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
                 qd_meas = np.asarray(self.arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
 
-                # Keep only a small position smoothing / slew limit
                 dq = np.clip(
                     q_target - self.prev_q_cmd,
                     -self.runtime_target_step_clip,
@@ -599,12 +730,11 @@ class Z1ArmAdapter:
                 )
                 q_target_limited = self.prev_q_cmd + dq
 
-                # Match training semantics: desired joint velocity is zero
                 qd_cmd = np.zeros(6, dtype=np.float32)
 
                 tau_cmd = (
-                    self.arm_kps_runtime * (q_target_limited - q_meas)
-                    + self.arm_kds_runtime * (qd_cmd - qd_meas)
+                    self.arm_kps_runtime_ff * (q_target_limited - q_meas)
+                    + self.arm_kds_runtime_ff * (qd_cmd - qd_meas)
                 )
                 tau_cmd = np.clip(
                     tau_cmd,
@@ -633,13 +763,22 @@ class Z1ArmAdapter:
             self._rt_loop_counter += 1
 
             if self.debug_print and (self._rt_loop_counter % self._rt_debug_print_every == 0):
+                kp_eq_motor = 25.6 * self.arm_kps_runtime_motor
+                kd_eq_motor = 0.0128 * self.arm_kds_runtime_motor
+                kp_eq_total = kp_eq_motor + self.arm_kps_runtime_ff
+                kd_eq_total = kd_eq_motor + self.arm_kds_runtime_ff
+
                 print(
                     "[Z1-RT] "
                     f"q_target={np.round(q_target, 3)} | "
                     f"q_tgt_lim={np.round(q_target_limited, 3)} | "
                     f"q_meas={np.round(q_meas, 3)} | "
                     f"qd_meas={np.round(qd_meas, 3)} | "
-                    f"tau_cmd={np.round(tau_cmd, 3)} | "
+                    f"tau_ff={np.round(tau_cmd, 3)} | "
+                    f"kp_motor_raw={np.round(self.arm_kps_runtime_motor, 3)} | "
+                    f"kd_motor_raw={np.round(self.arm_kds_runtime_motor, 3)} | "
+                    f"kp_eq_total={np.round(kp_eq_total, 3)} | "
+                    f"kd_eq_total={np.round(kd_eq_total, 3)} | "
                     f"fsm={self._fsm_state}"
                 )
 
@@ -665,248 +804,9 @@ class Z1ArmAdapter:
             else:
                 next_tick = time.perf_counter()
 
-    # Compatibility wrappers
-
-    def hold_target_once(
-        self,
-        q_target: np.ndarray,
-        gripper_q_target: float,
-        use_startup_gains: bool = False,
-    ):
-        self.send_arm_command(
-            q_cmd=q_target,
-            gripper_q_cmd=gripper_q_target,
-            use_startup_gains=use_startup_gains,
-        )
-
-    def hold_target_for_duration(
-        self,
-        q_target: np.ndarray,
-        gripper_q_target: float,
-        duration_s: float,
-        use_startup_gains: bool = False,
-        step_callback=None,
-    ):
-        if self.is_realtime_loop_running():
-            self.set_target(
-                q_target=q_target,
-                gripper_q_target=gripper_q_target,
-                duration_s=duration_s,
-                use_startup_gains=use_startup_gains,
-            )
-            return
-
-        q_target = np.asarray(q_target, dtype=np.float32).reshape(6,)
-        dt = self.get_arm_dt()
-        num_steps = max(1, int(round(duration_s / dt)))
-
-        for step in range(num_steps):
-            self.hold_target_once(
-                q_target=q_target,
-                gripper_q_target=gripper_q_target,
-                use_startup_gains=use_startup_gains,
-            )
-
-            fsm = self.arm.getCurrentState()
-            if fsm != self.unitree_arm_interface.ArmFSMState.LOWCMD:
-                print(f"[Z1ArmAdapter][ERROR] FSM dropped to {fsm} during hold_target_for_duration at step {step+1}")
-                break
-
-            if step_callback is not None:
-                step_callback()
-
-            time.sleep(dt)
-
-    def track_target_for_duration(
-        self,
-        q_start: np.ndarray,
-        q_target: np.ndarray,
-        gripper_q_target: float,
-        duration_s: float,
-        use_startup_gains: bool = False,
-        step_callback=None,
-    ):
-        if self.is_realtime_loop_running():
-            self.set_target(
-                q_target=q_target,
-                gripper_q_target=gripper_q_target,
-                duration_s=duration_s,
-                use_startup_gains=use_startup_gains,
-            )
-            return
-
-        q_start = np.asarray(q_start, dtype=np.float32).reshape(6,)
-        q_target = np.asarray(q_target, dtype=np.float32).reshape(6,)
-
-        dt = self.get_arm_dt()
-        num_steps = max(1, int(round(duration_s / dt)))
-
-        for step in range(num_steps):
-            alpha = float(step + 1) / float(num_steps)
-            q_cmd = (1.0 - alpha) * q_start + alpha * q_target
-
-            self.send_arm_command(
-                q_cmd=q_cmd,
-                gripper_q_cmd=gripper_q_target,
-                use_startup_gains=use_startup_gains,
-            )
-
-            fsm = self.arm.getCurrentState()
-            if fsm != self.unitree_arm_interface.ArmFSMState.LOWCMD:
-                print(f"[Z1ArmAdapter][ERROR] FSM dropped to {fsm} during track_target_for_duration at step {step+1}")
-                break
-
-            if step_callback is not None:
-                step_callback()
-
-            time.sleep(dt)
-
-    # Startup helpers
-
-    def move_to_pose(self, target_q: np.ndarray, duration: float, use_startup_gains: bool = True):
-        if self.is_realtime_loop_running():
-            raise RuntimeError("move_to_pose() must not be used after realtime loop starts.")
-
-        self.read_state()
-        q0 = self.q.copy()
-        target_q = np.asarray(target_q, dtype=np.float32).reshape(6,)
-
-        dt = self.get_arm_dt()
-        num_steps = max(1, int(round(duration / dt)))
-        for step in range(num_steps):
-            alpha = float(step + 1) / float(num_steps)
-            q_cmd = (1.0 - alpha) * q0 + alpha * target_q
-            self.send_arm_command(
-                q_cmd=q_cmd,
-                gripper_q_cmd=self.default_gripper_pos,
-                use_startup_gains=use_startup_gains,
-            )
-            time.sleep(dt)
-
-        self.read_state()
-        self.prev_q_cmd = self.q.copy()
-
-    def move_to_default_like_official(
-        self,
-        duration_s: float,
-        step_callback=None,
-    ):
-        """
-        Mimic the official Unitree lowcmd startup example:
-        - arm lowcmd gains are zero for arm joints
-        - q follows a linear trajectory
-        - qd is constant trajectory velocity
-        - tau is inverse dynamics feedforward only
-        """
-        if self.is_realtime_loop_running():
-            raise RuntimeError("move_to_default_like_official() must not be used after realtime loop starts.")
-
-        self.read_state()
-        q0 = self.q.copy()
-        target_q = self.default_arm_pos.copy()
-        target_gripper = float(self.default_gripper_pos)
-
-        dt = float(self.arm._ctrlComp.dt)
-        num_steps = max(1, int(round(duration_s / dt)))
-
-        print("[Z1ArmAdapter] move_to_default_like_official")
-        print("[Z1ArmAdapter] q0       =", np.round(q0, 4))
-        print("[Z1ArmAdapter] target_q =", np.round(target_q, 4))
-        print("[Z1ArmAdapter] dt       =", dt)
-        print("[Z1ArmAdapter] steps    =", num_steps)
-
-        self.arm.setFsmLowcmd()
-        time.sleep(0.02)
-
-        for _ in range(10):
-            self.arm.sendRecv()
-            time.sleep(dt)
-
-        # Keep the SDK/default lowcmd gains untouched here
-        # to better match the official example behavior.
-
-        qd_traj = ((target_q - q0) / max(duration_s, 1e-6)).astype(np.float32)
-
-        for step in range(num_steps):
-            alpha = float(step) / float(num_steps)
-            q_cmd = ((1.0 - alpha) * q0 + alpha * target_q).astype(np.float32)
-            qd_cmd = qd_traj.copy()
-
-            q_cmd_safe = q_cmd.copy()
-            qd_cmd_safe = qd_cmd.copy()
-
-            try:
-                tau_ff = np.asarray(
-                    self.arm_model.inverseDynamics(
-                        q_cmd_safe.astype(np.float32),
-                        qd_cmd_safe.astype(np.float32),
-                        np.zeros(6, dtype=np.float32),
-                        np.zeros(6, dtype=np.float32),
-                    ),
-                    dtype=np.float32,
-                ).reshape(6,)
-            except Exception:
-                tau_ff = np.zeros(6, dtype=np.float32)
-
-            # Keep a safety clip, but do not add external PD here
-            tau_cmd = np.clip(tau_ff, -self.runtime_tau_clip, self.runtime_tau_clip)
-
-            self.arm.q = q_cmd_safe
-            self.arm.qd = qd_cmd_safe
-            self.arm.tau = tau_cmd
-            self.arm.gripperQ = target_gripper
-
-            self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
-            self.arm.setGripperCmd(self.arm.gripperQ, self.arm.gripperQd, self.arm.gripperTau)
-            self.arm.sendRecv()
-
-            self._read_state_from_sdk_once()
-
-            if step_callback is not None:
-                step_callback()
-
-            fsm = self.arm.getCurrentState()
-            if (step % 20 == 0) or (step == num_steps - 1) or (fsm != self.unitree_arm_interface.ArmFSMState.LOWCMD):
-                q_meas_dbg = np.array(self.arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
-                qd_meas_dbg = np.array(self.arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
-                tau_meas_dbg = np.array(self.arm.lowstate.getTau(), dtype=np.float32).reshape(6,)
-                err = q_cmd_safe - q_meas_dbg
-
-                print(
-                    f"[Z1-OFFICIAL {step+1:04d}/{num_steps}] "
-                    f"FSM={fsm} | "
-                    f"q_cmd={np.round(q_cmd_safe, 3)} | "
-                    f"q_meas={np.round(q_meas_dbg, 3)} | "
-                    f"err={np.round(err, 3)} | "
-                    f"qd_cmd={np.round(qd_cmd_safe, 3)} | "
-                    f"qd_meas={np.round(qd_meas_dbg, 3)} | "
-                    f"tau_cmd={np.round(tau_cmd, 3)} | "
-                    f"tau_meas={np.round(tau_meas_dbg, 3)}"
-                )
-
-            if fsm != self.unitree_arm_interface.ArmFSMState.LOWCMD:
-                print(f"[Z1ArmAdapter][ERROR] FSM dropped to {fsm} at step {step+1}")
-                break
-
-            time.sleep(dt)
-
-        self.read_state()
-        self.prev_q_cmd = self.q.copy()
-        self.prev_gripper_q_cmd = float(self.gripper_q)
-
-        print("[Z1ArmAdapter] final q =", np.round(self.q, 4))
-
-    def hold_default_step(self):
-        self.send_arm_command(
-            q_cmd=self.default_arm_pos,
-            gripper_q_cmd=self.default_gripper_pos,
-            use_startup_gains=True,
-        )
-
-    def safe_back_to_start(self):
-        pass
-
+    # -------------------------------------------------------------------------
     # FK / policy EE conversion
+    # -------------------------------------------------------------------------
 
     def compute_policy_ee_pose_in_base(self) -> Tuple[np.ndarray, np.ndarray]:
         q_fk = self.q.copy()

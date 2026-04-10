@@ -8,7 +8,8 @@ Run from repository root:
     python3 deploy/b2wz1_locomanipulation.py <network_interface> deploy/configs/b2wz1_locomanipulation.yaml --mode full-policy
 
 Design goals:
-- Use Z1 lowcmd with explicit external gains via the modified Python binding.
+- Startup: use official-style Z1 lowcmd motion + lowcmd hold.
+- Runtime: keep current Z1 torque-control deployment path for now.
 """
 
 import os
@@ -513,10 +514,9 @@ class B2WZ1LocoManipController:
             self.send_b2w_cmd()
 
             if hold_arm:
-                self.z1.send_arm_command_lowcmd_only(
+                self.z1.hold_pose_lowcmd(
                     self.default_arm_pos.copy(),
                     self.default_gripper_pos,
-                    use_startup_gains=True,
                 )
 
             time.sleep(self.control_dt)
@@ -531,10 +531,9 @@ class B2WZ1LocoManipController:
             create_zero_cmd(self.low_cmd)
             self.send_b2w_cmd()
 
-            self.z1.send_arm_command_lowcmd_only(
+            self.z1.hold_pose_lowcmd(
                 self.default_arm_pos.copy(),
                 self.default_gripper_pos,
-                use_startup_gains=True,
             )
 
             time.sleep(self.control_dt)
@@ -550,10 +549,9 @@ class B2WZ1LocoManipController:
             )
             self.send_b2w_cmd()
 
-            self.z1.send_arm_command_lowcmd_only(
+            self.z1.hold_pose_lowcmd(
                 self.default_arm_pos.copy(),
                 self.default_gripper_pos,
-                use_startup_gains=True,
             )
 
             time.sleep(self.control_dt)
@@ -741,14 +739,12 @@ class B2WZ1LocoManipController:
         self.zero_torque_state()
 
         print("[B2WZ1] Moving arm to default before any B2W startup motion...")
-        self.z1.move_to_default_like_official(
+        self.z1.move_to_pose_official(
+            target_q=self.default_arm_pos.copy(),
+            target_gripper=self.default_gripper_pos,
             duration_s=float(self.cfg["arm_default_transition_s"]),
             step_callback=None,
         )
-
-        self.z1.read_state()
-        self.z1.prev_q_cmd = self.z1.q.copy()
-        self.z1.prev_gripper_q_cmd = float(self.z1.gripper_q)
 
         self.hold_arm_default_until_A()
 

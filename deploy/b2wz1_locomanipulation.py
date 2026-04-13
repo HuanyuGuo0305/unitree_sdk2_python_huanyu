@@ -9,7 +9,7 @@ Run from repository root:
 
 Design goals:
 - Startup: use official-style Z1 lowcmd motion + lowcmd hold.
-- Runtime: keep current Z1 torque-control deployment path for now.
+- Runtime: pure lowcmd PD for Z1 at 50 Hz, no FF torque, no hybrid control.
 """
 
 import os
@@ -89,15 +89,10 @@ class B2WZ1LocoManipController:
         self.command_deadband_ang = float(self.cfg.get("command_deadband_ang", 0.2))
 
         # B2W default poses / gains
-        # Full B2W joint order in POLICY order:
-        # [FL_hip, FR_hip, RL_hip, RR_hip,
-        #  FL_thigh, FR_thigh, RL_thigh, RR_thigh,
-        #  FL_calf, FR_calf, RL_calf, RR_calf,
-        #  FL_wheel, FR_wheel, RL_wheel, RR_wheel]
         self.default_b2w_pos_policy = np.array(self.cfg["default_b2w_pos_policy"], dtype=np.float32).reshape(16,)
         self.squat_b2w_pos_policy = np.array(self.cfg["squat_b2w_pos_policy"], dtype=np.float32).reshape(16,)
 
-        # PD gains in POLICY order, same style as proven locomotion deployment
+        # PD gains in POLICY order
         self.kps_rl = np.array(self.cfg["kps_rl"], dtype=np.float32).reshape(16,)
         self.kds_rl = np.array(self.cfg["kds_rl"], dtype=np.float32).reshape(16,)
         self.kps_pd = np.array(self.cfg["kps_pd"], dtype=np.float32).reshape(16,)
@@ -105,7 +100,6 @@ class B2WZ1LocoManipController:
 
         self.leg_action_scale = float(self.cfg["leg_action_scale"])
         self.arm_action_scale = np.array(self.cfg["arm_action_scale"], dtype=np.float32).reshape(6,)
-        # Maximum allowed arm target change per policy step (rad)
         self.wheel_action_scale = float(self.cfg["wheel_action_scale"])
 
         # Arm defaults
@@ -136,14 +130,9 @@ class B2WZ1LocoManipController:
             "FR_wheel_joint", "FL_wheel_joint", "RR_wheel_joint", "RL_wheel_joint",
         ]
 
-        # Same definitions as proven locomotion deployment:
-        # hardware_to_policy_joint_indices:
-        #   get hardware index given policy index
         self.hardware_to_policy_joint_indices = [
             self.hardware_joint_names.index(name) for name in self.policy_joint_names
         ]
-        # policy_to_hardware_joint_indices:
-        #   get policy index given hardware index
         self.policy_to_hardware_joint_indices = [
             self.policy_joint_names.index(name) for name in self.hardware_joint_names
         ]
@@ -178,7 +167,6 @@ class B2WZ1LocoManipController:
             self.wheel_kps_pd_hw[hw_idx] = self.kps_pd_hw[hw_idx]
             self.wheel_kds_pd_hw[hw_idx] = self.kds_pd_hw[hw_idx]
 
-        # Hardware index -> wheel cmd index in policy wheel order [FL, FR, RL, RR]
         self.hw_to_wheel_cmd_indices = {
             self.hardware_joint_names.index(name): idx
             for idx, name in enumerate(self.wheel_joint_names)
@@ -260,6 +248,12 @@ class B2WZ1LocoManipController:
         self.arm_policy_warmup_s = float(self.cfg.get("arm_policy_warmup_s", 4.0))
         self.arm_policy_warmup_steps = max(1, int(round(self.arm_policy_warmup_s / self.control_dt)))
 
+        # 纯真机安全建议：full-policy 先限幅
+        self.arm_target_clip = np.array(
+            self.cfg.get("arm_target_clip", [0.25, 0.35, 0.25, 0.25, 0.25, 0.25]),
+            dtype=np.float32,
+        ).reshape(6,)
+
     def _resolve_path(self, path_str: str) -> str:
         if os.path.isabs(path_str):
             return path_str
@@ -309,7 +303,6 @@ class B2WZ1LocoManipController:
 
         self.projected_gravity_b[:] = quat_rotate_inverse_numpy(self.base_quat_wxyz, self.gravity_w)
 
-        # Read B2W joints from hardware-order lowstate and store them in policy order
         for p_idx in range(self.num_b2w_dof):
             hw_idx = self.hardware_to_policy_joint_indices[p_idx]
             self.b2w_joint_pos[p_idx] = self.low_state.motor_state[hw_idx].q
@@ -398,18 +391,6 @@ class B2WZ1LocoManipController:
 
     # B2W command helpers
     def _write_b2w_pose_cmd_policy(self, target_b2w_pos_policy: np.ndarray, use_pd_gains: bool):
-        """
-        Write B2W command from full policy-order target positions.
-
-        Policy order:
-            [FL_hip, FR_hip, RL_hip, RR_hip,
-             FL_thigh, FR_thigh, RL_thigh, RR_thigh,
-             FL_calf, FR_calf, RL_calf, RR_calf,
-             FL_wheel, FR_wheel, RL_wheel, RR_wheel]
-
-        Startup uses this path to stay aligned with the proven locomotion deployment.
-        Legs are position-controlled; wheels are kept stopped.
-        """
         target_b2w_pos_policy = np.asarray(target_b2w_pos_policy, dtype=np.float32).reshape(16,)
         target_b2w_pos_hw = target_b2w_pos_policy[self.policy_to_hardware_joint_indices]
 
@@ -432,7 +413,6 @@ class B2WZ1LocoManipController:
                 self.low_cmd.motor_cmd[i].kd = float(kds_hw[i])
                 self.low_cmd.motor_cmd[i].tau = 0.0
             else:
-                # Startup/default hold: keep wheels stopped
                 self.low_cmd.motor_cmd[i].q = 0.0
                 self.low_cmd.motor_cmd[i].dq = 0.0
                 self.low_cmd.motor_cmd[i].kp = float(wheel_kps_hw[i])
@@ -440,12 +420,6 @@ class B2WZ1LocoManipController:
                 self.low_cmd.motor_cmd[i].tau = 0.0
 
     def _write_b2w_rl_cmd(self, leg_target_policy: np.ndarray, wheel_cmd_policy: np.ndarray):
-        """
-        Runtime RL-style B2W command, aligned with the proven locomotion deployment.
-
-        - Legs: position control
-        - Wheels: velocity control
-        """
         leg_target_policy = np.asarray(leg_target_policy, dtype=np.float32).reshape(12,)
         wheel_cmd_policy = np.asarray(wheel_cmd_policy, dtype=np.float32).reshape(4,)
 
@@ -471,11 +445,6 @@ class B2WZ1LocoManipController:
                 self.low_cmd.motor_cmd[i].tau = 0.0
 
     def _write_b2w_pd_stand_cmd(self):
-        """
-        PD stand mode for B2W:
-        - Legs hold default pose with PD gains
-        - Wheels remain stopped
-        """
         self._write_b2w_pose_cmd_policy(self.default_b2w_pos_policy, use_pd_gains=True)
 
     # Startup states
@@ -522,12 +491,11 @@ class B2WZ1LocoManipController:
             time.sleep(self.control_dt)
 
         print("[B2WZ1] Reached target B2W pose.")
-    
+
     def hold_arm_default_until_A(self):
         print("[B2WZ1] Holding arm default pose while B2W stays still. Press A to continue to squat...")
 
         while self.remote_controller.button[KeyMap.A] != 1:
-            # Keep B2W quiet during the arm-only hold phase.
             create_zero_cmd(self.low_cmd)
             self.send_b2w_cmd()
 
@@ -558,7 +526,6 @@ class B2WZ1LocoManipController:
 
         print("[B2WZ1] A pressed. Start main loop.")
 
-    # Main control step
     def step(self):
         # 1) Read sensors
         self._read_all_sensors_once()
@@ -630,7 +597,7 @@ class B2WZ1LocoManipController:
         arm_act = action[self.arm_action_indices]
         wheel_act = action[self.wheel_action_indices]
 
-        # 6) Apply mode logic (no blend-in)
+        # 6) Apply mode logic
         if self.mode == "pd-stand":
             self.leg_target = self.default_leg_pos_policy.copy()
             self.arm_target = self.default_arm_pos.copy()
@@ -651,10 +618,14 @@ class B2WZ1LocoManipController:
         elif self.mode == "full-policy":
             self.leg_target = self.default_leg_pos_policy + self.leg_action_scale * leg_act
 
-            arm_target_policy = self.default_arm_pos + self.arm_action_scale * arm_act
+            # 强烈建议真机先夹 action，避免飞
+            arm_act = np.clip(arm_act, -1.0, 1.0)
+
+            arm_delta = self.arm_action_scale * arm_act
+            arm_delta = np.clip(arm_delta, -self.arm_target_clip, self.arm_target_clip)
+            arm_target_policy = self.default_arm_pos + arm_delta
             arm_target_policy = np.asarray(arm_target_policy, dtype=np.float32).reshape(6,)
 
-            # Warm up arm target blending at the beginning of full-policy runtime
             warmup_alpha = min(1.0, float(self.policy_tick) / float(self.arm_policy_warmup_steps))
             self.arm_target = (
                 (1.0 - warmup_alpha) * self.default_arm_pos
@@ -671,17 +642,15 @@ class B2WZ1LocoManipController:
         else:
             raise ValueError(f"Unsupported mode: {self.mode}")
 
-        # 7) Send B2W lowcmd once at policy rate
+        # 7) Send B2W
         self.send_b2w_cmd()
 
-        # 8) Smoothly track Z1 target at arm low-level rate within one policy interval
-        arm_use_startup_gains = (self.mode in ["pd-stand"])
-
-        self.z1.set_target(
+        # 8) Z1: 50Hz 纯 PD，一步一发
+        use_startup_gains = (self.mode == "pd-stand")
+        self.z1.track_target_pd_once(
             q_target=self.arm_target.copy(),
             gripper_q_target=self.default_gripper_pos,
-            duration_s=self.control_dt,
-            use_startup_gains=arm_use_startup_gains,
+            use_startup_gains=use_startup_gains,
         )
 
         # 9) Bookkeeping
@@ -714,7 +683,6 @@ class B2WZ1LocoManipController:
                 f"ee_err={np.round(ee_err_lb, 3)}"
             )
 
-    # Main run
     def setup(self):
         print("=" * 80)
         print("B2WZ1 loco-manipulation sim2real")
@@ -761,14 +729,6 @@ class B2WZ1LocoManipController:
         )
 
         self.hold_all_default_until_A()
-
-        self.z1.start_realtime_loop(
-            initial_q_target=self.default_arm_pos.copy(),
-            gripper_q_target=self.default_gripper_pos,
-            use_startup_gains=(self.mode == "pd-stand"),
-        )
-
-        time.sleep(0.05)
 
         print("[B2WZ1] Re-initializing observation history at loop start pose...")
 
@@ -817,8 +777,6 @@ class B2WZ1LocoManipController:
 
         except KeyboardInterrupt:
             print("[B2WZ1] KeyboardInterrupt received.")
-
-        self.z1.stop_realtime_loop()
 
         create_damping_cmd(self.low_cmd)
         self.send_b2w_cmd()

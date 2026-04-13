@@ -2,16 +2,13 @@
 policy_path: "exported_policies/b2wz1_locomanipulation/policy_.onnx"
 ee_command_path: "utils/reachable_kp0kp1kp2_lb.npy"
 
-# Path to z1_sdk/lib that contains:
-#   unitree_arm_interface.cpython-*.so
-#   libZ1_SDK_x86_64.so
 z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"
 
 # High-level policy / deployment rate
 control_dt: 0.02
 
-# Z1 low-level command rate
-z1_control_dt: 0.002
+# Z1 runtime command rate: now same as policy rate
+z1_control_dt: 0.02
 
 squat_transition_s: 2.0
 default_transition_s: 2.0
@@ -24,20 +21,10 @@ obs_dim: 267
 action_dim: 22
 
 # Base command scaling
-# Training command ranges:
-#   vx in [-0.8, 0.8]
-#   vy in [-0.8, 0.8]
-#   wz in [-0.6, 0.6]
 command_scale: [0.8, 0.8, 0.6]
 command_deadband_lin: 0.2
 command_deadband_ang: 0.2
 
-# B2W default / squat pose in POLICY order (16)
-# Policy order:
-#   FL_hip, FR_hip, RL_hip, RR_hip,
-#   FL_thigh, FR_thigh, RL_thigh, RR_thigh,
-#   FL_calf, FR_calf, RL_calf, RR_calf,
-#   FL_wheel, FR_wheel, RL_wheel, RR_wheel
 squat_b2w_pos_policy: [
    0.1,  -0.1,   0.1,  -0.1,
    1.57,  1.57,  1.57,  1.57,
@@ -56,7 +43,6 @@ default_b2w_pos_policy: [
 default_arm_pos: [0.0, 1.48, -1.0, -0.54, 0.0, 0.0]
 default_gripper_pos: 0.0
 
-# Observation default in policy obs order: leg(12) + arm(6)
 default_joint_pos_policy: [
    0.1, -0.1,  0.1, -0.1,
    0.8,  0.8,  1.0,  1.0,
@@ -64,8 +50,7 @@ default_joint_pos_policy: [
    0.0,  1.48, -1.0, -0.54, 0.0, 0.0
 ]
 
-# B2W gains in POLICY order (16), aligned with locomotion deployment
-# RL gains
+# B2W gains
 kps_rl: [
   160.0, 160.0, 160.0, 160.0,
   160.0, 160.0, 160.0, 160.0,
@@ -80,7 +65,6 @@ kds_rl: [
   10.0, 10.0, 10.0, 10.0
 ]
 
-# PD gains for startup / stand-hold
 kps_pd: [
   500.0, 500.0, 500.0, 500.0,
   500.0, 500.0, 500.0, 500.0,
@@ -96,45 +80,32 @@ kds_pd: [
 ]
 
 # Action scales
-# Policy action order:
-#   leg(12) + arm(6) + wheel(4)
 leg_action_scale: 0.25
 arm_action_scale: [0.25, 0.35, 0.25, 0.25, 0.25, 0.25]
 wheel_action_scale: 5.0
 
-# Z1 explicit lowcmd gains
-# Note:
-#   These are Z1 lowcmd gains, NOT MuJoCo external PD gains.
-#   Because the lowcmd motor-side torque is approximately:
-#       tau = kp * 25.6 * (qd - q) + kd * 0.0128 * (dqd - dq) + tau_f
-#   the numerical gain values here should not be copied directly from sim.
+# Z1 startup PD gains
 arm_kps_startup: [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]
 arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
 
-# external FF torque part, in joint-space equivalent PD units
-arm_kps_runtime_ff: [15.0, 20.0, 20.0, 20.0, 15.0, 15.0]
-arm_kds_runtime_ff: [2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+# Z1 runtime PD gains at 50 Hz
+arm_kps_runtime: [18.0, 28.0, 28.0, 18.0, 12.0, 8.0]
+arm_kds_runtime: [1800.0, 1800.0, 1800.0, 1800.0, 1800.0, 1800.0]
 
-# motor-side lowcmd gains (raw values sent to SDK)
-arm_kps_runtime_motor: [0.70, 0.70, 0.70, 0.70, 0.70, 0.70]
-arm_kds_runtime_motor: [62.5, 62.5, 62.5, 62.5, 62.5, 62.5]
+# Per-step arm target limiter at 50 Hz
+z1_runtime_q_step_clip: [0.04, 0.04, 0.04, 0.04, 0.04, 0.04]
 
-z1_runtime_tau_clip: [33, 66, 33, 33, 33, 33]
-z1_runtime_target_step_clip: [0.03, 0.02, 0.02, 0.02, 0.03, 0.03]
-
-# Gripper lowcmd gain
+# Gripper gain
 z1_gripper_kp: 20.0
 z1_gripper_kd: 2000.0
 
-# Z1 SDK / arm kinematics
+# Z1 SDK / FK
 z1_has_gripper: true
 z1_fk_ee_index: 6
 
-# Fixed transform: B2W base_link -> arm_base
 arm_base_offset_pos: [0.190, 0.0, 0.0952]
 arm_base_offset_rpy: [0.0, 0.0, 0.0]
 
-# Fixed transform: SDK EE -> policy EE
 z1_fk_to_policy_ee_pos: [0.051, 0.0, 0.0]
 z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
 
@@ -148,7 +119,9 @@ ee_resample_interval: 200
 
 # Debug
 z1_debug_print: true
-z1_rt_debug_print_every: 100
 
 # Arm full-policy warmup
 arm_policy_warmup_s: 4.0
+
+# safety limits
+arm_target_clip: [0.20, 0.25, 0.20, 0.20, 0.20, 0.20]

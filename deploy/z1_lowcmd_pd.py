@@ -1,116 +1,139 @@
-import os
+#!/usr/bin/env python3
 import sys
 import time
-import yaml
-import argparse
 import numpy as np
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+# 改成你的 SDK lib 路径
+sys.path.append("/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib")
+import unitree_arm_interface
 
 
-def resolve_path(path_str: str, project_root: str) -> str:
-    if os.path.isabs(path_str):
-        return path_str
-    return os.path.abspath(os.path.join(project_root, path_str))
+HAS_GRIPPER = True
+
+KP = np.array([18.0, 28.0, 28.0, 18.0, 12.0, 8.0], dtype=np.float32)
+KD = np.array([1800.0, 1800.0, 1800.0, 1800.0, 1800.0, 1800.0], dtype=np.float32)
+
+ZERO_Q = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+DEFAULT_Q = np.array([0.0, 1.48, -1.0, -0.54, 0.0, 0.0], dtype=np.float32)
+
+GRIPPER_Q = 0.0
+
+MOVE_TIME = 4.0
+HOLD_TIME = 2.0
+STEP_CLIP = np.array([0.04, 0.04, 0.04, 0.04, 0.04, 0.04], dtype=np.float32)
+
+PRINT_EVERY = 20
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("config", type=str)
-    parser.add_argument("--kp", type=float, default=40.0)
-    parser.add_argument("--kd", type=float, default=3.0)
-    parser.add_argument("--duration", type=int, default=1000)
-    args = parser.parse_args()
+def set_gain(arm, kp, kd):
+    kp_full = [float(x) for x in kp] + [20.0]
+    kd_full = [float(x) for x in kd] + [2000.0]
+    arm._ctrlComp.lowcmd.setControlGain(kp_full, kd_full)
 
-    with open(args.config, "r") as f:
-        cfg = yaml.safe_load(f)
 
-    z1_sdk_lib = resolve_path(cfg["z1_sdk_lib"], PROJECT_ROOT)
-    if z1_sdk_lib not in sys.path:
-        sys.path.insert(0, z1_sdk_lib)
+def get_q(arm):
+    return np.asarray(arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
 
-    import unitree_arm_interface
 
-    np.set_printoptions(precision=4, suppress=True)
+def get_qd(arm):
+    return np.asarray(arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
 
-    has_gripper = bool(cfg.get("z1_has_gripper", True))
-    target_pos = np.array(cfg["default_arm_pos"], dtype=np.float32).reshape(6,)
-    target_gripper = float(cfg.get("default_gripper_pos", 0.0))
 
-    print("=" * 80)
-    print("[TEST] official example + external gain")
-    print("[TEST] z1_sdk_lib     =", z1_sdk_lib)
-    print("[TEST] target_pos     =", target_pos)
-    print("[TEST] target_gripper =", target_gripper)
-    print("[TEST] kp             =", args.kp)
-    print("[TEST] kd             =", args.kd)
-    print("=" * 80)
+def send_pd(arm, q_cmd, gripper_q):
+    qd_cmd = np.zeros(6, dtype=np.float32)
+    tau_cmd = np.zeros(6, dtype=np.float32)
 
-    arm = unitree_arm_interface.ArmInterface(hasGripper=has_gripper)
-    armModel = arm._ctrlComp.armModel
-    arm.setFsmLowcmd()
+    arm.q = q_cmd
+    arm.qd = qd_cmd
+    arm.tau = tau_cmd
+    arm.gripperQ = float(gripper_q)
 
-    duration = args.duration
+    arm.setArmCmd(arm.q, arm.qd, arm.tau)
+    arm.setGripperCmd(arm.gripperQ, arm.gripperQd, arm.gripperTau)
+    arm.sendRecv()
+
+
+def move_to_target(arm, q_target, hold_time, name):
     dt = float(arm._ctrlComp.dt)
+    steps = max(1, int(round(MOVE_TIME / dt)))
 
-    last_pos = np.array(arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
-    kp = [float(args.kp)] * 6 + [20.0]
-    kd = [float(args.kd)] * 6 + [2000.0]
+    q_start = get_q(arm).copy()
+    prev_q_cmd = q_start.copy()
 
-    print("[TEST] dt      =", dt)
-    print("[TEST] FSM     =", arm.getCurrentState())
-    print("[TEST] q_init  =", last_pos)
-    print("[TEST] q_delta =", target_pos - last_pos)
+    print(f"\n=== move to {name} ===")
+    print("q_start =", np.round(q_start, 3))
+    print("q_target=", np.round(q_target, 3))
 
-    input("[TEST] Press Enter to start...")
+    max_err = np.zeros(6, dtype=np.float32)
 
-    arm._ctrlComp.lowcmd.setControlGain(kp, kd)
+    for i in range(steps):
+        alpha = float(i + 1) / float(steps)
+        q_ref = (1.0 - alpha) * q_start + alpha * q_target
 
-    for i in range(duration):
-        alpha = float(i) / float(duration)
+        dq = np.clip(q_ref - prev_q_cmd, -STEP_CLIP, STEP_CLIP)
+        q_cmd = prev_q_cmd + dq
 
-        q_cmd = last_pos * (1.0 - alpha) + target_pos * alpha
-        qd_cmd = np.zeros(6, dtype=np.float32)
-        tau_cmd = np.zeros(6, dtype=np.float32)
+        send_pd(arm, q_cmd, GRIPPER_Q)
 
-        arm.q = q_cmd
-        arm.qd = qd_cmd
-        arm.tau = tau_cmd
-        arm.gripperQ = target_gripper
+        q_meas = get_q(arm)
+        qd_meas = get_qd(arm)
+        err = q_cmd - q_meas
+        max_err = np.maximum(max_err, np.abs(err))
+        prev_q_cmd = q_cmd.copy()
 
-        arm.setArmCmd(arm.q, arm.qd, arm.tau)
-        arm.setGripperCmd(arm.gripperQ, arm.gripperQd, arm.gripperTau)
-        arm.sendRecv()
-
-        fsm = arm.getCurrentState()
-
-        if (i % 20 == 0) or (i == duration - 1) or (fsm != unitree_arm_interface.ArmFSMState.LOWCMD):
-            q_meas = np.array(arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
-            qd_meas = np.array(arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
-            tau_meas = np.array(arm.lowstate.getTau(), dtype=np.float32).reshape(6,)
-            err = q_cmd - q_meas
-
+        if i % PRINT_EVERY == 0 or i == steps - 1:
             print(
-                f"[{i+1:04d}/{duration}] "
-                f"FSM={fsm} | "
-                f"q_cmd={np.round(q_cmd, 3)} | "
-                f"q_meas={np.round(q_meas, 3)} | "
-                f"err={np.round(err, 3)} | "
-                f"qd_meas={np.round(qd_meas, 3)} | "
-                f"tau_meas={np.round(tau_meas, 3)}"
+                f"[{name} {i+1:04d}/{steps}] "
+                f"err={np.round(err, 3)} "
+                f"qd={np.round(qd_meas, 3)}"
             )
-
-        if fsm != unitree_arm_interface.ArmFSMState.LOWCMD:
-            print(f"[ERROR] FSM dropped to {fsm} at step {i+1}")
-            break
 
         time.sleep(dt)
 
-    arm.loopOn()
-    arm.backToStart()
-    arm.loopOff()
+    print(f"--- hold {name} for {hold_time:.1f}s ---")
+    hold_steps = max(1, int(round(hold_time / dt)))
+    for i in range(hold_steps):
+        send_pd(arm, q_target, GRIPPER_Q)
+        q_meas = get_q(arm)
+        qd_meas = get_qd(arm)
+        err = q_target - q_meas
+        max_err = np.maximum(max_err, np.abs(err))
+
+        if i % PRINT_EVERY == 0 or i == hold_steps - 1:
+            print(
+                f"[hold {name} {i+1:04d}/{hold_steps}] "
+                f"err={np.round(err, 3)} "
+                f"qd={np.round(qd_meas, 3)}"
+            )
+
+        time.sleep(dt)
+
+    print(f"max_abs_err({name}) =", np.round(max_err, 4))
+
+
+def main():
+    np.set_printoptions(precision=3, suppress=True)
+    print("Press Ctrl+C to stop.")
+    print("KP =", KP)
+    print("KD =", KD)
+
+    arm = unitree_arm_interface.ArmInterface(hasGripper=HAS_GRIPPER)
+    arm.setFsmLowcmd()
+    time.sleep(0.02)
+
+    for _ in range(20):
+        arm.sendRecv()
+        time.sleep(0.002)
+
+    set_gain(arm, KP, KD)
+
+    print("current q =", np.round(get_q(arm), 3))
+
+    move_to_target(arm, ZERO_Q, HOLD_TIME, "ZERO")
+    move_to_target(arm, DEFAULT_Q, HOLD_TIME, "DEFAULT")
+    move_to_target(arm, ZERO_Q, HOLD_TIME, "ZERO_BACK")
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":

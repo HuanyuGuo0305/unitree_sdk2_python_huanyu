@@ -418,8 +418,8 @@ class Z1ArmAdapter:
         gripper_q_cmd: float,
         kp_cmd: np.ndarray,
         kd_cmd: np.ndarray,
-        qd_cmd: np.ndarray | None = None,
-        tau_cmd: np.ndarray | None = None,
+        qd_cmd: np.ndarray,
+        tau_cmd: np.ndarray,
     ):
         q_cmd = np.asarray(q_cmd, dtype=np.float32).reshape(6,)
         kp_cmd = np.asarray(kp_cmd, dtype=np.float32).reshape(6,)
@@ -539,12 +539,6 @@ class Z1ArmAdapter:
         for _ in range(10):
             self.arm.sendRecv()
             time.sleep(dt)
-
-        # Explicitly use zero lowcmd gains here to match the official lowcmd example.
-        self.set_control_gain(
-            np.zeros(6, dtype=np.float32),
-            np.zeros(6, dtype=np.float32),
-        )
 
         qd_traj = ((target_q - q0) / max(duration_s, 1e-6)).astype(np.float32)
 

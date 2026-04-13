@@ -108,16 +108,16 @@ wheel_action_scale: 5.0
 #   Because the lowcmd motor-side torque is approximately:
 #       tau = kp * 25.6 * (qd - q) + kd * 0.0128 * (dqd - dq) + tau_f
 #   the numerical gain values here should not be copied directly from sim.
-arm_kps_startup: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
-arm_kds_startup: [ 3.0,  3.0,  3.0,  3.0,  3.0,  3.0]
+arm_kps_startup: [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]
+arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
 
 # external FF torque part, in joint-space equivalent PD units
 arm_kps_runtime_ff: [15.0, 20.0, 20.0, 20.0, 15.0, 15.0]
 arm_kds_runtime_ff: [2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
 
 # motor-side lowcmd gains (raw values sent to SDK)
-arm_kps_runtime_motor: [0.20, 0.25, 0.25, 0.25, 0.20, 0.20]
-arm_kds_runtime_motor: [78.0, 78.0, 78.0, 78.0, 78.0, 78.0]
+arm_kps_runtime_motor: [0.70, 0.70, 0.70, 0.70, 0.70, 0.70]
+arm_kds_runtime_motor: [62.5, 62.5, 62.5, 62.5, 62.5, 62.5]
 
 z1_runtime_tau_clip: [33, 66, 33, 33, 33, 33]
 z1_runtime_target_step_clip: [0.03, 0.02, 0.02, 0.02, 0.03, 0.03]

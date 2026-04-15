@@ -1,82 +1,140 @@
 #!/usr/bin/env python3
+import os
 import sys
 import time
 import numpy as np
 
-# 改成你的 SDK lib 路径
-sys.path.append("/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib")
-import unitree_arm_interface
+# Add project root to sys.path so we can import utils.z1_helper
+PROJECT_ROOT = os.path.abspath("/home/huanyuguo/Workspace_huanyu/unitree_sdk2_python_huanyu")
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from utils.z1_helper import Z1ArmAdapter, compute_ee_current_kp_lb
 
 
-HAS_GRIPPER = True
+# ---------------------------------------------------------------------
+# User config
+# ---------------------------------------------------------------------
 
-KP = np.array([18.0, 28.0, 28.0, 18.0, 12.0, 8.0], dtype=np.float32)
-KD = np.array([1800.0, 1800.0, 1800.0, 1800.0, 1800.0, 1800.0], dtype=np.float32)
+CFG = {
+    "z1_sdk_lib": "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib",
+
+    # Control timing
+    "control_dt": 0.02,
+    "z1_control_dt": 0.02,
+
+    # Arm setup
+    "z1_has_gripper": True,
+    "z1_fk_ee_index": 6,
+
+    # Default target
+    "default_arm_pos": [0.0, 1.48, -1.0, -0.54, 0.0, 0.0],
+    "default_gripper_pos": 0.0,
+
+    # Startup gains used by hold_pose_lowcmd()
+    "arm_kps_startup": [3.33, 5.0, 5.0, 3.33, 2.5, 1.66],
+    "arm_kds_startup": [333.0, 333.0, 333.0, 333.0, 333.0, 333.0],
+
+    # Runtime gains (not important for this test, but adapter expects them)
+    "arm_kps_runtime": [1.56, 1.56, 1.56, 1.56, 1.56, 1.56],
+    "arm_kds_runtime": [235, 235, 235, 235, 235, 235],
+
+    # Step limiter for runtime PD path
+    "z1_runtime_q_step_clip": [0.04, 0.04, 0.04, 0.04, 0.04, 0.04],
+
+    # Gripper gains
+    "z1_gripper_kp": 20.0,
+    "z1_gripper_kd": 2000.0,
+
+    # Kinematic transforms
+    "arm_base_offset_pos": [0.10, 0.0, 0.12],
+    "arm_base_offset_rpy": [0.0, 0.0, 0.0],
+    "z1_fk_to_policy_ee_pos": [0.051, 0.0, 0.0],
+    "z1_fk_to_policy_ee_rpy": [0.0, 0.0, 0.0],
+
+    # Debug
+    "z1_debug_print": False,
+}
 
 ZERO_Q = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 DEFAULT_Q = np.array([0.0, 1.48, -1.0, -0.54, 0.0, 0.0], dtype=np.float32)
-
 GRIPPER_Q = 0.0
 
 MOVE_TIME = 4.0
 HOLD_TIME = 2.0
-STEP_CLIP = np.array([0.04, 0.04, 0.04, 0.04, 0.04, 0.04], dtype=np.float32)
-
 PRINT_EVERY = 20
 
+# Base orientation for standalone Z1 test.
+# If the arm base is level and world-aligned, identity is correct.
+BASE_QUAT_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
-def set_gain(arm, kp, kd):
-    kp_full = [float(x) for x in kp] + [20.0]
-    kd_full = [float(x) for x in kd] + [2000.0]
-    arm._ctrlComp.lowcmd.setControlGain(kp_full, kd_full)
-
-
-def get_q(arm):
-    return np.asarray(arm.lowstate.getQ(), dtype=np.float32).reshape(6,)
+# Keypoint definition, must match your sim/deploy pipeline
+KP_DX = 0.30
+KP_DZ = 0.30
 
 
-def get_qd(arm):
-    return np.asarray(arm.lowstate.getQd(), dtype=np.float32).reshape(6,)
+# ---------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------
+
+def get_q(z1: Z1ArmAdapter) -> np.ndarray:
+    z1.read_state()
+    return z1.q.copy()
 
 
-def send_pd(arm, q_cmd, gripper_q):
-    qd_cmd = np.zeros(6, dtype=np.float32)
-    tau_cmd = np.zeros(6, dtype=np.float32)
-
-    arm.q = q_cmd
-    arm.qd = qd_cmd
-    arm.tau = tau_cmd
-    arm.gripperQ = float(gripper_q)
-
-    arm.setArmCmd(arm.q, arm.qd, arm.tau)
-    arm.setGripperCmd(arm.gripperQ, arm.gripperQd, arm.gripperTau)
-    arm.sendRecv()
+def get_qd(z1: Z1ArmAdapter) -> np.ndarray:
+    z1.read_state()
+    return z1.qd.copy()
 
 
-def move_to_target(arm, q_target, hold_time, name):
-    dt = float(arm._ctrlComp.dt)
+def print_ee_current_lb(z1: Z1ArmAdapter, title: str, repeat: int = 5, sleep_dt: float = 0.02):
+    """
+    Print current EE keypoints in LB frame for several consecutive timesteps.
+    """
+    print(f"\n=== {title} ===")
+    for i in range(repeat):
+        z1.read_state()
+        ee_kp_lb = compute_ee_current_kp_lb(
+            base_quat_wxyz=BASE_QUAT_WXYZ,
+            z1_adapter=z1,
+            kp_dx=KP_DX,
+            kp_dz=KP_DZ,
+        )
+        print(f"[EE_CURRENT_LB {i+1}/{repeat}] {np.round(ee_kp_lb, 6)}")
+        time.sleep(sleep_dt)
+
+
+def move_to_target_pd(z1: Z1ArmAdapter, q_target: np.ndarray, hold_time: float, name: str):
+    """
+    Move to a target using lowcmd PD hold path.
+    """
+    dt = z1.get_arm_dt()
     steps = max(1, int(round(MOVE_TIME / dt)))
 
-    q_start = get_q(arm).copy()
+    q_start = get_q(z1)
     prev_q_cmd = q_start.copy()
 
-    print(f"\n=== move to {name} ===")
-    print("q_start =", np.round(q_start, 3))
-    print("q_target=", np.round(q_target, 3))
+    print(f"\n=== Move to {name} ===")
+    print("q_start  =", np.round(q_start, 3))
+    print("q_target =", np.round(q_target, 3))
 
     max_err = np.zeros(6, dtype=np.float32)
+    step_clip = z1.runtime_q_step_clip.copy()
 
     for i in range(steps):
         alpha = float(i + 1) / float(steps)
         q_ref = (1.0 - alpha) * q_start + alpha * q_target
 
-        dq = np.clip(q_ref - prev_q_cmd, -STEP_CLIP, STEP_CLIP)
+        dq = np.clip(q_ref - prev_q_cmd, -step_clip, step_clip)
         q_cmd = prev_q_cmd + dq
 
-        send_pd(arm, q_cmd, GRIPPER_Q)
+        z1.hold_pose_lowcmd(
+            q_cmd=q_cmd,
+            gripper_q_cmd=GRIPPER_Q,
+        )
 
-        q_meas = get_q(arm)
-        qd_meas = get_qd(arm)
+        q_meas = get_q(z1)
+        qd_meas = get_qd(z1)
         err = q_cmd - q_meas
         max_err = np.maximum(max_err, np.abs(err))
         prev_q_cmd = q_cmd.copy()
@@ -90,12 +148,17 @@ def move_to_target(arm, q_target, hold_time, name):
 
         time.sleep(dt)
 
-    print(f"--- hold {name} for {hold_time:.1f}s ---")
+    print(f"--- Hold {name} for {hold_time:.1f}s ---")
     hold_steps = max(1, int(round(hold_time / dt)))
+
     for i in range(hold_steps):
-        send_pd(arm, q_target, GRIPPER_Q)
-        q_meas = get_q(arm)
-        qd_meas = get_qd(arm)
+        z1.hold_pose_lowcmd(
+            q_cmd=q_target,
+            gripper_q_cmd=GRIPPER_Q,
+        )
+
+        q_meas = get_q(z1)
+        qd_meas = get_qd(z1)
         err = q_target - q_meas
         max_err = np.maximum(max_err, np.abs(err))
 
@@ -108,32 +171,44 @@ def move_to_target(arm, q_target, hold_time, name):
 
         time.sleep(dt)
 
-    print(f"max_abs_err({name}) =", np.round(max_err, 4))
+    print(f"max_abs_err({name}) = {np.round(max_err, 4)}")
 
+    if name == "DEFAULT":
+        print_ee_current_lb(
+            z1=z1,
+            title="EE keypoints in LB frame at DEFAULT pose",
+            repeat=5,
+            sleep_dt=dt,
+        )
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
 
 def main():
     np.set_printoptions(precision=3, suppress=True)
+
     print("Press Ctrl+C to stop.")
-    print("KP =", KP)
-    print("KD =", KD)
+    print("Startup KP =", np.array(CFG["arm_kps_startup"], dtype=np.float32))
+    print("Startup KD =", np.array(CFG["arm_kds_startup"], dtype=np.float32))
 
-    arm = unitree_arm_interface.ArmInterface(hasGripper=HAS_GRIPPER)
-    arm.setFsmLowcmd()
-    time.sleep(0.02)
+    z1 = Z1ArmAdapter(cfg=CFG, project_root=PROJECT_ROOT)
+    z1.connect()
 
-    for _ in range(20):
-        arm.sendRecv()
-        time.sleep(0.002)
+    print("Current q =", np.round(get_q(z1), 3))
 
-    set_gain(arm, KP, KD)
+    try:
+        move_to_target_pd(z1, ZERO_Q, HOLD_TIME, "ZERO")
+        move_to_target_pd(z1, DEFAULT_Q, HOLD_TIME, "DEFAULT")
+        move_to_target_pd(z1, ZERO_Q, HOLD_TIME, "ZERO_BACK")
+        print("\nDone.")
 
-    print("current q =", np.round(get_q(arm), 3))
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
 
-    move_to_target(arm, ZERO_Q, HOLD_TIME, "ZERO")
-    move_to_target(arm, DEFAULT_Q, HOLD_TIME, "DEFAULT")
-    move_to_target(arm, ZERO_Q, HOLD_TIME, "ZERO_BACK")
-
-    print("\nDone.")
+    except Exception as e:
+        print(f"\nError: {e}")
 
 
 if __name__ == "__main__":

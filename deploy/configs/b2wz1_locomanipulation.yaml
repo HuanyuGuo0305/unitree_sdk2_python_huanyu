@@ -81,7 +81,7 @@ kds_pd: [
 
 # Action scales
 leg_action_scale: 0.25
-arm_action_scale: [0.25, 0.35, 0.25, 0.25, 0.25, 0.25]
+arm_action_scale: [0.06, 0.08, 0.08, 0.06, 0.04, 0.04]
 wheel_action_scale: 5.0
 
 # Z1 startup PD gains
@@ -89,8 +89,8 @@ arm_kps_startup: [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]
 arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
 
 # Z1 runtime PD gains at 50 Hz
-arm_kps_runtime: [18.0, 28.0, 28.0, 18.0, 12.0, 8.0]
-arm_kds_runtime: [1800.0, 1800.0, 1800.0, 1800.0, 1800.0, 1800.0]
+arm_kps_runtime: [3.33, 5.0, 5.0, 3.33, 2.5, 1.66]
+arm_kds_runtime: [400.0, 400.0, 400.0, 400.0, 400.0, 400.0]
 
 # Per-step arm target limiter at 50 Hz
 z1_runtime_q_step_clip: [0.04, 0.04, 0.04, 0.04, 0.04, 0.04]
@@ -103,7 +103,7 @@ z1_gripper_kd: 2000.0
 z1_has_gripper: true
 z1_fk_ee_index: 6
 
-arm_base_offset_pos: [0.190, 0.0, 0.0952]
+arm_base_offset_pos: [0.097, 0.001, 0.092]
 arm_base_offset_rpy: [0.0, 0.0, 0.0]
 
 z1_fk_to_policy_ee_pos: [0.051, 0.0, 0.0]
@@ -112,16 +112,15 @@ z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
 # EE command sampler
 ee_kp_dx: 0.30
 ee_kp_dz: 0.30
-ee_kp0_threshold: 0.20
-ee_rot_threshold: 0.40
+ee_kp0_threshold: 0.10
+ee_rot_threshold: 0.25
 ee_command_seed: 0
-ee_resample_interval: 200
+ee_resample_interval: 600
 
 # Debug
 z1_debug_print: true
 
-# Arm full-policy warmup
-arm_policy_warmup_s: 4.0
+arm_action_clip: 1.0
 
-# safety limits
-arm_target_clip: [0.20, 0.25, 0.20, 0.20, 0.20, 0.20]
+arm_enable_delay_s: 3.0
+arm_policy_warmup_s: 5.0

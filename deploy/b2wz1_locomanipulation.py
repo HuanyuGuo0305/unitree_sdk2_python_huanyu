@@ -9,7 +9,8 @@ Run from repository root:
 
 Design goals:
 - Startup: use official-style Z1 lowcmd motion + lowcmd hold.
-- Runtime: pure lowcmd PD for Z1 at 50 Hz, no FF torque, no hybrid control.
+- Runtime: pure lowcmd PD for Z1 at policy rate.
+- Observation format should match sim2sim as closely as possible.
 """
 
 import os
@@ -82,17 +83,16 @@ class B2WZ1LocoManipController:
             self.input_name = self.session.get_inputs()[0].name
             self.output_name = self.session.get_outputs()[0].name
 
-        # Commands
+        # Base command
         self.base_command = np.zeros(3, dtype=np.float32)
         self.command_scale = np.array(self.cfg["command_scale"], dtype=np.float32).reshape(3,)
         self.command_deadband_lin = float(self.cfg.get("command_deadband_lin", 0.2))
         self.command_deadband_ang = float(self.cfg.get("command_deadband_ang", 0.2))
 
-        # B2W default poses / gains
+        # B2W default poses and gains
         self.default_b2w_pos_policy = np.array(self.cfg["default_b2w_pos_policy"], dtype=np.float32).reshape(16,)
         self.squat_b2w_pos_policy = np.array(self.cfg["squat_b2w_pos_policy"], dtype=np.float32).reshape(16,)
 
-        # PD gains in POLICY order
         self.kps_rl = np.array(self.cfg["kps_rl"], dtype=np.float32).reshape(16,)
         self.kds_rl = np.array(self.cfg["kds_rl"], dtype=np.float32).reshape(16,)
         self.kps_pd = np.array(self.cfg["kps_pd"], dtype=np.float32).reshape(16,)
@@ -102,14 +102,17 @@ class B2WZ1LocoManipController:
         self.arm_action_scale = np.array(self.cfg["arm_action_scale"], dtype=np.float32).reshape(6,)
         self.wheel_action_scale = float(self.cfg["wheel_action_scale"])
 
+        # Action clipping
+        self.arm_action_clip = float(self.cfg.get("arm_action_clip", 2.0))
+
         # Arm defaults
         self.default_arm_pos = np.array(self.cfg["default_arm_pos"], dtype=np.float32).reshape(6,)
         self.default_gripper_pos = float(self.cfg["default_gripper_pos"])
 
-        # Observation default: leg(12) + arm(6)
+        # Observation defaults
         self.default_joint_pos_policy = np.array(self.cfg["default_joint_pos_policy"], dtype=np.float32).reshape(18,)
 
-        # Joint naming / ordering
+        # Policy joint order
         self.policy_joint_names = [
             "FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint",
             "FL_thigh_joint", "FR_thigh_joint", "RL_thigh_joint", "RR_thigh_joint",
@@ -139,13 +142,12 @@ class B2WZ1LocoManipController:
 
         self.num_b2w_dof = 16
 
-        # Reorder gains from policy order -> hardware order
+        # Reorder gains from policy order to hardware order
         self.kps_rl_hw = self.kps_rl[self.policy_to_hardware_joint_indices]
         self.kds_rl_hw = self.kds_rl[self.policy_to_hardware_joint_indices]
         self.kps_pd_hw = self.kps_pd[self.policy_to_hardware_joint_indices]
         self.kds_pd_hw = self.kds_pd[self.policy_to_hardware_joint_indices]
 
-        # Split leg / wheel joints
         self.leg_policy_indices = list(range(12))
         self.wheel_policy_indices = list(range(12, 16))
 
@@ -156,7 +158,6 @@ class B2WZ1LocoManipController:
             self.hardware_joint_names.index(name) for name in self.wheel_joint_names
         ]
 
-        # Wheel gains in hardware order
         self.wheel_kps_rl_hw = np.zeros(self.num_b2w_dof, dtype=np.float32)
         self.wheel_kds_rl_hw = np.zeros(self.num_b2w_dof, dtype=np.float32)
         self.wheel_kps_pd_hw = np.zeros(self.num_b2w_dof, dtype=np.float32)
@@ -199,7 +200,7 @@ class B2WZ1LocoManipController:
         self.ee_resample_interval = int(self.cfg["ee_resample_interval"])
         self.ee_cmd_lb_current = np.zeros(9, dtype=np.float32)
 
-        # Runtime states
+        # Runtime state
         self.remote_controller = RemoteController()
 
         self.low_cmd = unitree_go_msg_dds__LowCmd_()
@@ -219,7 +220,7 @@ class B2WZ1LocoManipController:
         self.gravity_w = np.array([0.0, 0.0, -1.0], dtype=np.float32)
         self.projected_gravity_b = np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
-        # B2W state in policy order [leg(12), wheel(4)]
+        # B2W state in policy order
         self.b2w_joint_pos = np.zeros(16, dtype=np.float32)
         self.b2w_joint_vel = np.zeros(16, dtype=np.float32)
 
@@ -245,21 +246,25 @@ class B2WZ1LocoManipController:
         self.counter = 0
         self.policy_tick = 0
 
+        # Full-policy arm enable / warmup
+        self.arm_enable_delay_s = float(self.cfg.get("arm_enable_delay_s", 2.0))
+        self.arm_enable_delay_steps = max(1, int(round(self.arm_enable_delay_s / self.control_dt)))
+
         self.arm_policy_warmup_s = float(self.cfg.get("arm_policy_warmup_s", 4.0))
         self.arm_policy_warmup_steps = max(1, int(round(self.arm_policy_warmup_s / self.control_dt)))
 
-        # 纯真机安全建议：full-policy 先限幅
-        self.arm_target_clip = np.array(
-            self.cfg.get("arm_target_clip", [0.25, 0.35, 0.25, 0.25, 0.25, 0.25]),
-            dtype=np.float32,
-        ).reshape(6,)
+        # Observation debug in pd-stand mode
+        self.debug_obs_enabled = (self.mode == "pd-stand")
+        self.debug_obs_print_max = 5
+        self.debug_obs_print_count = 0
+        self.debug_obs_started = False
 
     def _resolve_path(self, path_str: str) -> str:
         if os.path.isabs(path_str):
             return path_str
         return os.path.abspath(os.path.join(PROJECT_ROOT, path_str))
 
-    # DDS callbacks / publishing
+    # DDS callbacks
     def low_state_handler(self, msg: LowStateGo):
         self.low_state = msg
         self.remote_controller.set(msg.wireless_remote)
@@ -359,6 +364,36 @@ class B2WZ1LocoManipController:
         )
         assert obs.shape[0] == self.obs_dim_per_step, f"Obs dim mismatch: {obs.shape[0]}"
         return obs
+
+    def print_obs_step_debug(self, obs_step: np.ndarray, tag: str):
+        i = 0
+        base_ang_vel = obs_step[i:i + 3]; i += 3
+        projected_gravity = obs_step[i:i + 3]; i += 3
+        base_cmd_dbg = obs_step[i:i + 3]; i += 3
+        ee_cmd_dbg = obs_step[i:i + 9]; i += 9
+        ee_cur_dbg = obs_step[i:i + 9]; i += 9
+        joint_pos_leg_dbg = obs_step[i:i + 12]; i += 12
+        joint_pos_arm_dbg = obs_step[i:i + 6]; i += 6
+        joint_vel_leg_dbg = obs_step[i:i + 12]; i += 12
+        joint_vel_arm_dbg = obs_step[i:i + 6]; i += 6
+        joint_vel_wheel_dbg = obs_step[i:i + 4]; i += 4
+        last_action_dbg = obs_step[i:i + 22]; i += 22
+
+        print("=" * 96)
+        print(f"[OBS-DEBUG] {tag}")
+        print(f"base_ang_vel      : {np.round(base_ang_vel, 6)}")
+        print(f"projected_gravity : {np.round(projected_gravity, 6)}")
+        print(f"base_command      : {np.round(base_cmd_dbg, 6)}")
+        print(f"ee_cmd_lb         : {np.round(ee_cmd_dbg, 6)}")
+        print(f"ee_cur_lb         : {np.round(ee_cur_dbg, 6)}")
+        print(f"joint_pos_leg_rel : {np.round(joint_pos_leg_dbg, 6)}")
+        print(f"joint_pos_arm_rel : {np.round(joint_pos_arm_dbg, 6)}")
+        print(f"joint_vel_leg     : {np.round(joint_vel_leg_dbg, 6)}")
+        print(f"joint_vel_arm     : {np.round(joint_vel_arm_dbg, 6)}")
+        print(f"joint_vel_wheel   : {np.round(joint_vel_wheel_dbg, 6)}")
+        print(f"last_action       : {np.round(last_action_dbg, 6)}")
+        print(f"obs_step_full     : {np.round(obs_step, 6)}")
+        print("=" * 96)
 
     def _init_history(self):
         obs0 = self.build_obs_step(self.ee_cmd_lb_current)
@@ -494,7 +529,6 @@ class B2WZ1LocoManipController:
 
     def hold_arm_default_until_A(self):
         print("[B2WZ1] Holding arm default pose while B2W stays still. Press A to continue to squat...")
-
         while self.remote_controller.button[KeyMap.A] != 1:
             create_zero_cmd(self.low_cmd)
             self.send_b2w_cmd()
@@ -510,6 +544,22 @@ class B2WZ1LocoManipController:
 
     def hold_all_default_until_A(self):
         print("[B2WZ1] Holding full default pose. Press A to start main loop...")
+
+        debug_counter = 0
+        debug_max = 5
+        debug_done = False
+
+        if self.mode == "pd-stand":
+            print("\n" + "=" * 80)
+            print("[DEBUG] PD-STAND: start printing obs at DEFAULT pose")
+            print("=" * 80)
+
+            self._read_all_sensors_once()
+            self.last_action[:] = 0.0
+
+            ee_cur_lb = self.compute_ee_current_kp_lb()
+            self.ee_cmd_lb_current = ee_cur_lb.copy()
+
         while self.remote_controller.button[KeyMap.A] != 1:
             self._write_b2w_pose_cmd_policy(
                 target_b2w_pos_policy=self.default_b2w_pos_policy,
@@ -522,21 +572,46 @@ class B2WZ1LocoManipController:
                 self.default_gripper_pos,
             )
 
+            if self.mode == "pd-stand" and not debug_done:
+                self._read_all_sensors_once()
+
+                obs_step = self.build_obs_step(self.ee_cmd_lb_current)
+
+                self.print_obs_step_debug(
+                    obs_step,
+                    tag=f"DEFAULT_POSE step {debug_counter+1}/5"
+                )
+
+                debug_counter += 1
+                if debug_counter >= debug_max:
+                    debug_done = True
+                    print("[DEBUG] Finished printing 5 obs.\n")
+
             time.sleep(self.control_dt)
 
         print("[B2WZ1] A pressed. Start main loop.")
 
     def step(self):
-        # 1) Read sensors
+        # Read sensors
         self._read_all_sensors_once()
 
-        # 2) Update EE command
-        if self.policy_tick > 0 and (self.policy_tick % self.ee_resample_interval == 0):
-            self.ee_cmd_sampler.resample()
-        self.ee_cmd_lb_current = self.ee_cmd_sampler.command.copy()
+        # Update EE command
+        if self.mode == "pd-stand":
+            self.ee_cmd_lb_current = self.ee_cmd_sampler.command.copy()
+        else:
+            if self.policy_tick > 0 and (self.policy_tick % self.ee_resample_interval == 0):
+                self.ee_cmd_sampler.resample()
+            self.ee_cmd_lb_current = self.ee_cmd_sampler.command.copy()
 
-        # 3) Build one-step observation and update history
+        # Build current observation step
         obs_step = self.build_obs_step(self.ee_cmd_lb_current)
+
+        if self.debug_obs_enabled and self.debug_obs_started and self.debug_obs_print_count < self.debug_obs_print_max:
+            self.print_obs_step_debug(
+                obs_step,
+                tag=f"control_step={self.policy_tick}, mode={self.mode}"
+            )
+            self.debug_obs_print_count += 1
 
         i = 0
         curr_base_ang_vel = obs_step[i:i + 3]; i += 3
@@ -563,7 +638,7 @@ class B2WZ1LocoManipController:
         self.joint_vel_wheel_hist.append(curr_joint_vel_wheel.copy())
         self.last_action_hist.append(curr_last_action.copy())
 
-        # 4) Stack history
+        # Stack history
         obs_stack = np.concatenate(
             [
                 np.array(self.base_ang_vel_hist).reshape(-1),
@@ -582,7 +657,7 @@ class B2WZ1LocoManipController:
         )
         assert obs_stack.shape[0] == self.obs_dim, f"obs_stack dim mismatch: {obs_stack.shape[0]}"
 
-        # 5) Run policy
+        # Policy inference
         if self.mode == "pd-stand":
             action = np.zeros(self.action_dim, dtype=np.float32)
         else:
@@ -593,11 +668,17 @@ class B2WZ1LocoManipController:
 
         self.last_action[:] = action
 
-        leg_act = action[self.leg_action_indices]
-        arm_act = action[self.arm_action_indices]
-        wheel_act = action[self.wheel_action_indices]
+        # Raw actions
+        raw_leg_act = action[self.leg_action_indices].copy()
+        raw_arm_act = action[self.arm_action_indices].copy()
+        raw_wheel_act = action[self.wheel_action_indices].copy()
 
-        # 6) Apply mode logic
+        # Use raw leg/wheel actions directly, only clip arm action
+        leg_act = raw_leg_act
+        wheel_act = raw_wheel_act
+        arm_act = np.clip(raw_arm_act, -self.arm_action_clip, self.arm_action_clip)
+
+        # Apply mode logic
         if self.mode == "pd-stand":
             self.leg_target = self.default_leg_pos_policy.copy()
             self.arm_target = self.default_arm_pos.copy()
@@ -617,22 +698,23 @@ class B2WZ1LocoManipController:
 
         elif self.mode == "full-policy":
             self.leg_target = self.default_leg_pos_policy + self.leg_action_scale * leg_act
-
-            # 强烈建议真机先夹 action，避免飞
-            arm_act = np.clip(arm_act, -1.0, 1.0)
-
-            arm_delta = self.arm_action_scale * arm_act
-            arm_delta = np.clip(arm_delta, -self.arm_target_clip, self.arm_target_clip)
-            arm_target_policy = self.default_arm_pos + arm_delta
-            arm_target_policy = np.asarray(arm_target_policy, dtype=np.float32).reshape(6,)
-
-            warmup_alpha = min(1.0, float(self.policy_tick) / float(self.arm_policy_warmup_steps))
-            self.arm_target = (
-                (1.0 - warmup_alpha) * self.default_arm_pos
-                + warmup_alpha * arm_target_policy
-            ).astype(np.float32)
-
             self.wheel_cmd[:] = self.wheel_action_scale * wheel_act
+
+            # Arm: first lock for arm_enable_delay_s, then warmup for arm_policy_warmup_s
+            if self.policy_tick < self.arm_enable_delay_steps:
+                self.arm_target = self.default_arm_pos.copy()
+                warmup_alpha = 0.0
+            else:
+                arm_target_policy = self.default_arm_pos + self.arm_action_scale * arm_act
+                arm_target_policy = np.asarray(arm_target_policy, dtype=np.float32).reshape(6,)
+
+                warmup_progress_steps = self.policy_tick - self.arm_enable_delay_steps
+                warmup_alpha = min(1.0, float(warmup_progress_steps) / float(self.arm_policy_warmup_steps))
+
+                self.arm_target = (
+                    (1.0 - warmup_alpha) * self.default_arm_pos
+                    + warmup_alpha * arm_target_policy
+                ).astype(np.float32)
 
             self._write_b2w_rl_cmd(
                 leg_target_policy=self.leg_target,
@@ -642,10 +724,10 @@ class B2WZ1LocoManipController:
         else:
             raise ValueError(f"Unsupported mode: {self.mode}")
 
-        # 7) Send B2W
+        # Send B2W command
         self.send_b2w_cmd()
 
-        # 8) Z1: 50Hz 纯 PD，一步一发
+        # Send one Z1 PD command at policy rate
         use_startup_gains = (self.mode == "pd-stand")
         self.z1.track_target_pd_once(
             q_target=self.arm_target.copy(),
@@ -653,25 +735,34 @@ class B2WZ1LocoManipController:
             use_startup_gains=use_startup_gains,
         )
 
-        # 9) Bookkeeping
+        # Bookkeeping
         self.counter += 1
         self.policy_tick += 1
 
         if self.counter % 100 == 0:
             if self.mode == "full-policy":
-                warmup_alpha_dbg = min(1.0, float(self.policy_tick) / float(self.arm_policy_warmup_steps))
+                if self.policy_tick < self.arm_enable_delay_steps:
+                    arm_phase = "lock"
+                    warmup_alpha_dbg = 0.0
+                else:
+                    arm_phase = "warmup_or_policy"
+                    warmup_progress_steps = self.policy_tick - self.arm_enable_delay_steps
+                    warmup_alpha_dbg = min(1.0, float(warmup_progress_steps) / float(self.arm_policy_warmup_steps))
             else:
+                arm_phase = "n/a"
                 warmup_alpha_dbg = 1.0
 
             print(
                 f"[{self.counter:5d}] "
                 f"mode={self.mode} | "
                 f"cmd={self.base_command} | "
+                f"arm_phase={arm_phase} | "
                 f"warmup_alpha={warmup_alpha_dbg:.2f} | "
-                f"leg_act=[{leg_act.min():+.2f},{leg_act.max():+.2f}] | "
-                f"arm_act=[{arm_act.min():+.2f},{arm_act.max():+.2f}] | "
-                f"arm_tgt=[{self.arm_target.min():+.2f},{self.arm_target.max():+.2f}] | "
-                f"wheel_act=[{wheel_act.min():+.2f},{wheel_act.max():+.2f}]"
+                f"leg_act_raw=[{raw_leg_act.min():+.2f},{raw_leg_act.max():+.2f}] | "
+                f"arm_act_raw=[{raw_arm_act.min():+.2f},{raw_arm_act.max():+.2f}] | "
+                f"arm_act_clip=[{arm_act.min():+.2f},{arm_act.max():+.2f}] | "
+                f"wheel_act_raw=[{raw_wheel_act.min():+.2f},{raw_wheel_act.max():+.2f}] | "
+                f"arm_tgt=[{self.arm_target.min():+.2f},{self.arm_target.max():+.2f}]"
             )
 
             ee_cur_lb = self.compute_ee_current_kp_lb()
@@ -681,6 +772,23 @@ class B2WZ1LocoManipController:
                 f"ee_cmd={np.round(self.ee_cmd_lb_current, 3)} | "
                 f"ee_cur={np.round(ee_cur_lb, 3)} | "
                 f"ee_err={np.round(ee_err_lb, 3)}"
+            )
+
+            # Debug: arm raw/clipped action vector
+            print(
+                "[ARM-ACT] "
+                f"raw={np.round(raw_arm_act, 3)} | "
+                f"clipped={np.round(arm_act, 3)}"
+            )
+
+            # Debug: arm tracking error
+            arm_q_meas = self.z1.q.copy()
+            arm_q_err = self.arm_target - arm_q_meas
+            print(
+                "[ARM-TRACK] "
+                f"q_tgt={np.round(self.arm_target, 3)} | "
+                f"q_meas={np.round(arm_q_meas, 3)} | "
+                f"q_err={np.round(arm_q_err, 3)}"
             )
 
     def setup(self):
@@ -693,6 +801,9 @@ class B2WZ1LocoManipController:
         print(f"Obs dim per step  : {self.obs_dim_per_step}")
         print(f"Obs stacked dim   : {self.obs_dim}")
         print(f"Action dim        : {self.action_dim}")
+        print(f"Arm action clip   : +/-{self.arm_action_clip}")
+        print(f"Arm enable delay  : {self.arm_enable_delay_s:.2f}s ({self.arm_enable_delay_steps} steps)")
+        print(f"Arm warmup        : {self.arm_policy_warmup_s:.2f}s ({self.arm_policy_warmup_steps} steps)")
         print("=" * 80)
 
         self.wait_for_low_state()
@@ -752,13 +863,19 @@ class B2WZ1LocoManipController:
         self.last_action_hist.clear()
 
         ee_cur_init_lb = self.compute_ee_current_kp_lb()
-        self.ee_cmd_sampler.reset(ee_cur_init_lb, sample_first=True)
+
+        sample_first = False if self.mode == "pd-stand" else True
+        self.ee_cmd_sampler.reset(ee_cur_init_lb, sample_first=sample_first)
         self.ee_cmd_lb_current = self.ee_cmd_sampler.command.copy()
 
         self._init_history()
 
         self.counter = 0
         self.policy_tick = 0
+
+        if self.debug_obs_enabled:
+            self.debug_obs_started = True
+            self.debug_obs_print_count = 0
 
         print("[B2WZ1] Main loop started. Press SELECT to stop.")
 

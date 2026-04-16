@@ -51,6 +51,7 @@ from utils.math import (
     quat_unique_wxyz,
 )
 from utils.z1_helper import (
+    SequentialKeypointsTrajectoryCommandLBSim,
     PresampledKeypointsCubicTrajectoryCommandLBSim,
     Z1ArmAdapter,
     compute_ee_current_kp_lb,
@@ -190,17 +191,30 @@ class B2WZ1LocoManipController:
         self.ee_kp_dx = float(self.cfg["ee_kp_dx"])
         self.ee_kp_dz = float(self.cfg["ee_kp_dz"])
 
-        self.ee_cmd_sampler = PresampledKeypointsCubicTrajectoryCommandLBSim(
-            file_path=ee_command_path,
-            control_dt=self.control_dt,
-            kp_dx=self.ee_kp_dx,
-            kp_dz=self.ee_kp_dz,
-            kp0_threshold=float(self.cfg["ee_kp0_threshold"]),
-            rot_threshold=float(self.cfg["ee_rot_threshold"]),
-            traj_duration_s=float(self.cfg["ee_traj_duration_s"]),
-            hold_duration_s=float(self.cfg["ee_hold_duration_s"]),
-            seed=int(self.cfg.get("ee_command_seed", 0)),
-        )
+        self.ee_command_mode = str(self.cfg.get("ee_command_mode", "presampled"))
+
+        if self.ee_command_mode == "sequential":
+            self.ee_cmd_sampler = SequentialKeypointsTrajectoryCommandLBSim(
+                file_path=ee_command_path,
+                control_dt=self.control_dt,
+                traj_duration_s=float(self.cfg.get("ee_sequential_traj_duration_s", 4.0)),
+                hold_duration_s=float(self.cfg.get("ee_sequential_hold_duration_s", 2.0)),
+            )
+        elif self.ee_command_mode == "presampled":
+            self.ee_cmd_sampler = PresampledKeypointsCubicTrajectoryCommandLBSim(
+                file_path=ee_command_path,
+                control_dt=self.control_dt,
+                kp_dx=self.ee_kp_dx,
+                kp_dz=self.ee_kp_dz,
+                kp0_threshold=float(self.cfg["ee_kp0_threshold"]),
+                rot_threshold=float(self.cfg["ee_rot_threshold"]),
+                traj_duration_s=float(self.cfg["ee_traj_duration_s"]),
+                hold_duration_s=float(self.cfg["ee_hold_duration_s"]),
+                seed=int(self.cfg.get("ee_command_seed", 0)),
+            )
+        else:
+            raise ValueError(f"Unsupported ee_command_mode: {self.ee_command_mode}")
+
         self.ee_cmd_lb_current = np.zeros(9, dtype=np.float32)
 
         # Runtime state
@@ -810,6 +824,8 @@ class B2WZ1LocoManipController:
         print(f"Arm action scale  : {self.arm_action_scale}")
         print(f"Arm enable delay  : {self.arm_enable_delay_s:.2f}s ({self.arm_enable_delay_steps} steps)")
         print(f"Arm warmup        : {self.arm_policy_warmup_s:.2f}s ({self.arm_policy_warmup_steps} steps)")
+        print(f"EE command mode   : {self.ee_command_mode}")
+        print(f"EE command path   : {self.cfg['ee_command_path']}")
         print("=" * 80)
 
         self.wait_for_low_state()

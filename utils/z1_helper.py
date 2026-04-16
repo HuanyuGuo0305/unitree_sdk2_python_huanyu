@@ -56,6 +56,112 @@ def rotmat_from_rpy_xyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
     return (rz @ ry @ rx).astype(np.float32)
 
 
+class SequentialKeypointsTrajectoryCommandLBSim:
+    """
+    Sequential keypoint trajectory sampler.
+
+    Behavior:
+      1) follow rows in the npy file sequentially
+      2) interpolate between consecutive rows with cubic time scaling
+      3) optionally hold at each waypoint
+      4) loop forever
+
+    Interface is aligned with PresampledKeypointsCubicTrajectoryCommandLBSim:
+      - reset(initial_kps_lb, sample_first=True)
+      - update()
+      - command property
+    """
+
+    def __init__(
+        self,
+        file_path: str,
+        control_dt: float,
+        traj_duration_s: float = 4.0,
+        hold_duration_s: float = 2.0,
+    ):
+        arr = np.load(file_path).astype(np.float32)
+        if arr.ndim != 2 or arr.shape[1] != 9:
+            raise ValueError(f"Expected npy shape (N,9), got {arr.shape} from '{file_path}'.")
+
+        self._table = arr
+        self._num_rows = int(arr.shape[0])
+
+        self._control_dt = float(control_dt)
+        self._traj_duration_s = float(traj_duration_s)
+        self._hold_duration_s = float(hold_duration_s)
+        self._cycle_duration_s = self._traj_duration_s + self._hold_duration_s
+
+        self._steps_per_traj = max(1, int(round(self._traj_duration_s / self._control_dt)))
+        self._steps_per_hold = max(0, int(round(self._hold_duration_s / self._control_dt)))
+
+        self._has_cmd = False
+        self._row_idx = 0
+        self._step_in_phase = 0
+        self._phase = "move"   # "move" or "hold"
+
+        self.keypoints_command_lb = np.zeros(9, dtype=np.float32)
+        self._traj_start_kps_lb = np.zeros(9, dtype=np.float32)
+        self._traj_end_kps_lb = np.zeros(9, dtype=np.float32)
+
+    @property
+    def command(self) -> np.ndarray:
+        return self.keypoints_command_lb.copy()
+
+    @staticmethod
+    def _cubic_time_scaling(tau: float) -> float:
+        tau = float(np.clip(tau, 0.0, 1.0))
+        return 3.0 * tau * tau - 2.0 * tau * tau * tau
+
+    def reset(self, initial_kps_lb: np.ndarray, sample_first: bool = True):
+        initial_kps_lb = np.asarray(initial_kps_lb, dtype=np.float32).reshape(9,)
+
+        self._has_cmd = True
+        self._row_idx = 0
+        self._step_in_phase = 0
+        self._phase = "move"
+
+        self.keypoints_command_lb = initial_kps_lb.copy()
+        self._traj_start_kps_lb = initial_kps_lb.copy()
+
+        if sample_first:
+            self._traj_end_kps_lb = self._table[0].copy()
+        else:
+            self._traj_end_kps_lb = initial_kps_lb.copy()
+
+    def update(self) -> np.ndarray:
+        if not self._has_cmd:
+            raise RuntimeError("Command sampler not initialized. Call reset() first.")
+
+        if self._phase == "move":
+            tau = self._step_in_phase / max(1, self._steps_per_traj)
+            s = self._cubic_time_scaling(tau)
+
+            self.keypoints_command_lb = (
+                (1.0 - s) * self._traj_start_kps_lb + s * self._traj_end_kps_lb
+            ).astype(np.float32)
+
+            self._step_in_phase += 1
+
+            if self._step_in_phase > self._steps_per_traj:
+                self.keypoints_command_lb = self._traj_end_kps_lb.copy()
+                self._phase = "hold"
+                self._step_in_phase = 0
+
+        elif self._phase == "hold":
+            self.keypoints_command_lb = self._traj_end_kps_lb.copy()
+            self._step_in_phase += 1
+
+            if self._step_in_phase >= self._steps_per_hold:
+                self._phase = "move"
+                self._step_in_phase = 0
+
+                self._row_idx = (self._row_idx + 1) % self._num_rows
+                self._traj_start_kps_lb = self._traj_end_kps_lb.copy()
+                self._traj_end_kps_lb = self._table[self._row_idx].copy()
+
+        return self.command
+
+
 class PresampledKeypointsCubicTrajectoryCommandLBSim:
     """
     Single-env NumPy version of the training command generator.

@@ -19,6 +19,7 @@ from utils.math import (
     quat_slerp_wxyz,
     quat_unique_wxyz,
     quat_angle_wxyz,
+    quat_inv_wxyz,
     euler_xyz_from_quat_wxyz,
 )
 
@@ -56,19 +57,36 @@ def rotmat_from_rpy_xyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
     return (rz @ ry @ rx).astype(np.float32)
 
 
-class PresampledKeypointsInterpolateCommandLBSim:
+class PresampledKeypointsCubicTrajectoryCommandLBSim:
+    """
+    Single-env NumPy version of the training command generator.
+
+    Behavior:
+      1) sample raw target from presampled LB table
+      2) apply adjacent target limit using kp0 / rotation thresholds
+      3) generate cubic trajectory from current start pose to accepted target
+      4) hold at target for hold_duration_s
+      5) auto-resample after each cycle
+
+    Command format:
+      [kp0(3), kp1(3), kp2(3)] in LB frame
+    """
+
     def __init__(
         self,
         file_path: str,
+        control_dt: float,
         kp_dx: float = 0.30,
         kp_dz: float = 0.30,
         kp0_threshold: float = 0.20,
         rot_threshold: float = 0.40,
+        traj_duration_s: float = 4.0,
+        hold_duration_s: float = 2.0,
         seed: int = 0,
     ):
         arr = np.load(file_path).astype(np.float32)
         if arr.ndim != 2 or arr.shape[1] != 9:
-            raise ValueError(f"Expected npy shape (N, 9), got {arr.shape} from '{file_path}'.")
+            raise ValueError(f"Expected npy shape (N,9), got {arr.shape} from '{file_path}'.")
 
         self._table = arr
         self._num_rows = int(arr.shape[0])
@@ -78,9 +96,23 @@ class PresampledKeypointsInterpolateCommandLBSim:
         self._kp0_threshold = float(kp0_threshold)
         self._rot_threshold = float(rot_threshold)
 
+        self._traj_duration_s = float(traj_duration_s)
+        self._hold_duration_s = float(hold_duration_s)
+        self._cycle_duration_s = self._traj_duration_s + self._hold_duration_s
+        self._control_dt = float(control_dt)
+
         self._rng = np.random.default_rng(seed)
+
         self.keypoints_command_lb = np.zeros(9, dtype=np.float32)
+
         self._has_cmd = False
+        self._elapsed_s = 0.0
+
+        self._traj_start_pos_lb = np.zeros(3, dtype=np.float32)
+        self._traj_start_quat_lb = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+        self._traj_end_pos_lb = np.zeros(3, dtype=np.float32)
+        self._traj_end_quat_lb = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
     @property
     def command(self) -> np.ndarray:
@@ -104,51 +136,102 @@ class PresampledKeypointsInterpolateCommandLBSim:
         kp2 = kp0 + quat_apply_wxyz(quat, off_z)
         return kp1.astype(np.float32), kp2.astype(np.float32)
 
-    def _compute_next_from_reference(self, ref_kps_lb: np.ndarray, sampled_kps_lb: np.ndarray) -> np.ndarray:
-        kp0_s, kp1_s, kp2_s = self._split_kps(sampled_kps_lb)
-        kp0_r, kp1_r, kp2_r = self._split_kps(ref_kps_lb)
+    @staticmethod
+    def _cubic_time_scaling(tau: float) -> float:
+        tau = float(np.clip(tau, 0.0, 1.0))
+        return 3.0 * tau * tau - 2.0 * tau * tau * tau
 
-        quat_r = quat_from_keypoints_lb(kp0_r, kp1_r, kp2_r, self._dx, self._dz)
-        quat_s = quat_from_keypoints_lb(kp0_s, kp1_s, kp2_s, self._dx, self._dz)
+    def _quat_from_kps(self, kps_9: np.ndarray) -> np.ndarray:
+        kp0, kp1, kp2 = self._split_kps(kps_9)
+        return quat_from_keypoints_lb(kp0, kp1, kp2, self._dx, self._dz).astype(np.float32)
 
-        delta = kp0_s - kp0_r
+    def _apply_adjacent_target_limit(
+        self,
+        kp0_ref: np.ndarray,
+        quat_ref: np.ndarray,
+        kp0_raw: np.ndarray,
+        quat_raw: np.ndarray,
+    ):
+        delta = kp0_raw - kp0_ref
         dist = max(float(np.linalg.norm(delta)), 1e-8)
         alpha_pos = min(self._kp0_threshold / dist, 1.0)
 
-        ang = max(float(quat_angle_wxyz(quat_r, quat_s)), 1e-8)
+        ang = max(float(quat_angle_wxyz(quat_ref, quat_raw)), 1e-8)
         alpha_rot = min(self._rot_threshold / ang, 1.0)
 
         alpha = min(alpha_pos, alpha_rot)
         within = (dist <= self._kp0_threshold) and (ang <= self._rot_threshold)
         alpha_eff = 1.0 if within else alpha
 
-        kp0_new = kp0_r + alpha_eff * delta
-        quat_new = quat_slerp_wxyz(quat_r, quat_s, float(alpha_eff))
-        kp1_new, kp2_new = self._kps_from_pose(kp0_new, quat_new)
+        kp0_new = kp0_ref + alpha_eff * delta
+        quat_new = quat_slerp_wxyz(quat_ref, quat_raw, float(alpha_eff))
+        return kp0_new.astype(np.float32), quat_new.astype(np.float32)
 
-        return self._pack_kps(kp0_new, kp1_new, kp2_new)
+    def _start_new_cycle_from_reference(self, ref_kps_lb: np.ndarray):
+        ref_kps_lb = np.asarray(ref_kps_lb, dtype=np.float32).reshape(9,)
+        kp0_ref, kp1_ref, kp2_ref = self._split_kps(ref_kps_lb)
+        quat_ref = quat_from_keypoints_lb(kp0_ref, kp1_ref, kp2_ref, self._dx, self._dz).astype(np.float32)
+
+        sampled = self._table[self._pick_index()].copy()
+        kp0_raw, kp1_raw, kp2_raw = self._split_kps(sampled)
+        quat_raw = quat_from_keypoints_lb(kp0_raw, kp1_raw, kp2_raw, self._dx, self._dz).astype(np.float32)
+
+        kp0_end, quat_end = self._apply_adjacent_target_limit(
+            kp0_ref=kp0_ref,
+            quat_ref=quat_ref,
+            kp0_raw=kp0_raw,
+            quat_raw=quat_raw,
+        )
+
+        self._traj_start_pos_lb = kp0_ref.astype(np.float32)
+        self._traj_start_quat_lb = quat_ref.astype(np.float32)
+        self._traj_end_pos_lb = kp0_end.astype(np.float32)
+        self._traj_end_quat_lb = quat_end.astype(np.float32)
+
+        kp1_start, kp2_start = self._kps_from_pose(self._traj_start_pos_lb, self._traj_start_quat_lb)
+        self.keypoints_command_lb = self._pack_kps(self._traj_start_pos_lb, kp1_start, kp2_start)
+
+        self._elapsed_s = 0.0
+        self._has_cmd = True
 
     def reset(self, initial_kps_lb: np.ndarray, sample_first: bool = True):
         initial_kps_lb = np.asarray(initial_kps_lb, dtype=np.float32).reshape(9,)
         self.keypoints_command_lb = initial_kps_lb.copy()
-        self._has_cmd = True
+        self._has_cmd = False
+        self._elapsed_s = 0.0
+
+        self._traj_start_pos_lb[:] = 0.0
+        self._traj_start_quat_lb[:] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        self._traj_end_pos_lb[:] = 0.0
+        self._traj_end_quat_lb[:] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
         if sample_first:
-            sampled = self._table[self._pick_index()].copy()
-            self.keypoints_command_lb = self._compute_next_from_reference(
-                ref_kps_lb=initial_kps_lb,
-                sampled_kps_lb=sampled,
-            )
+            self._start_new_cycle_from_reference(initial_kps_lb)
+        else:
+            self._has_cmd = True
 
-    def resample(self):
+    def _eval_current_command(self):
+        t = float(np.clip(self._elapsed_s, 0.0, self._cycle_duration_s))
+        tau = min(t / max(self._traj_duration_s, 1e-6), 1.0)
+        s = self._cubic_time_scaling(tau)
+
+        pos = self._traj_start_pos_lb + s * (self._traj_end_pos_lb - self._traj_start_pos_lb)
+        quat = quat_slerp_wxyz(self._traj_start_quat_lb, self._traj_end_quat_lb, s)
+
+        kp1, kp2 = self._kps_from_pose(pos, quat)
+        self.keypoints_command_lb = self._pack_kps(pos, kp1, kp2)
+
+    def update(self) -> np.ndarray:
         if not self._has_cmd:
             raise RuntimeError("Command sampler not initialized. Call reset() first.")
 
-        sampled = self._table[self._pick_index()].copy()
-        self.keypoints_command_lb = self._compute_next_from_reference(
-            ref_kps_lb=self.keypoints_command_lb,
-            sampled_kps_lb=sampled,
-        )
+        self._eval_current_command()
+
+        self._elapsed_s += self._control_dt
+        if self._elapsed_s >= self._cycle_duration_s:
+            self._start_new_cycle_from_reference(self.keypoints_command_lb.copy())
+
+        return self.command
 
 
 class Z1ArmAdapter:
@@ -160,7 +243,7 @@ class Z1ArmAdapter:
         - lowcmd hold_pose_lowcmd
 
     Runtime:
-        - pure lowcmd PD at 50 Hz
+        - pure lowcmd PD at policy rate
         - no realtime thread
         - no FF torque
     """
@@ -201,7 +284,6 @@ class Z1ArmAdapter:
             dtype=np.float32,
         ).reshape(6,)
 
-        # 运行期纯 PD lowcmd 增益
         self.arm_kps_runtime = np.array(
             cfg.get("arm_kps_runtime", [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]),
             dtype=np.float32,
@@ -212,10 +294,6 @@ class Z1ArmAdapter:
         ).reshape(6,)
 
         self.debug_print = bool(cfg.get("z1_debug_print", False))
-        self.runtime_q_step_clip = np.array(
-            cfg.get("z1_runtime_q_step_clip", [0.08, 0.08, 0.08, 0.08, 0.08, 0.08]),
-            dtype=np.float32,
-        ).reshape(6,)
 
         self.arm = None
         self.arm_model = None
@@ -508,12 +586,7 @@ class Z1ArmAdapter:
     ):
         q_target = np.asarray(q_target, dtype=np.float32).reshape(6,)
 
-        dq = np.clip(
-            q_target - self.prev_q_cmd,
-            -self.runtime_q_step_clip,
-            self.runtime_q_step_clip,
-        )
-        q_target_limited = self.prev_q_cmd + dq
+        q_target_limited = q_target.copy()
 
         kp = self.arm_kps_startup if use_startup_gains else self.arm_kps_runtime
         kd = self.arm_kds_startup if use_startup_gains else self.arm_kds_runtime
@@ -530,7 +603,7 @@ class Z1ArmAdapter:
 
         if self.debug_print and (self._debug_counter % 100 == 0):
             print(
-                "[Z1-PD-50HZ] "
+                "[Z1-PD] "
                 f"q_target={np.round(q_target, 3)} | "
                 f"q_tgt_lim={np.round(q_target_limited, 3)} | "
                 f"q_meas={np.round(self.q, 3)} | "

@@ -1,27 +1,25 @@
 # Paths
-policy_path: "exported_policies/b2wz1_locomanipulation/policy_.onnx"
+policy_path: "exported_policies/b2wz1_locomanipulation/policy_traj.onnx"
 ee_command_path: "utils/reachable_kp0kp1kp2_lb.npy"
 
 z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"
 
 # High-level policy / deployment rate
 control_dt: 0.02
-
-# Z1 runtime command rate: now same as policy rate
 z1_control_dt: 0.02
 
 squat_transition_s: 2.0
 default_transition_s: 2.0
 arm_default_transition_s: 4.0
 
-# Dimensions
-history_length: 3
-obs_dim_per_step: 89
-obs_dim: 267
+# Dimensions: must match training
+history_length: 5
+obs_dim_per_step: 98
+obs_dim: 490
 action_dim: 22
 
 # Base command scaling
-command_scale: [0.8, 0.8, 0.6]
+command_scale: [0.6, 0.6, 0.6]
 command_deadband_lin: 0.2
 command_deadband_ang: 0.2
 
@@ -43,6 +41,8 @@ default_b2w_pos_policy: [
 default_arm_pos: [0.0, 1.48, -1.0, -0.54, 0.0, 0.0]
 default_gripper_pos: 0.0
 
+# Must match training observation default order:
+# leg(12) + arm(6)
 default_joint_pos_policy: [
    0.1, -0.1,  0.1, -0.1,
    0.8,  0.8,  1.0,  1.0,
@@ -79,21 +79,18 @@ kds_pd: [
   10.0, 10.0, 10.0, 10.0
 ]
 
-# Action scales
+# Action scales: match current training
 leg_action_scale: 0.25
-arm_action_scale: [0.06, 0.08, 0.08, 0.06, 0.04, 0.04]
-wheel_action_scale: 5.0
+arm_action_scale: [0.20, 0.20, 0.20, 0.20, 0.20, 0.20]
+wheel_action_scale: 4.0
 
 # Z1 startup PD gains
 arm_kps_startup: [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]
 arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
 
-# Z1 runtime PD gains at 50 Hz
+# Z1 runtime PD gains
 arm_kps_runtime: [3.33, 5.0, 5.0, 3.33, 2.5, 1.66]
 arm_kds_runtime: [400.0, 400.0, 400.0, 400.0, 400.0, 400.0]
-
-# Per-step arm target limiter at 50 Hz
-z1_runtime_q_step_clip: [0.04, 0.04, 0.04, 0.04, 0.04, 0.04]
 
 # Gripper gain
 z1_gripper_kp: 20.0
@@ -109,18 +106,19 @@ arm_base_offset_rpy: [0.0, 0.0, 0.0]
 z1_fk_to_policy_ee_pos: [0.051, 0.0, 0.0]
 z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
 
-# EE command sampler
+# EE command sampler: match training
 ee_kp_dx: 0.30
 ee_kp_dz: 0.30
-ee_kp0_threshold: 0.10
-ee_rot_threshold: 0.25
+ee_kp0_threshold: 0.20
+ee_rot_threshold: 0.40
 ee_command_seed: 0
-ee_resample_interval: 600
+ee_traj_duration_s: 4.0
+ee_hold_duration_s: 2.0
 
 # Debug
 z1_debug_print: true
+debug_obs_enabled: false
+debug_obs_print_max: 5
 
-arm_action_clip: 1.0
-
-arm_enable_delay_s: 3.0
-arm_policy_warmup_s: 5.0
+arm_enable_delay_s: 2.0
+arm_policy_warmup_s: 4.0

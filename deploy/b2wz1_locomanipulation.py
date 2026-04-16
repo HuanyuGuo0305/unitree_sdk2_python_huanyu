@@ -10,7 +10,11 @@ Run from repository root:
 Design goals:
 - Startup: use official-style Z1 lowcmd motion + lowcmd hold.
 - Runtime: pure lowcmd PD for Z1 at policy rate.
-- Observation format should match sim2sim as closely as possible.
+- Observation format matches current training:
+    3 + 3 + 3 + 9 + 9 + 9 + 12 + 6 + 12 + 6 + 4 + 22 = 98
+- History length matches current training: 5
+- EE command sampler matches current training:
+    cubic trajectory + hold, continuous command every control step
 """
 
 import os
@@ -47,7 +51,7 @@ from utils.math import (
     quat_unique_wxyz,
 )
 from utils.z1_helper import (
-    PresampledKeypointsInterpolateCommandLBSim,
+    PresampledKeypointsCubicTrajectoryCommandLBSim,
     Z1ArmAdapter,
     compute_ee_current_kp_lb,
 )
@@ -71,8 +75,8 @@ class B2WZ1LocoManipController:
         self.obs_dim = int(self.cfg["obs_dim"])
         self.action_dim = int(self.cfg["action_dim"])
 
-        assert self.obs_dim_per_step == 89, f"Expected obs_dim_per_step=89, got {self.obs_dim_per_step}"
-        assert self.obs_dim == 267, f"Expected obs_dim=267, got {self.obs_dim}"
+        assert self.obs_dim_per_step == 98, f"Expected obs_dim_per_step=98, got {self.obs_dim_per_step}"
+        assert self.obs_dim == 490, f"Expected obs_dim=490, got {self.obs_dim}"
         assert self.action_dim == 22, f"Expected action_dim=22, got {self.action_dim}"
 
         self.session = None
@@ -101,9 +105,6 @@ class B2WZ1LocoManipController:
         self.leg_action_scale = float(self.cfg["leg_action_scale"])
         self.arm_action_scale = np.array(self.cfg["arm_action_scale"], dtype=np.float32).reshape(6,)
         self.wheel_action_scale = float(self.cfg["wheel_action_scale"])
-
-        # Action clipping
-        self.arm_action_clip = float(self.cfg.get("arm_action_clip", 2.0))
 
         # Arm defaults
         self.default_arm_pos = np.array(self.cfg["default_arm_pos"], dtype=np.float32).reshape(6,)
@@ -189,15 +190,17 @@ class B2WZ1LocoManipController:
         self.ee_kp_dx = float(self.cfg["ee_kp_dx"])
         self.ee_kp_dz = float(self.cfg["ee_kp_dz"])
 
-        self.ee_cmd_sampler = PresampledKeypointsInterpolateCommandLBSim(
+        self.ee_cmd_sampler = PresampledKeypointsCubicTrajectoryCommandLBSim(
             file_path=ee_command_path,
+            control_dt=self.control_dt,
             kp_dx=self.ee_kp_dx,
             kp_dz=self.ee_kp_dz,
             kp0_threshold=float(self.cfg["ee_kp0_threshold"]),
             rot_threshold=float(self.cfg["ee_rot_threshold"]),
+            traj_duration_s=float(self.cfg["ee_traj_duration_s"]),
+            hold_duration_s=float(self.cfg["ee_hold_duration_s"]),
             seed=int(self.cfg.get("ee_command_seed", 0)),
         )
-        self.ee_resample_interval = int(self.cfg["ee_resample_interval"])
         self.ee_cmd_lb_current = np.zeros(9, dtype=np.float32)
 
         # Runtime state
@@ -236,6 +239,7 @@ class B2WZ1LocoManipController:
         self.base_cmd_hist = deque(maxlen=self.history_length)
         self.ee_cmd_hist = deque(maxlen=self.history_length)
         self.ee_cur_hist = deque(maxlen=self.history_length)
+        self.ee_err_hist = deque(maxlen=self.history_length)
         self.joint_pos_leg_hist = deque(maxlen=self.history_length)
         self.joint_pos_arm_hist = deque(maxlen=self.history_length)
         self.joint_vel_leg_hist = deque(maxlen=self.history_length)
@@ -254,8 +258,8 @@ class B2WZ1LocoManipController:
         self.arm_policy_warmup_steps = max(1, int(round(self.arm_policy_warmup_s / self.control_dt)))
 
         # Observation debug in pd-stand mode
-        self.debug_obs_enabled = (self.mode == "pd-stand")
-        self.debug_obs_print_max = 5
+        self.debug_obs_enabled = bool(self.cfg.get("debug_obs_enabled", False))
+        self.debug_obs_print_max = int(self.cfg.get("debug_obs_print_max", 5))
         self.debug_obs_print_count = 0
         self.debug_obs_started = False
 
@@ -330,6 +334,7 @@ class B2WZ1LocoManipController:
 
     def build_obs_step(self, ee_cmd_lb: np.ndarray) -> np.ndarray:
         ee_cur_lb = self.compute_ee_current_kp_lb()
+        ee_err_lb = (ee_cmd_lb - ee_cur_lb).astype(np.float32)
 
         leg_pos = self.b2w_joint_pos[:12].copy()
         wheel_vel = self.b2w_joint_vel[12:16].copy()
@@ -348,17 +353,18 @@ class B2WZ1LocoManipController:
 
         obs = np.concatenate(
             [
-                self.base_ang_vel_b,
-                self.projected_gravity_b,
-                self.base_command,
-                ee_cmd_lb,
-                ee_cur_lb,
-                joint_pos_leg_rel,
-                joint_pos_arm_rel,
-                joint_vel_leg,
-                joint_vel_arm,
-                joint_vel_wheel,
-                self.last_action,
+                self.base_ang_vel_b,      # 3
+                self.projected_gravity_b, # 3
+                self.base_command,        # 3
+                ee_cmd_lb,                # 9
+                ee_cur_lb,                # 9
+                ee_err_lb,                # 9
+                joint_pos_leg_rel,        # 12
+                joint_pos_arm_rel,        # 6
+                joint_vel_leg,            # 12
+                joint_vel_arm,            # 6
+                joint_vel_wheel,          # 4
+                self.last_action,         # 22
             ],
             dtype=np.float32,
         )
@@ -372,6 +378,7 @@ class B2WZ1LocoManipController:
         base_cmd_dbg = obs_step[i:i + 3]; i += 3
         ee_cmd_dbg = obs_step[i:i + 9]; i += 9
         ee_cur_dbg = obs_step[i:i + 9]; i += 9
+        ee_err_dbg = obs_step[i:i + 9]; i += 9
         joint_pos_leg_dbg = obs_step[i:i + 12]; i += 12
         joint_pos_arm_dbg = obs_step[i:i + 6]; i += 6
         joint_vel_leg_dbg = obs_step[i:i + 12]; i += 12
@@ -386,13 +393,13 @@ class B2WZ1LocoManipController:
         print(f"base_command      : {np.round(base_cmd_dbg, 6)}")
         print(f"ee_cmd_lb         : {np.round(ee_cmd_dbg, 6)}")
         print(f"ee_cur_lb         : {np.round(ee_cur_dbg, 6)}")
+        print(f"ee_err_lb         : {np.round(ee_err_dbg, 6)}")
         print(f"joint_pos_leg_rel : {np.round(joint_pos_leg_dbg, 6)}")
         print(f"joint_pos_arm_rel : {np.round(joint_pos_arm_dbg, 6)}")
         print(f"joint_vel_leg     : {np.round(joint_vel_leg_dbg, 6)}")
         print(f"joint_vel_arm     : {np.round(joint_vel_arm_dbg, 6)}")
         print(f"joint_vel_wheel   : {np.round(joint_vel_wheel_dbg, 6)}")
         print(f"last_action       : {np.round(last_action_dbg, 6)}")
-        print(f"obs_step_full     : {np.round(obs_step, 6)}")
         print("=" * 96)
 
     def _init_history(self):
@@ -404,6 +411,7 @@ class B2WZ1LocoManipController:
         obs0_base_cmd = obs0[i:i + 3]; i += 3
         obs0_ee_cmd = obs0[i:i + 9]; i += 9
         obs0_ee_cur = obs0[i:i + 9]; i += 9
+        obs0_ee_err = obs0[i:i + 9]; i += 9
         obs0_joint_pos_leg = obs0[i:i + 12]; i += 12
         obs0_joint_pos_arm = obs0[i:i + 6]; i += 6
         obs0_joint_vel_leg = obs0[i:i + 12]; i += 12
@@ -417,6 +425,7 @@ class B2WZ1LocoManipController:
             self.base_cmd_hist.append(obs0_base_cmd.copy())
             self.ee_cmd_hist.append(obs0_ee_cmd.copy())
             self.ee_cur_hist.append(obs0_ee_cur.copy())
+            self.ee_err_hist.append(obs0_ee_err.copy())
             self.joint_pos_leg_hist.append(obs0_joint_pos_leg.copy())
             self.joint_pos_arm_hist.append(obs0_joint_pos_arm.copy())
             self.joint_vel_leg_hist.append(obs0_joint_vel_leg.copy())
@@ -599,9 +608,7 @@ class B2WZ1LocoManipController:
         if self.mode == "pd-stand":
             self.ee_cmd_lb_current = self.ee_cmd_sampler.command.copy()
         else:
-            if self.policy_tick > 0 and (self.policy_tick % self.ee_resample_interval == 0):
-                self.ee_cmd_sampler.resample()
-            self.ee_cmd_lb_current = self.ee_cmd_sampler.command.copy()
+            self.ee_cmd_lb_current = self.ee_cmd_sampler.update()
 
         # Build current observation step
         obs_step = self.build_obs_step(self.ee_cmd_lb_current)
@@ -619,6 +626,7 @@ class B2WZ1LocoManipController:
         curr_base_cmd = obs_step[i:i + 3]; i += 3
         curr_ee_cmd = obs_step[i:i + 9]; i += 9
         curr_ee_cur = obs_step[i:i + 9]; i += 9
+        curr_ee_err = obs_step[i:i + 9]; i += 9
         curr_joint_pos_leg = obs_step[i:i + 12]; i += 12
         curr_joint_pos_arm = obs_step[i:i + 6]; i += 6
         curr_joint_vel_leg = obs_step[i:i + 12]; i += 12
@@ -631,6 +639,7 @@ class B2WZ1LocoManipController:
         self.base_cmd_hist.append(curr_base_cmd.copy())
         self.ee_cmd_hist.append(curr_ee_cmd.copy())
         self.ee_cur_hist.append(curr_ee_cur.copy())
+        self.ee_err_hist.append(curr_ee_err.copy())
         self.joint_pos_leg_hist.append(curr_joint_pos_leg.copy())
         self.joint_pos_arm_hist.append(curr_joint_pos_arm.copy())
         self.joint_vel_leg_hist.append(curr_joint_vel_leg.copy())
@@ -646,6 +655,7 @@ class B2WZ1LocoManipController:
                 np.array(self.base_cmd_hist).reshape(-1),
                 np.array(self.ee_cmd_hist).reshape(-1),
                 np.array(self.ee_cur_hist).reshape(-1),
+                np.array(self.ee_err_hist).reshape(-1),
                 np.array(self.joint_pos_leg_hist).reshape(-1),
                 np.array(self.joint_pos_arm_hist).reshape(-1),
                 np.array(self.joint_vel_leg_hist).reshape(-1),
@@ -673,12 +683,10 @@ class B2WZ1LocoManipController:
         raw_arm_act = action[self.arm_action_indices].copy()
         raw_wheel_act = action[self.wheel_action_indices].copy()
 
-        # Use raw leg/wheel actions directly, only clip arm action
         leg_act = raw_leg_act
         wheel_act = raw_wheel_act
-        arm_act = np.clip(raw_arm_act, -self.arm_action_clip, self.arm_action_clip)
+        arm_act = raw_arm_act
 
-        # Apply mode logic
         if self.mode == "pd-stand":
             self.leg_target = self.default_leg_pos_policy.copy()
             self.arm_target = self.default_arm_pos.copy()
@@ -700,7 +708,6 @@ class B2WZ1LocoManipController:
             self.leg_target = self.default_leg_pos_policy + self.leg_action_scale * leg_act
             self.wheel_cmd[:] = self.wheel_action_scale * wheel_act
 
-            # Arm: first lock for arm_enable_delay_s, then warmup for arm_policy_warmup_s
             if self.policy_tick < self.arm_enable_delay_steps:
                 self.arm_target = self.default_arm_pos.copy()
                 warmup_alpha = 0.0
@@ -735,7 +742,6 @@ class B2WZ1LocoManipController:
             use_startup_gains=use_startup_gains,
         )
 
-        # Bookkeeping
         self.counter += 1
         self.policy_tick += 1
 
@@ -767,21 +773,21 @@ class B2WZ1LocoManipController:
 
             ee_cur_lb = self.compute_ee_current_kp_lb()
             ee_err_lb = self.ee_cmd_lb_current - ee_cur_lb
+            ee_err_norm = np.linalg.norm(ee_err_lb.reshape(3, 3), axis=1)
             print(
                 "[EE-OBS] "
                 f"ee_cmd={np.round(self.ee_cmd_lb_current, 3)} | "
                 f"ee_cur={np.round(ee_cur_lb, 3)} | "
-                f"ee_err={np.round(ee_err_lb, 3)}"
+                f"ee_err={np.round(ee_err_lb, 3)} | "
+                f"ee_err_norm={np.round(ee_err_norm, 3)}"
             )
 
-            # Debug: arm raw/clipped action vector
             print(
                 "[ARM-ACT] "
                 f"raw={np.round(raw_arm_act, 3)} | "
                 f"clipped={np.round(arm_act, 3)}"
             )
 
-            # Debug: arm tracking error
             arm_q_meas = self.z1.q.copy()
             arm_q_err = self.arm_target - arm_q_meas
             print(
@@ -801,7 +807,7 @@ class B2WZ1LocoManipController:
         print(f"Obs dim per step  : {self.obs_dim_per_step}")
         print(f"Obs stacked dim   : {self.obs_dim}")
         print(f"Action dim        : {self.action_dim}")
-        print(f"Arm action clip   : +/-{self.arm_action_clip}")
+        print(f"Arm action scale  : {self.arm_action_scale}")
         print(f"Arm enable delay  : {self.arm_enable_delay_s:.2f}s ({self.arm_enable_delay_steps} steps)")
         print(f"Arm warmup        : {self.arm_policy_warmup_s:.2f}s ({self.arm_policy_warmup_steps} steps)")
         print("=" * 80)
@@ -855,6 +861,7 @@ class B2WZ1LocoManipController:
         self.base_cmd_hist.clear()
         self.ee_cmd_hist.clear()
         self.ee_cur_hist.clear()
+        self.ee_err_hist.clear()
         self.joint_pos_leg_hist.clear()
         self.joint_pos_arm_hist.clear()
         self.joint_vel_leg_hist.clear()

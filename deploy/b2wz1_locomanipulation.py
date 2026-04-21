@@ -94,17 +94,19 @@ class B2WZ1LocoManipController:
         self.command_deadband_lin = float(self.cfg.get("command_deadband_lin", 0.2))
         self.command_deadband_ang = float(self.cfg.get("command_deadband_ang", 0.2))
 
-        # Current training policy order:
-        # leg:   FR, FL, RR, RL (each grouped by hip/thigh/calf)
-        # wheel: FR, FL, RR, RL
+        # leg:
+        #   FL_hip, FR_hip, RL_hip, RR_hip,
+        #   FL_thigh, FR_thigh, RL_thigh, RR_thigh,
+        #   FL_calf, FR_calf, RL_calf, RR_calf
+        # wheel:
+        #   FL_wheel, FR_wheel, RL_wheel, RR_wheel
         self.policy_leg_joint_names = [
-            "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
-            "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
-            "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
-            "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+            "FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint",
+            "FL_thigh_joint", "FR_thigh_joint", "RL_thigh_joint", "RR_thigh_joint",
+            "FL_calf_joint", "FR_calf_joint", "RL_calf_joint", "RR_calf_joint",
         ]
         self.policy_wheel_joint_names = [
-            "FR_wheel_joint", "FL_wheel_joint", "RR_wheel_joint", "RL_wheel_joint",
+            "FL_wheel_joint", "FR_wheel_joint", "RL_wheel_joint", "RR_wheel_joint",
         ]
         self.arm_joint_names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
 

@@ -119,7 +119,7 @@ z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
 # If this ONNX was exported from training with presampled command, use presampled.
 # Keep sequential only if this specific policy was trained/evaluated with sequential deployment trick.
 ee_command_mode: "presampled"   # "presampled" or "sequential"
-ee_command_path: "utils/demo_sweep_curve.npy"  # "utils/reachable_kp0kp1kp2_lb.npy" or "utils/demo_sweep_curve.npy"
+ee_command_path: "utils/reachable_kp0kp1kp2_lb.npy"  # "utils/reachable_kp0kp1kp2_lb.npy" or "utils/demo_sweep_curve.npy"
 
 # Presampled mode settings: match latest training
 ee_kp_dx: 0.30

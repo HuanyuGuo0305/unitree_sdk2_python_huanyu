@@ -11,7 +11,7 @@ Design goals:
 - Startup: use official-style Z1 lowcmd motion + lowcmd hold.
 - Runtime: pure lowcmd PD for Z1 at policy rate.
 - Observation format matches current training:
-    3 + 3 + 3 + 9 + 9 + 9 + 12 + 6 + 12 + 6 + 4 + 22 = 98
+    3 + 3 + 3 + 9 + 9 + 12 + 6 + 12 + 6 + 4 + 22 = 89
 - History length matches current training: 5
 - EE command sampler matches current training:
     cubic trajectory + hold, continuous command every control step
@@ -76,8 +76,8 @@ class B2WZ1LocoManipController:
         self.obs_dim = int(self.cfg["obs_dim"])
         self.action_dim = int(self.cfg["action_dim"])
 
-        assert self.obs_dim_per_step == 98, f"Expected obs_dim_per_step=98, got {self.obs_dim_per_step}"
-        assert self.obs_dim == 490, f"Expected obs_dim=490, got {self.obs_dim}"
+        assert self.obs_dim_per_step == 89, f"Expected obs_dim_per_step=89, got {self.obs_dim_per_step}"
+        assert self.obs_dim == 445, f"Expected obs_dim=445, got {self.obs_dim}"
         assert self.action_dim == 22, f"Expected action_dim=22, got {self.action_dim}"
 
         self.session = None
@@ -94,7 +94,22 @@ class B2WZ1LocoManipController:
         self.command_deadband_lin = float(self.cfg.get("command_deadband_lin", 0.2))
         self.command_deadband_ang = float(self.cfg.get("command_deadband_ang", 0.2))
 
-        # B2W default poses and gains
+        # Current training policy order:
+        # leg:   FR, FL, RR, RL (each grouped by hip/thigh/calf)
+        # wheel: FR, FL, RR, RL
+        self.policy_leg_joint_names = [
+            "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+            "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+            "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
+            "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+        ]
+        self.policy_wheel_joint_names = [
+            "FR_wheel_joint", "FL_wheel_joint", "RR_wheel_joint", "RL_wheel_joint",
+        ]
+        self.arm_joint_names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+
+        # B2W defaults and gains in policy order:
+        # [leg(12), wheel(4)]
         self.default_b2w_pos_policy = np.array(self.cfg["default_b2w_pos_policy"], dtype=np.float32).reshape(16,)
         self.squat_b2w_pos_policy = np.array(self.cfg["squat_b2w_pos_policy"], dtype=np.float32).reshape(16,)
 
@@ -112,21 +127,15 @@ class B2WZ1LocoManipController:
         self.default_gripper_pos = float(self.cfg["default_gripper_pos"])
 
         # Observation defaults
+        # Current training joint_pos obs order = leg(12) + arm(6)
         self.default_joint_pos_policy = np.array(self.cfg["default_joint_pos_policy"], dtype=np.float32).reshape(18,)
 
-        # Policy joint order
-        self.policy_joint_names = [
-            "FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint",
-            "FL_thigh_joint", "FR_thigh_joint", "RL_thigh_joint", "RR_thigh_joint",
-            "FL_calf_joint", "FR_calf_joint", "RL_calf_joint", "RR_calf_joint",
-            "FL_wheel_joint", "FR_wheel_joint", "RL_wheel_joint", "RR_wheel_joint",
-        ]
+        # Combined policy-side B2W joint order
+        self.policy_joint_names = self.policy_leg_joint_names + self.policy_wheel_joint_names
+        self.leg_joint_names = self.policy_leg_joint_names
+        self.wheel_joint_names = self.policy_wheel_joint_names
 
-        self.leg_joint_names = self.policy_joint_names[:12]
-        self.wheel_joint_names = self.policy_joint_names[12:]
-        self.arm_joint_names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
-
-        # B2W hardware order
+        # B2W hardware order on low_state / low_cmd
         self.hardware_joint_names = [
             "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
             "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
@@ -197,8 +206,8 @@ class B2WZ1LocoManipController:
             self.ee_cmd_sampler = SequentialKeypointsTrajectoryCommandLBSim(
                 file_path=ee_command_path,
                 control_dt=self.control_dt,
-                traj_duration_s=float(self.cfg.get("ee_sequential_traj_duration_s", 4.0)),
-                hold_duration_s=float(self.cfg.get("ee_sequential_hold_duration_s", 2.0)),
+                traj_duration_s=float(self.cfg.get("ee_sequential_traj_duration_s", 2.5)),
+                hold_duration_s=float(self.cfg.get("ee_sequential_hold_duration_s", 1.5)),
             )
         elif self.ee_command_mode == "presampled":
             self.ee_cmd_sampler = PresampledKeypointsCubicTrajectoryCommandLBSim(
@@ -206,10 +215,10 @@ class B2WZ1LocoManipController:
                 control_dt=self.control_dt,
                 kp_dx=self.ee_kp_dx,
                 kp_dz=self.ee_kp_dz,
-                kp0_threshold=float(self.cfg["ee_kp0_threshold"]),
-                rot_threshold=float(self.cfg["ee_rot_threshold"]),
-                traj_duration_s=float(self.cfg["ee_traj_duration_s"]),
-                hold_duration_s=float(self.cfg["ee_hold_duration_s"]),
+                kp0_threshold_range=self.cfg.get("ee_kp0_threshold_range", [0.20, 0.30]),
+                cycle_duration_s=float(self.cfg.get("ee_cycle_duration_s", 6.0)),
+                traj_duration_min_s=float(self.cfg.get("ee_traj_duration_min_s", 4.0)),
+                traj_duration_max_s=float(self.cfg.get("ee_traj_duration_max_s", 5.0)),
                 seed=int(self.cfg.get("ee_command_seed", 0)),
             )
         else:
@@ -237,7 +246,7 @@ class B2WZ1LocoManipController:
         self.gravity_w = np.array([0.0, 0.0, -1.0], dtype=np.float32)
         self.projected_gravity_b = np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
-        # B2W state in policy order
+        # B2W state in policy order: [leg(12), wheel(4)]
         self.b2w_joint_pos = np.zeros(16, dtype=np.float32)
         self.b2w_joint_vel = np.zeros(16, dtype=np.float32)
 
@@ -252,7 +261,6 @@ class B2WZ1LocoManipController:
         self.projected_gravity_hist = deque(maxlen=self.history_length)
         self.base_cmd_hist = deque(maxlen=self.history_length)
         self.ee_cmd_hist = deque(maxlen=self.history_length)
-        self.ee_cur_hist = deque(maxlen=self.history_length)
         self.ee_err_hist = deque(maxlen=self.history_length)
         self.joint_pos_leg_hist = deque(maxlen=self.history_length)
         self.joint_pos_arm_hist = deque(maxlen=self.history_length)
@@ -371,7 +379,6 @@ class B2WZ1LocoManipController:
                 self.projected_gravity_b, # 3
                 self.base_command,        # 3
                 ee_cmd_lb,                # 9
-                ee_cur_lb,                # 9
                 ee_err_lb,                # 9
                 joint_pos_leg_rel,        # 12
                 joint_pos_arm_rel,        # 6
@@ -391,7 +398,6 @@ class B2WZ1LocoManipController:
         projected_gravity = obs_step[i:i + 3]; i += 3
         base_cmd_dbg = obs_step[i:i + 3]; i += 3
         ee_cmd_dbg = obs_step[i:i + 9]; i += 9
-        ee_cur_dbg = obs_step[i:i + 9]; i += 9
         ee_err_dbg = obs_step[i:i + 9]; i += 9
         joint_pos_leg_dbg = obs_step[i:i + 12]; i += 12
         joint_pos_arm_dbg = obs_step[i:i + 6]; i += 6
@@ -406,7 +412,6 @@ class B2WZ1LocoManipController:
         print(f"projected_gravity : {np.round(projected_gravity, 6)}")
         print(f"base_command      : {np.round(base_cmd_dbg, 6)}")
         print(f"ee_cmd_lb         : {np.round(ee_cmd_dbg, 6)}")
-        print(f"ee_cur_lb         : {np.round(ee_cur_dbg, 6)}")
         print(f"ee_err_lb         : {np.round(ee_err_dbg, 6)}")
         print(f"joint_pos_leg_rel : {np.round(joint_pos_leg_dbg, 6)}")
         print(f"joint_pos_arm_rel : {np.round(joint_pos_arm_dbg, 6)}")
@@ -424,7 +429,6 @@ class B2WZ1LocoManipController:
         obs0_projected_gravity = obs0[i:i + 3]; i += 3
         obs0_base_cmd = obs0[i:i + 3]; i += 3
         obs0_ee_cmd = obs0[i:i + 9]; i += 9
-        obs0_ee_cur = obs0[i:i + 9]; i += 9
         obs0_ee_err = obs0[i:i + 9]; i += 9
         obs0_joint_pos_leg = obs0[i:i + 12]; i += 12
         obs0_joint_pos_arm = obs0[i:i + 6]; i += 6
@@ -438,7 +442,6 @@ class B2WZ1LocoManipController:
             self.projected_gravity_hist.append(obs0_projected_gravity.copy())
             self.base_cmd_hist.append(obs0_base_cmd.copy())
             self.ee_cmd_hist.append(obs0_ee_cmd.copy())
-            self.ee_cur_hist.append(obs0_ee_cur.copy())
             self.ee_err_hist.append(obs0_ee_err.copy())
             self.joint_pos_leg_hist.append(obs0_joint_pos_leg.copy())
             self.joint_pos_arm_hist.append(obs0_joint_pos_arm.copy())
@@ -639,7 +642,6 @@ class B2WZ1LocoManipController:
         curr_projected_gravity = obs_step[i:i + 3]; i += 3
         curr_base_cmd = obs_step[i:i + 3]; i += 3
         curr_ee_cmd = obs_step[i:i + 9]; i += 9
-        curr_ee_cur = obs_step[i:i + 9]; i += 9
         curr_ee_err = obs_step[i:i + 9]; i += 9
         curr_joint_pos_leg = obs_step[i:i + 12]; i += 12
         curr_joint_pos_arm = obs_step[i:i + 6]; i += 6
@@ -648,11 +650,12 @@ class B2WZ1LocoManipController:
         curr_joint_vel_wheel = obs_step[i:i + 4]; i += 4
         curr_last_action = obs_step[i:i + 22]; i += 22
 
+        assert i == self.obs_dim_per_step, f"obs parse ended at {i}, expected {self.obs_dim_per_step}"
+
         self.base_ang_vel_hist.append(curr_base_ang_vel.copy())
         self.projected_gravity_hist.append(curr_projected_gravity.copy())
         self.base_cmd_hist.append(curr_base_cmd.copy())
         self.ee_cmd_hist.append(curr_ee_cmd.copy())
-        self.ee_cur_hist.append(curr_ee_cur.copy())
         self.ee_err_hist.append(curr_ee_err.copy())
         self.joint_pos_leg_hist.append(curr_joint_pos_leg.copy())
         self.joint_pos_arm_hist.append(curr_joint_pos_arm.copy())
@@ -668,7 +671,6 @@ class B2WZ1LocoManipController:
                 np.array(self.projected_gravity_hist).reshape(-1),
                 np.array(self.base_cmd_hist).reshape(-1),
                 np.array(self.ee_cmd_hist).reshape(-1),
-                np.array(self.ee_cur_hist).reshape(-1),
                 np.array(self.ee_err_hist).reshape(-1),
                 np.array(self.joint_pos_leg_hist).reshape(-1),
                 np.array(self.joint_pos_arm_hist).reshape(-1),
@@ -760,6 +762,14 @@ class B2WZ1LocoManipController:
         self.policy_tick += 1
 
         if self.counter % 100 == 0:
+            extra_cmd_info = ""
+            if self.ee_command_mode == "presampled":
+                extra_cmd_info = (
+                    f" | kp0_th={self.ee_cmd_sampler.current_kp0_threshold:.3f}"
+                    f" | traj={self.ee_cmd_sampler.current_traj_duration_s:.2f}s"
+                    f" | hold={self.ee_cmd_sampler.current_hold_duration_s:.2f}s"
+                )
+
             if self.mode == "full-policy":
                 if self.policy_tick < self.arm_enable_delay_steps:
                     arm_phase = "lock"
@@ -777,10 +787,11 @@ class B2WZ1LocoManipController:
                 f"mode={self.mode} | "
                 f"cmd={self.base_command} | "
                 f"arm_phase={arm_phase} | "
-                f"warmup_alpha={warmup_alpha_dbg:.2f} | "
+                f"warmup_alpha={warmup_alpha_dbg:.2f}"
+                f"{extra_cmd_info} | "
                 f"leg_act_raw=[{raw_leg_act.min():+.2f},{raw_leg_act.max():+.2f}] | "
                 f"arm_act_raw=[{raw_arm_act.min():+.2f},{raw_arm_act.max():+.2f}] | "
-                f"arm_act_clip=[{arm_act.min():+.2f},{arm_act.max():+.2f}] | "
+                f"arm_act_used=[{arm_act.min():+.2f},{arm_act.max():+.2f}] | "
                 f"wheel_act_raw=[{raw_wheel_act.min():+.2f},{raw_wheel_act.max():+.2f}] | "
                 f"arm_tgt=[{self.arm_target.min():+.2f},{self.arm_target.max():+.2f}]"
             )
@@ -799,7 +810,7 @@ class B2WZ1LocoManipController:
             print(
                 "[ARM-ACT] "
                 f"raw={np.round(raw_arm_act, 3)} | "
-                f"clipped={np.round(arm_act, 3)}"
+                f"used={np.round(arm_act, 3)}"
             )
 
             arm_q_meas = self.z1.q.copy()
@@ -826,6 +837,28 @@ class B2WZ1LocoManipController:
         print(f"Arm warmup        : {self.arm_policy_warmup_s:.2f}s ({self.arm_policy_warmup_steps} steps)")
         print(f"EE command mode   : {self.ee_command_mode}")
         print(f"EE command path   : {self.cfg['ee_command_path']}")
+        if self.ee_command_mode == "presampled":
+            cycle_s = float(self.cfg.get("ee_cycle_duration_s", 6.0))
+            traj_min = float(self.cfg.get("ee_traj_duration_min_s", 4.0))
+            traj_max = float(self.cfg.get("ee_traj_duration_max_s", 5.0))
+            hold_min = cycle_s - traj_max
+            hold_max = cycle_s - traj_min
+            kp0_range = self.cfg.get("ee_kp0_threshold_range", [0.20, 0.30])
+
+            print(f"EE kp0 th range   : {kp0_range}")
+            print(f"EE cycle          : {cycle_s:.2f}s")
+            print(
+                f"EE dist->traj     : "
+                f"[{kp0_range[0]:.2f}, {kp0_range[1]:.2f}] -> "
+                f"[{traj_min:.2f}, {traj_max:.2f}] s"
+            )
+            print(f"EE hold range     : [{hold_min:.2f}, {hold_max:.2f}] s")
+        else:
+            print(
+                f"EE traj/hold      : "
+                f"{self.cfg.get('ee_sequential_traj_duration_s', 2.5):.2f}s / "
+                f"{self.cfg.get('ee_sequential_hold_duration_s', 1.5):.2f}s"
+            )
         print("=" * 80)
 
         self.wait_for_low_state()
@@ -876,7 +909,6 @@ class B2WZ1LocoManipController:
         self.projected_gravity_hist.clear()
         self.base_cmd_hist.clear()
         self.ee_cmd_hist.clear()
-        self.ee_cur_hist.clear()
         self.ee_err_hist.clear()
         self.joint_pos_leg_hist.clear()
         self.joint_pos_arm_hist.clear()

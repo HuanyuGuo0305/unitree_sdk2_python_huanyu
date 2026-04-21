@@ -18,7 +18,6 @@ from utils.math import (
     quat_normalize_wxyz,
     quat_slerp_wxyz,
     quat_unique_wxyz,
-    quat_angle_wxyz,
     euler_xyz_from_quat_wxyz,
 )
 
@@ -66,7 +65,7 @@ class SequentialKeypointsTrajectoryCommandLBSim:
       3) optionally hold at each waypoint
       4) loop forever
 
-    Interface is aligned with PresampledKeypointsCubicTrajectoryCommandLBSim:
+    Interface:
       - reset(initial_kps_lb, sample_first=True)
       - update()
       - command property
@@ -76,8 +75,8 @@ class SequentialKeypointsTrajectoryCommandLBSim:
         self,
         file_path: str,
         control_dt: float,
-        traj_duration_s: float = 4.0,
-        hold_duration_s: float = 2.0,
+        traj_duration_s: float = 2.5,
+        hold_duration_s: float = 1.5,
     ):
         arr = np.load(file_path).astype(np.float32)
         if arr.ndim != 2 or arr.shape[1] != 9:
@@ -97,7 +96,7 @@ class SequentialKeypointsTrajectoryCommandLBSim:
         self._has_cmd = False
         self._row_idx = 0
         self._step_in_phase = 0
-        self._phase = "move"   # "move" or "hold"
+        self._phase = "move"
 
         self.keypoints_command_lb = np.zeros(9, dtype=np.float32)
         self._traj_start_kps_lb = np.zeros(9, dtype=np.float32)
@@ -122,11 +121,7 @@ class SequentialKeypointsTrajectoryCommandLBSim:
 
         self.keypoints_command_lb = initial_kps_lb.copy()
         self._traj_start_kps_lb = initial_kps_lb.copy()
-
-        if sample_first:
-            self._traj_end_kps_lb = self._table[0].copy()
-        else:
-            self._traj_end_kps_lb = initial_kps_lb.copy()
+        self._traj_end_kps_lb = self._table[0].copy() if sample_first else initial_kps_lb.copy()
 
     def update(self) -> np.ndarray:
         if not self._has_cmd:
@@ -142,7 +137,7 @@ class SequentialKeypointsTrajectoryCommandLBSim:
 
             self._step_in_phase += 1
 
-            if self._step_in_phase > self._steps_per_traj:
+            if self._step_in_phase >= self._steps_per_traj:
                 self.keypoints_command_lb = self._traj_end_kps_lb.copy()
                 self._phase = "hold"
                 self._step_in_phase = 0
@@ -154,7 +149,6 @@ class SequentialKeypointsTrajectoryCommandLBSim:
             if self._step_in_phase >= self._steps_per_hold:
                 self._phase = "move"
                 self._step_in_phase = 0
-
                 self._row_idx = (self._row_idx + 1) % self._num_rows
                 self._traj_start_kps_lb = self._traj_end_kps_lb.copy()
                 self._traj_end_kps_lb = self._table[self._row_idx].copy()
@@ -164,17 +158,17 @@ class SequentialKeypointsTrajectoryCommandLBSim:
 
 class PresampledKeypointsCubicTrajectoryCommandLBSim:
     """
-    Single-env NumPy version of the training command generator.
+    Single-env NumPy version aligned with the current training command.
 
     Behavior:
       1) sample raw target from presampled LB table
-      2) apply adjacent target limit using kp0 / rotation thresholds
-      3) generate cubic trajectory from current start pose to accepted target
-      4) hold at target for hold_duration_s
-      5) auto-resample after each cycle
-
-    Command format:
-      [kp0(3), kp1(3), kp2(3)] in LB frame
+      2) sample kp0 threshold each cycle
+      3) apply adjacent target limit
+      4) compute accepted distance
+      5) map accepted distance to traj duration using threshold range bounds
+      6) hold duration = cycle_duration - traj_duration
+      7) cubic interpolation from current reference pose to accepted target
+      8) hold at the target until cycle ends
     """
 
     def __init__(
@@ -183,10 +177,10 @@ class PresampledKeypointsCubicTrajectoryCommandLBSim:
         control_dt: float,
         kp_dx: float = 0.30,
         kp_dz: float = 0.30,
-        kp0_threshold: float = 0.20,
-        rot_threshold: float = 0.40,
-        traj_duration_s: float = 4.0,
-        hold_duration_s: float = 2.0,
+        kp0_threshold_range=(0.20, 0.30),
+        cycle_duration_s: float = 6.0,
+        traj_duration_min_s: float = 4.0,
+        traj_duration_max_s: float = 5.0,
         seed: int = 0,
     ):
         arr = np.load(file_path).astype(np.float32)
@@ -198,20 +192,35 @@ class PresampledKeypointsCubicTrajectoryCommandLBSim:
 
         self._dx = float(kp_dx)
         self._dz = float(kp_dz)
-        self._kp0_threshold = float(kp0_threshold)
-        self._rot_threshold = float(rot_threshold)
 
-        self._traj_duration_s = float(traj_duration_s)
-        self._hold_duration_s = float(hold_duration_s)
-        self._cycle_duration_s = self._traj_duration_s + self._hold_duration_s
+        kp0_threshold_range = np.asarray(kp0_threshold_range, dtype=np.float32).reshape(2,)
+        self._kp0_threshold_min = float(min(kp0_threshold_range[0], kp0_threshold_range[1]))
+        self._kp0_threshold_max = float(max(kp0_threshold_range[0], kp0_threshold_range[1]))
+
+        self._cycle_duration_s = float(cycle_duration_s)
+        self._traj_duration_min_s = float(traj_duration_min_s)
+        self._traj_duration_max_s = float(traj_duration_max_s)
+
+        if self._cycle_duration_s <= 0.0:
+            raise ValueError(f"Invalid cycle_duration_s={self._cycle_duration_s}")
+        if self._traj_duration_min_s <= 0.0 or self._traj_duration_max_s < self._traj_duration_min_s:
+            raise ValueError(
+                f"Invalid traj duration range: ({self._traj_duration_min_s}, {self._traj_duration_max_s})"
+            )
+        if self._traj_duration_max_s > self._cycle_duration_s:
+            raise ValueError(
+                f"traj_duration_max_s {self._traj_duration_max_s} exceeds cycle_duration_s {self._cycle_duration_s}"
+            )
+
         self._control_dt = float(control_dt)
+        self._cycle_steps = max(1, int(round(self._cycle_duration_s / self._control_dt)))
 
         self._rng = np.random.default_rng(seed)
 
         self.keypoints_command_lb = np.zeros(9, dtype=np.float32)
 
         self._has_cmd = False
-        self._elapsed_s = 0.0
+        self._step_in_cycle = 0
 
         self._traj_start_pos_lb = np.zeros(3, dtype=np.float32)
         self._traj_start_quat_lb = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
@@ -219,12 +228,31 @@ class PresampledKeypointsCubicTrajectoryCommandLBSim:
         self._traj_end_pos_lb = np.zeros(3, dtype=np.float32)
         self._traj_end_quat_lb = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
+        self._current_kp0_threshold = self._kp0_threshold_min
+        self._current_traj_duration_s = self._traj_duration_min_s
+        self._current_hold_duration_s = self._cycle_duration_s - self._current_traj_duration_s
+
     @property
     def command(self) -> np.ndarray:
         return self.keypoints_command_lb.copy()
 
+    @property
+    def current_kp0_threshold(self) -> float:
+        return float(self._current_kp0_threshold)
+
+    @property
+    def current_traj_duration_s(self) -> float:
+        return float(self._current_traj_duration_s)
+
+    @property
+    def current_hold_duration_s(self) -> float:
+        return float(self._current_hold_duration_s)
+
     def _pick_index(self) -> int:
         return int(self._rng.integers(0, self._num_rows))
+
+    def _sample_kp0_threshold(self) -> float:
+        return float(self._rng.uniform(self._kp0_threshold_min, self._kp0_threshold_max))
 
     @staticmethod
     def _split_kps(kps_9: np.ndarray):
@@ -246,31 +274,43 @@ class PresampledKeypointsCubicTrajectoryCommandLBSim:
         tau = float(np.clip(tau, 0.0, 1.0))
         return 3.0 * tau * tau - 2.0 * tau * tau * tau
 
-    def _quat_from_kps(self, kps_9: np.ndarray) -> np.ndarray:
-        kp0, kp1, kp2 = self._split_kps(kps_9)
-        return quat_from_keypoints_lb(kp0, kp1, kp2, self._dx, self._dz).astype(np.float32)
-
     def _apply_adjacent_target_limit(
         self,
         kp0_ref: np.ndarray,
         quat_ref: np.ndarray,
         kp0_raw: np.ndarray,
         quat_raw: np.ndarray,
+        kp0_threshold: float,
     ):
         delta = kp0_raw - kp0_ref
         dist = max(float(np.linalg.norm(delta)), 1e-8)
-        alpha_pos = min(self._kp0_threshold / dist, 1.0)
 
-        ang = max(float(quat_angle_wxyz(quat_ref, quat_raw)), 1e-8)
-        alpha_rot = min(self._rot_threshold / ang, 1.0)
-
-        alpha = min(alpha_pos, alpha_rot)
-        within = (dist <= self._kp0_threshold) and (ang <= self._rot_threshold)
-        alpha_eff = 1.0 if within else alpha
+        alpha_pos = min(float(kp0_threshold) / dist, 1.0)
+        alpha_eff = 1.0 if dist <= float(kp0_threshold) else alpha_pos
 
         kp0_new = kp0_ref + alpha_eff * delta
-        quat_new = quat_slerp_wxyz(quat_ref, quat_raw, float(alpha_eff))
+        quat_new = quat_slerp_wxyz(quat_ref, quat_raw, alpha_eff)
+
         return kp0_new.astype(np.float32), quat_new.astype(np.float32)
+
+    def _compute_traj_duration_from_distance(self, start_pos: np.ndarray, end_pos: np.ndarray) -> float:
+        dist_eff = float(np.linalg.norm(end_pos - start_pos))
+
+        dist_min = self._kp0_threshold_min
+        dist_max = self._kp0_threshold_max
+
+        if dist_max <= dist_min + 1e-8:
+            alpha = 0.0
+        else:
+            alpha = (dist_eff - dist_min) / (dist_max - dist_min)
+            alpha = float(np.clip(alpha, 0.0, 1.0))
+
+        traj = self._traj_duration_min_s + alpha * (self._traj_duration_max_s - self._traj_duration_min_s)
+        hold = self._cycle_duration_s - traj
+
+        self._current_traj_duration_s = float(traj)
+        self._current_hold_duration_s = float(hold)
+        return self._current_traj_duration_s
 
     def _start_new_cycle_from_reference(self, ref_kps_lb: np.ndarray):
         ref_kps_lb = np.asarray(ref_kps_lb, dtype=np.float32).reshape(9,)
@@ -281,12 +321,17 @@ class PresampledKeypointsCubicTrajectoryCommandLBSim:
         kp0_raw, kp1_raw, kp2_raw = self._split_kps(sampled)
         quat_raw = quat_from_keypoints_lb(kp0_raw, kp1_raw, kp2_raw, self._dx, self._dz).astype(np.float32)
 
+        self._current_kp0_threshold = self._sample_kp0_threshold()
+
         kp0_end, quat_end = self._apply_adjacent_target_limit(
             kp0_ref=kp0_ref,
             quat_ref=quat_ref,
             kp0_raw=kp0_raw,
             quat_raw=quat_raw,
+            kp0_threshold=self._current_kp0_threshold,
         )
+
+        self._compute_traj_duration_from_distance(kp0_ref, kp0_end)
 
         self._traj_start_pos_lb = kp0_ref.astype(np.float32)
         self._traj_start_quat_lb = quat_ref.astype(np.float32)
@@ -296,19 +341,25 @@ class PresampledKeypointsCubicTrajectoryCommandLBSim:
         kp1_start, kp2_start = self._kps_from_pose(self._traj_start_pos_lb, self._traj_start_quat_lb)
         self.keypoints_command_lb = self._pack_kps(self._traj_start_pos_lb, kp1_start, kp2_start)
 
-        self._elapsed_s = 0.0
+        self._step_in_cycle = 0
         self._has_cmd = True
 
     def reset(self, initial_kps_lb: np.ndarray, sample_first: bool = True):
         initial_kps_lb = np.asarray(initial_kps_lb, dtype=np.float32).reshape(9,)
         self.keypoints_command_lb = initial_kps_lb.copy()
         self._has_cmd = False
-        self._elapsed_s = 0.0
+        self._step_in_cycle = 0
+        self._current_kp0_threshold = self._kp0_threshold_min
+        self._current_traj_duration_s = self._traj_duration_min_s
+        self._current_hold_duration_s = self._cycle_duration_s - self._current_traj_duration_s
 
-        self._traj_start_pos_lb[:] = 0.0
-        self._traj_start_quat_lb[:] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        self._traj_end_pos_lb[:] = 0.0
-        self._traj_end_quat_lb[:] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        kp0_init, kp1_init, kp2_init = self._split_kps(initial_kps_lb)
+        quat_init = quat_from_keypoints_lb(kp0_init, kp1_init, kp2_init, self._dx, self._dz).astype(np.float32)
+
+        self._traj_start_pos_lb = kp0_init.astype(np.float32)
+        self._traj_start_quat_lb = quat_init.astype(np.float32)
+        self._traj_end_pos_lb = kp0_init.astype(np.float32)
+        self._traj_end_quat_lb = quat_init.astype(np.float32)
 
         if sample_first:
             self._start_new_cycle_from_reference(initial_kps_lb)
@@ -316,8 +367,12 @@ class PresampledKeypointsCubicTrajectoryCommandLBSim:
             self._has_cmd = True
 
     def _eval_current_command(self):
-        t = float(np.clip(self._elapsed_s, 0.0, self._cycle_duration_s))
-        tau = min(t / max(self._traj_duration_s, 1e-6), 1.0)
+        if self._step_in_cycle <= 0:
+            tau = 0.0
+        else:
+            t = min(self._step_in_cycle * self._control_dt, self._cycle_duration_s)
+            tau = min(t / max(self._current_traj_duration_s, 1e-6), 1.0)
+
         s = self._cubic_time_scaling(tau)
 
         pos = self._traj_start_pos_lb + s * (self._traj_end_pos_lb - self._traj_start_pos_lb)
@@ -332,8 +387,8 @@ class PresampledKeypointsCubicTrajectoryCommandLBSim:
 
         self._eval_current_command()
 
-        self._elapsed_s += self._control_dt
-        if self._elapsed_s >= self._cycle_duration_s:
+        self._step_in_cycle += 1
+        if self._step_in_cycle >= self._cycle_steps:
             self._start_new_cycle_from_reference(self.keypoints_command_lb.copy())
 
         return self.command
@@ -460,10 +515,7 @@ class Z1ArmAdapter:
         self.tau = np.asarray(self.arm.lowstate.getTau(), dtype=np.float32).reshape(6,)
 
         gripper_q_raw = np.asarray(self.arm.lowstate.getGripperQ(), dtype=np.float32).reshape(-1)
-        if gripper_q_raw.size > 0:
-            self.gripper_q = float(gripper_q_raw[0])
-        else:
-            self.gripper_q = 0.0
+        self.gripper_q = float(gripper_q_raw[0]) if gripper_q_raw.size > 0 else 0.0
 
         self._fsm_state = self.arm.getCurrentState()
 
@@ -690,7 +742,6 @@ class Z1ArmAdapter:
         use_startup_gains: bool = False,
     ):
         q_target = np.asarray(q_target, dtype=np.float32).reshape(6,)
-
         q_target_limited = q_target.copy()
 
         kp = self.arm_kps_startup if use_startup_gains else self.arm_kps_runtime

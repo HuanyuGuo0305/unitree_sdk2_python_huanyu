@@ -1,0 +1,145 @@
+# Paths
+policy_path: "exported_policies/b2wz1_locomanipulation_plb/policy_2.onnx"
+
+z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"
+
+# High-level policy / deployment rate
+control_dt: 0.02
+z1_control_dt: 0.02
+
+squat_transition_s: 2.0
+default_transition_s: 2.0
+arm_default_transition_s: 4.0
+
+# Dimensions: must match training
+history_length: 5
+obs_dim_per_step: 89
+obs_dim: 445
+action_dim: 22
+
+# Base command scaling
+command_scale: [0.6, 0.6, 0.6]
+command_deadband_lin: 0.2
+command_deadband_ang: 0.2
+
+# Policy order:
+# leg =
+#   FL_hip, FR_hip, RL_hip, RR_hip,
+#   FL_thigh, FR_thigh, RL_thigh, RR_thigh,
+#   FL_calf, FR_calf, RL_calf, RR_calf
+# wheel =
+#   FL_wheel, FR_wheel, RL_wheel, RR_wheel
+
+squat_b2w_pos_policy: [
+   0.1,  -0.1,   0.1,  -0.1,
+   1.57,  1.57,  1.57,  1.57,
+  -2.65, -2.65, -2.65, -2.65,
+   0.0,   0.0,   0.0,   0.0
+]
+
+default_b2w_pos_policy: [
+   0.1, -0.1,  0.1, -0.1,
+   0.8,  0.8,  1.0,  1.0,
+  -1.5, -1.5, -1.5, -1.5,
+   0.0,  0.0,  0.0,  0.0
+]
+
+# Arm defaults
+default_arm_pos: [0.0, 1.48, -1.0, -0.54, 0.0, 0.0]
+default_gripper_pos: 0.0
+
+# Observation default order = leg(12) + arm(6)
+default_joint_pos_policy: [
+   0.1, -0.1,  0.1, -0.1,
+   0.8,  0.8,  1.0,  1.0,
+  -1.5, -1.5, -1.5, -1.5,
+   0.0,  1.48, -1.0, -0.54, 0.0, 0.0
+]
+
+# B2W gains in policy order [leg(12), wheel(4)]
+kps_rl: [
+  160.0, 160.0, 160.0, 160.0,
+  160.0, 160.0, 160.0, 160.0,
+  240.0, 240.0, 240.0, 240.0,
+    0.0,   0.0,   0.0,   0.0
+]
+
+kds_rl: [
+   5.0,  5.0,  5.0,  5.0,
+   5.0,  5.0,  5.0,  5.0,
+   8.0,  8.0,  8.0,  8.0,
+  10.0, 10.0, 10.0, 10.0
+]
+
+kps_pd: [
+  500.0, 500.0, 500.0, 500.0,
+  500.0, 500.0, 500.0, 500.0,
+  500.0, 500.0, 500.0, 500.0,
+    0.0,   0.0,   0.0,   0.0
+]
+
+kds_pd: [
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0
+]
+
+# Action scales: match new training
+leg_action_scale: 0.25
+arm_action_scale: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
+wheel_action_scale: 4.0
+
+# Z1 startup PD gains
+arm_kps_startup: [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]
+arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
+
+# Z1 runtime PD gains
+# These are protocol-side gains. Keep aligned with old working sim2real chain.
+arm_kps_runtime: [3.0, 4.8, 4.8, 3.0, 2.4, 2.0]  # [...] * 25.6
+arm_kds_runtime: [234.375, 312.5, 312.5, 234.375, 234.375, 234.375]  # [...] * 0.0128
+
+# Gripper gain
+z1_gripper_kp: 20.0
+z1_gripper_kd: 2000.0
+
+# Z1 SDK / FK
+z1_has_gripper: true
+z1_fk_ee_index: 6
+
+arm_base_offset_pos: [0.1, 0.0, 0.088]
+arm_base_offset_rpy: [0.0, 0.0, 0.0]
+
+z1_fk_to_policy_ee_pos: [0.051, 0.0, 0.0]
+z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
+
+# New EE command: direct sample-and-hold
+ee_command_mode: "direct"
+ee_command_path: "utils/reachable_kp0kp1kp2_plb_v0.npy"
+
+ee_kp_dx: 0.30
+ee_kp_dz: 0.30
+ee_command_seed: 0
+ee_cycle_duration_s: 8.0
+
+# Debug
+z1_debug_print: true
+debug_obs_enabled: false
+debug_obs_print_max: 5
+
+# SELECT protection mode
+# B2W: kp=0, dq=0, tau=0, kd=large
+damping_kd_b2w: 150.0
+damping_kd_wheel: 10.0
+
+# Z1: q_cmd=current q, qd=0, tau=0, kd=large
+damping_kp_z1: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+damping_kd_z1: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
+damping_print_period: 100
+
+# Arm warmup
+arm_enable_delay_s: 2.0
+arm_policy_warmup_s: 4.0
+
+ee_ground_z: 0.0
+base_height: 0.6017

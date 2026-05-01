@@ -826,3 +826,41 @@ def compute_ee_current_kp_lb(
     kp2 = ee_pos_lb + quat_apply_wxyz(ee_quat_lb, off_z)
 
     return np.concatenate([kp0, kp1, kp2]).astype(np.float32)
+
+
+def compute_ee_current_kp_plb(
+    base_quat_wxyz: np.ndarray,
+    base_height: float,
+    ground_z: float,
+    z1_adapter: Z1ArmAdapter,
+    kp_dx: float,
+    kp_dz: float,
+) -> np.ndarray:
+    base_quat_wxyz = quat_unique_wxyz(quat_normalize_wxyz(base_quat_wxyz))
+
+    ee_pos_b, ee_rot_b = z1_adapter.compute_policy_ee_pose_in_base()
+    ee_quat_b = quat_from_rotmat_wxyz(ee_rot_b)
+
+    _, _, yaw = euler_xyz_from_quat_wxyz(base_quat_wxyz)
+    plb_quat_w = quat_from_yaw_wxyz(yaw)
+    plb_quat_w = quat_unique_wxyz(quat_normalize_wxyz(plb_quat_w))
+
+    base_pos_w = np.array([0.0, 0.0, base_height], dtype=np.float32)
+    plb_pos_w = np.array([0.0, 0.0, ground_z], dtype=np.float32)
+
+    ee_pos_w = base_pos_w + quat_apply_wxyz(base_quat_wxyz, ee_pos_b)
+    ee_quat_w = quat_mul_wxyz(base_quat_wxyz, ee_quat_b)
+    ee_quat_w = quat_unique_wxyz(quat_normalize_wxyz(ee_quat_w))
+
+    ee_pos_plb = quat_apply_inverse_wxyz(plb_quat_w, ee_pos_w - plb_pos_w)
+    ee_quat_plb = quat_mul_wxyz(quat_conjugate_wxyz(plb_quat_w), ee_quat_w)
+    ee_quat_plb = quat_unique_wxyz(quat_normalize_wxyz(ee_quat_plb))
+
+    off_x = np.array([kp_dx, 0.0, 0.0], dtype=np.float32)
+    off_z = np.array([0.0, 0.0, kp_dz], dtype=np.float32)
+
+    kp0 = ee_pos_plb
+    kp1 = ee_pos_plb + quat_apply_wxyz(ee_quat_plb, off_x)
+    kp2 = ee_pos_plb + quat_apply_wxyz(ee_quat_plb, off_z)
+
+    return np.concatenate([kp0, kp1, kp2]).astype(np.float32)

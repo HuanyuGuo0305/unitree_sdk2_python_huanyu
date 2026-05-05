@@ -11,6 +11,20 @@ PLB frame:
     origin      = [base_x, base_y, ground_z]
     orientation = yaw-only(base_quat)
 
+This version removes ee_err_plb from actor observation.
+Expected actor obs per step:
+    base_ang_vel_b       3
+    projected_gravity_b  3
+    base_command         3
+    ee_cmd_plb           9
+    joint_pos_leg_rel   12
+    joint_pos_arm_rel    6
+    joint_vel_leg       12
+    joint_vel_arm        6
+    joint_vel_wheel      4
+    last_action         22
+    total               80
+
 Control chain unchanged:
     policy -> q_target -> Z1ArmAdapter -> lowcmd internal PD
 """
@@ -55,12 +69,11 @@ class PresampledKeypointsDirectCommandPLBSim:
     """
     Direct sample-and-hold EE keypoint command in PLB frame.
 
-    Matches PLB training command:
+    Behavior:
       1) randomly sample one row from reachable PLB keypoint table
       2) hold for cycle_duration_s
-      3) no kp0_threshold
-      4) no cubic interpolation
-      5) no adjacent target clipping
+      3) no cubic interpolation
+      4) no adjacent target clipping
     """
 
     def __init__(
@@ -78,6 +91,8 @@ class PresampledKeypointsDirectCommandPLBSim:
         self._num_rows = int(arr.shape[0])
         self._control_dt = float(control_dt)
         self._cycle_duration_s = float(cycle_duration_s)
+        if self._cycle_duration_s <= 0.0:
+            raise ValueError(f"Invalid cycle_duration_s={self._cycle_duration_s}")
         self._cycle_steps = max(1, int(round(self._cycle_duration_s / self._control_dt)))
         self._rng = np.random.default_rng(seed)
 
@@ -140,7 +155,7 @@ class B2WZ1PLBLocoManipController:
         self.obs_dim = int(self.cfg["obs_dim"])
         self.action_dim = int(self.cfg["action_dim"])
 
-        assert self.obs_dim_per_step == 89
+        assert self.obs_dim_per_step == 80, f"Expected obs_dim_per_step=80, got {self.obs_dim_per_step}"
         assert self.obs_dim == self.obs_dim_per_step * self.history_length
         assert self.action_dim == 22
 
@@ -288,7 +303,6 @@ class B2WZ1PLBLocoManipController:
         self.projected_gravity_hist = deque(maxlen=self.history_length)
         self.base_cmd_hist = deque(maxlen=self.history_length)
         self.ee_cmd_hist = deque(maxlen=self.history_length)
-        self.ee_err_hist = deque(maxlen=self.history_length)
         self.joint_pos_leg_hist = deque(maxlen=self.history_length)
         self.joint_pos_arm_hist = deque(maxlen=self.history_length)
         self.joint_vel_leg_hist = deque(maxlen=self.history_length)
@@ -391,9 +405,6 @@ class B2WZ1PLBLocoManipController:
         )
 
     def build_obs_step(self, ee_cmd_plb: np.ndarray) -> np.ndarray:
-        ee_cur_plb = self.compute_ee_current_kp_plb()
-        ee_err_plb = (ee_cmd_plb - ee_cur_plb).astype(np.float32)
-
         leg_pos = self.b2w_joint_pos[:12].copy()
         wheel_vel = self.b2w_joint_vel[12:16].copy()
         arm_pos = self.z1.q.copy()
@@ -411,21 +422,20 @@ class B2WZ1PLBLocoManipController:
 
         obs = np.concatenate(
             [
-                self.base_ang_vel_b,
-                self.projected_gravity_b,
-                self.base_command,
-                ee_cmd_plb,
-                ee_err_plb,
-                joint_pos_leg_rel,
-                joint_pos_arm_rel,
-                joint_vel_leg,
-                joint_vel_arm,
-                joint_vel_wheel,
-                self.last_action,
+                self.base_ang_vel_b,       # 3
+                self.projected_gravity_b,  # 3
+                self.base_command,         # 3
+                ee_cmd_plb,                # 9
+                joint_pos_leg_rel,         # 12
+                joint_pos_arm_rel,         # 6
+                joint_vel_leg,             # 12
+                joint_vel_arm,             # 6
+                joint_vel_wheel,           # 4
+                self.last_action,          # 22
             ],
             dtype=np.float32,
         )
-        assert obs.shape[0] == self.obs_dim_per_step
+        assert obs.shape[0] == self.obs_dim_per_step, f"Obs dim mismatch: {obs.shape[0]} vs {self.obs_dim_per_step}"
         return obs
 
     def print_obs_step_debug(self, obs_step: np.ndarray, tag: str):
@@ -434,7 +444,6 @@ class B2WZ1PLBLocoManipController:
         projected_gravity = obs_step[i:i + 3]; i += 3
         base_cmd_dbg = obs_step[i:i + 3]; i += 3
         ee_cmd_dbg = obs_step[i:i + 9]; i += 9
-        ee_err_dbg = obs_step[i:i + 9]; i += 9
         joint_pos_leg_dbg = obs_step[i:i + 12]; i += 12
         joint_pos_arm_dbg = obs_step[i:i + 6]; i += 6
         joint_vel_leg_dbg = obs_step[i:i + 12]; i += 12
@@ -448,7 +457,6 @@ class B2WZ1PLBLocoManipController:
         print(f"projected_gravity : {np.round(projected_gravity, 6)}")
         print(f"base_command      : {np.round(base_cmd_dbg, 6)}")
         print(f"ee_cmd_plb        : {np.round(ee_cmd_dbg, 6)}")
-        print(f"ee_err_plb        : {np.round(ee_err_dbg, 6)}")
         print(f"joint_pos_leg_rel : {np.round(joint_pos_leg_dbg, 6)}")
         print(f"joint_pos_arm_rel : {np.round(joint_pos_arm_dbg, 6)}")
         print(f"joint_vel_leg     : {np.round(joint_vel_leg_dbg, 6)}")
@@ -465,7 +473,6 @@ class B2WZ1PLBLocoManipController:
         obs0_projected_gravity = obs0[i:i + 3]; i += 3
         obs0_base_cmd = obs0[i:i + 3]; i += 3
         obs0_ee_cmd = obs0[i:i + 9]; i += 9
-        obs0_ee_err = obs0[i:i + 9]; i += 9
         obs0_joint_pos_leg = obs0[i:i + 12]; i += 12
         obs0_joint_pos_arm = obs0[i:i + 6]; i += 6
         obs0_joint_vel_leg = obs0[i:i + 12]; i += 12
@@ -478,7 +485,6 @@ class B2WZ1PLBLocoManipController:
             self.projected_gravity_hist.append(obs0_projected_gravity.copy())
             self.base_cmd_hist.append(obs0_base_cmd.copy())
             self.ee_cmd_hist.append(obs0_ee_cmd.copy())
-            self.ee_err_hist.append(obs0_ee_err.copy())
             self.joint_pos_leg_hist.append(obs0_joint_pos_leg.copy())
             self.joint_pos_arm_hist.append(obs0_joint_pos_arm.copy())
             self.joint_vel_leg_hist.append(obs0_joint_vel_leg.copy())
@@ -696,7 +702,6 @@ class B2WZ1PLBLocoManipController:
         curr_projected_gravity = obs_step[i:i + 3]; i += 3
         curr_base_cmd = obs_step[i:i + 3]; i += 3
         curr_ee_cmd = obs_step[i:i + 9]; i += 9
-        curr_ee_err = obs_step[i:i + 9]; i += 9
         curr_joint_pos_leg = obs_step[i:i + 12]; i += 12
         curr_joint_pos_arm = obs_step[i:i + 6]; i += 6
         curr_joint_vel_leg = obs_step[i:i + 12]; i += 12
@@ -708,7 +713,6 @@ class B2WZ1PLBLocoManipController:
         self.projected_gravity_hist.append(curr_projected_gravity.copy())
         self.base_cmd_hist.append(curr_base_cmd.copy())
         self.ee_cmd_hist.append(curr_ee_cmd.copy())
-        self.ee_err_hist.append(curr_ee_err.copy())
         self.joint_pos_leg_hist.append(curr_joint_pos_leg.copy())
         self.joint_pos_arm_hist.append(curr_joint_pos_arm.copy())
         self.joint_vel_leg_hist.append(curr_joint_vel_leg.copy())
@@ -722,7 +726,6 @@ class B2WZ1PLBLocoManipController:
                 np.array(self.projected_gravity_hist).reshape(-1),
                 np.array(self.base_cmd_hist).reshape(-1),
                 np.array(self.ee_cmd_hist).reshape(-1),
-                np.array(self.ee_err_hist).reshape(-1),
                 np.array(self.joint_pos_leg_hist).reshape(-1),
                 np.array(self.joint_pos_arm_hist).reshape(-1),
                 np.array(self.joint_vel_leg_hist).reshape(-1),
@@ -732,7 +735,7 @@ class B2WZ1PLBLocoManipController:
             ],
             dtype=np.float32,
         )
-        assert obs_stack.shape[0] == self.obs_dim
+        assert obs_stack.shape[0] == self.obs_dim, f"obs_stack dim mismatch: {obs_stack.shape[0]} vs {self.obs_dim}"
 
         if self.mode == "pd-stand":
             action = np.zeros(self.action_dim, dtype=np.float32)
@@ -814,6 +817,10 @@ class B2WZ1PLBLocoManipController:
                 arm_phase = "n/a"
                 warmup_alpha_dbg = 1.0
 
+            leg_q_meas = self.b2w_joint_pos[:12].copy()
+            wheel_dq_meas = self.b2w_joint_vel[12:16].copy()
+            arm_q_meas = self.z1.q.copy()
+
             print(
                 f"[{self.counter:5d}] "
                 f"mode={self.mode} | "
@@ -824,28 +831,9 @@ class B2WZ1PLBLocoManipController:
                 f"cycle_step={self.ee_cmd_sampler.step_in_cycle} | "
                 f"leg_act=[{raw_leg_act.min():+.2f},{raw_leg_act.max():+.2f}] | "
                 f"arm_act=[{raw_arm_act.min():+.2f},{raw_arm_act.max():+.2f}] | "
-                f"wheel_act=[{raw_wheel_act.min():+.2f},{raw_wheel_act.max():+.2f}] | "
-                f"arm_tgt=[{self.arm_target.min():+.2f},{self.arm_target.max():+.2f}]"
+                f"wheel_act=[{raw_wheel_act.min():+.2f},{raw_wheel_act.max():+.2f}]"
             )
 
-            # ===== EE tracking =====
-            ee_cur_plb = self.compute_ee_current_kp_plb()
-            ee_err_plb = self.ee_cmd_plb_current - ee_cur_plb
-            ee_err_norm = np.linalg.norm(ee_err_plb.reshape(3, 3), axis=1)
-
-            print(
-                "[EE-OBS] "
-                f"ee_cmd_plb={np.round(self.ee_cmd_plb_current, 3)} | "
-                f"ee_cur_plb={np.round(ee_cur_plb, 3)} | "
-                f"ee_err_norm={np.round(ee_err_norm, 3)}"
-            )
-
-            # ===== Joint measurements =====
-            leg_q_meas = self.b2w_joint_pos[:12].copy()
-            wheel_dq_meas = self.b2w_joint_vel[12:16].copy()
-            arm_q_meas = self.z1.q.copy()
-
-            # ===== Policy targets =====
             print(
                 "[POLICY-TARGET] "
                 f"leg_q_tgt={np.round(self.leg_target, 3)} | "
@@ -853,7 +841,6 @@ class B2WZ1PLBLocoManipController:
                 f"arm_q_tgt={np.round(self.arm_target, 3)}"
             )
 
-            # ===== Measured joints =====
             print(
                 "[JOINT-MEAS] "
                 f"leg_q={np.round(leg_q_meas, 3)} | "
@@ -861,14 +848,6 @@ class B2WZ1PLBLocoManipController:
                 f"arm_q={np.round(arm_q_meas, 3)}"
             )
 
-            # ===== Tracking error =====
-            print(
-                "[JOINT-ERR] "
-                f"leg_q_err={np.round(self.leg_target - leg_q_meas, 3)} | "
-                f"wheel_dq_err={np.round(self.wheel_cmd - wheel_dq_meas, 3)} | "
-                f"arm_q_err={np.round(self.arm_target - arm_q_meas, 3)}"
-            )
-            
         return True
 
     def setup(self):
@@ -886,6 +865,7 @@ class B2WZ1PLBLocoManipController:
         print(f"Arm warmup        : {self.arm_policy_warmup_s:.2f}s ({self.arm_policy_warmup_steps} steps)")
         print("EE command mode   : direct sample-and-hold")
         print("EE frame          : PLB = yaw-only + projected origin to ground")
+        print("Actor obs         : no ee_err_plb")
         print(f"EE command path   : {self.cfg['ee_command_path']}")
         print(f"EE ground_z       : {self.ee_ground_z:.4f}")
         print(f"Base height       : {self.base_height:.4f}")
@@ -940,7 +920,6 @@ class B2WZ1PLBLocoManipController:
         self.projected_gravity_hist.clear()
         self.base_cmd_hist.clear()
         self.ee_cmd_hist.clear()
-        self.ee_err_hist.clear()
         self.joint_pos_leg_hist.clear()
         self.joint_pos_arm_hist.clear()
         self.joint_vel_leg_hist.clear()

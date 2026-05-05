@@ -1,5 +1,5 @@
 # Paths
-policy_path: "exported_policies/b2wz1_locomanipulation_plb/policy_5.onnx"
+policy_path: "exported_policies/b2wz1_locomanipulation_plb/policy.onnx"
 
 z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"
 
@@ -13,8 +13,8 @@ arm_default_transition_s: 4.0
 
 # Dimensions: must match training
 history_length: 5
-obs_dim_per_step: 89
-obs_dim: 445
+obs_dim_per_step: 80
+obs_dim: 400
 action_dim: 22
 
 # Base command scaling

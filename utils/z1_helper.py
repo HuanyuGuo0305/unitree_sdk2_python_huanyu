@@ -836,17 +836,27 @@ def compute_ee_current_kp_plb(
     kp_dx: float,
     kp_dz: float,
 ) -> np.ndarray:
+    """
+    Match sim2sim PLB exactly:
+
+        PLB origin      = [base_x, base_y, ground_z]
+        PLB orientation = yaw-only(base_quat)
+
+    In sim2real, base_x/base_y cancel because EE is computed relative to base.
+    But base_height must be accurate.
+    """
     base_quat_wxyz = quat_unique_wxyz(quat_normalize_wxyz(base_quat_wxyz))
 
     ee_pos_b, ee_rot_b = z1_adapter.compute_policy_ee_pose_in_base()
     ee_quat_b = quat_from_rotmat_wxyz(ee_rot_b)
+    ee_quat_b = quat_unique_wxyz(quat_normalize_wxyz(ee_quat_b))
 
     _, _, yaw = euler_xyz_from_quat_wxyz(base_quat_wxyz)
     plb_quat_w = quat_from_yaw_wxyz(yaw)
     plb_quat_w = quat_unique_wxyz(quat_normalize_wxyz(plb_quat_w))
 
-    base_pos_w = np.array([0.0, 0.0, base_height], dtype=np.float32)
-    plb_pos_w = np.array([0.0, 0.0, ground_z], dtype=np.float32)
+    base_pos_w = np.array([0.0, 0.0, float(base_height)], dtype=np.float32)
+    plb_pos_w = np.array([0.0, 0.0, float(ground_z)], dtype=np.float32)
 
     ee_pos_w = base_pos_w + quat_apply_wxyz(base_quat_wxyz, ee_pos_b)
     ee_quat_w = quat_mul_wxyz(base_quat_wxyz, ee_quat_b)
@@ -860,7 +870,7 @@ def compute_ee_current_kp_plb(
     off_z = np.array([0.0, 0.0, kp_dz], dtype=np.float32)
 
     kp0 = ee_pos_plb
-    kp1 = ee_pos_plb + quat_apply_wxyz(ee_quat_plb, off_x)
-    kp2 = ee_pos_plb + quat_apply_wxyz(ee_quat_plb, off_z)
+    kp1 = kp0 + quat_apply_wxyz(ee_quat_plb, off_x)
+    kp2 = kp0 + quat_apply_wxyz(ee_quat_plb, off_z)
 
     return np.concatenate([kp0, kp1, kp2]).astype(np.float32)

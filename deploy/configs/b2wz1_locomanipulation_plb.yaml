@@ -1,5 +1,5 @@
 # Paths
-policy_path: "exported_policies/b2wz1_locomanipulation_plb/policy_3.onnx"
+policy_path: "exported_policies/b2wz1_locomanipulation_plb/policy_5.onnx"
 
 z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"
 
@@ -58,15 +58,15 @@ default_joint_pos_policy: [
 
 # B2W gains in policy order [leg(12), wheel(4)]
 kps_rl: [
-  180.0, 180.0, 180.0, 180.0,
-  180.0, 180.0, 180.0, 180.0,
-  280.0, 280.0, 280.0, 280.0,
+  200.0, 200.0, 200.0, 200.0,
+  200.0, 200.0, 200.0, 200.0,
+  300.0, 300.0, 300.0, 300.0,
     0.0,   0.0,   0.0,   0.0
 ]
 
 kds_rl: [
-   7.0,  7.0,  7.0,  7.0,
-   7.0,  7.0,  7.0,  7.0,
+   8.0,  8.0,  8.0,  8.0,
+   8.0,  8.0,  8.0,  8.0,
   12.0, 12.0, 12.0, 12.0,
   10.0, 10.0, 10.0, 10.0
 ]
@@ -96,8 +96,8 @@ arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
 
 # Z1 runtime PD gains
 # These are protocol-side gains. Keep aligned with old working sim2real chain.
-arm_kps_runtime: [3.0, 4.8, 4.8, 3.0, 2.4, 2.0]  # [...] * 25.6
-arm_kds_runtime: [234.375, 312.5, 312.5, 234.375, 234.375, 234.375]  # [...] * 0.0128
+arm_kps_runtime: [3.0, 4.8, 3.0, 3.0, 3.0, 3.0]  # [...] * 25.6
+arm_kds_runtime: [156.25, 234.375, 156.25, 156.25, 156.25, 156.25]  # [...] * 0.0128
 
 # Gripper gain
 z1_gripper_kp: 20.0
@@ -115,7 +115,7 @@ z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
 
 # New EE command: direct sample-and-hold
 ee_command_mode: "direct"
-ee_command_path: "utils/reachable_kp0kp1kp2_plb_v0.npy"
+ee_command_path: "utils/dataset/reachable_kp0kp1kp2_plb_wholebody.npy"
 
 ee_kp_dx: 0.30
 ee_kp_dz: 0.30

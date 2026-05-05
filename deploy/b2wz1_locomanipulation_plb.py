@@ -806,7 +806,10 @@ class B2WZ1PLBLocoManipController:
                 else:
                     arm_phase = "warmup_or_policy"
                     warmup_progress_steps = self.policy_tick - self.arm_enable_delay_steps
-                    warmup_alpha_dbg = min(1.0, float(warmup_progress_steps) / float(self.arm_policy_warmup_steps))
+                    warmup_alpha_dbg = min(
+                        1.0,
+                        float(warmup_progress_steps) / float(self.arm_policy_warmup_steps),
+                    )
             else:
                 arm_phase = "n/a"
                 warmup_alpha_dbg = 1.0
@@ -825,6 +828,7 @@ class B2WZ1PLBLocoManipController:
                 f"arm_tgt=[{self.arm_target.min():+.2f},{self.arm_target.max():+.2f}]"
             )
 
+            # ===== EE tracking =====
             ee_cur_plb = self.compute_ee_current_kp_plb()
             ee_err_plb = self.ee_cmd_plb_current - ee_cur_plb
             ee_err_norm = np.linalg.norm(ee_err_plb.reshape(3, 3), axis=1)
@@ -836,13 +840,35 @@ class B2WZ1PLBLocoManipController:
                 f"ee_err_norm={np.round(ee_err_norm, 3)}"
             )
 
+            # ===== Joint measurements =====
+            leg_q_meas = self.b2w_joint_pos[:12].copy()
+            wheel_dq_meas = self.b2w_joint_vel[12:16].copy()
+            arm_q_meas = self.z1.q.copy()
+
+            # ===== Policy targets =====
             print(
-                "[ARM-TRACK] "
-                f"q_tgt={np.round(self.arm_target, 3)} | "
-                f"q_meas={np.round(self.z1.q, 3)} | "
-                f"q_err={np.round(self.arm_target - self.z1.q, 3)}"
+                "[POLICY-TARGET] "
+                f"leg_q_tgt={np.round(self.leg_target, 3)} | "
+                f"wheel_dq_tgt={np.round(self.wheel_cmd, 3)} | "
+                f"arm_q_tgt={np.round(self.arm_target, 3)}"
             )
 
+            # ===== Measured joints =====
+            print(
+                "[JOINT-MEAS] "
+                f"leg_q={np.round(leg_q_meas, 3)} | "
+                f"wheel_dq={np.round(wheel_dq_meas, 3)} | "
+                f"arm_q={np.round(arm_q_meas, 3)}"
+            )
+
+            # ===== Tracking error =====
+            print(
+                "[JOINT-ERR] "
+                f"leg_q_err={np.round(self.leg_target - leg_q_meas, 3)} | "
+                f"wheel_dq_err={np.round(self.wheel_cmd - wheel_dq_meas, 3)} | "
+                f"arm_q_err={np.round(self.arm_target - arm_q_meas, 3)}"
+            )
+            
         return True
 
     def setup(self):

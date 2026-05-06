@@ -97,7 +97,7 @@ arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
 # Z1 runtime PD gains
 # These are protocol-side gains. Keep aligned with old working sim2real chain.
 arm_kps_runtime: [3.0, 4.8, 3.0, 3.0, 3.0, 3.0]  # [...] * 25.6
-arm_kds_runtime: [156.25, 234.375, 156.25, 156.25, 156.25, 156.25]  # [...] * 0.0128
+arm_kds_runtime: [234.375, 234.375, 156.25, 156.25, 156.25, 156.25]  # [...] * 0.0128
 
 # Gripper gain
 z1_gripper_kp: 20.0

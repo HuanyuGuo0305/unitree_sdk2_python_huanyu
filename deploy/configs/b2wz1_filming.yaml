@@ -1,0 +1,250 @@
+# B2WZ1 filming-demo sim2real replay config.
+# Run:
+#   python3 deploy/b2wz1_filming.py <network_interface> deploy/configs/b2wz1_filming.yaml --mode full-policy
+
+# =============================================================================
+# Paths
+# =============================================================================
+
+policy_path: "exported_policy/b2wz1_plb_loco_manipulation/policy.onnx"
+z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"
+
+# Compatibility only:
+# The inherited base controller constructs this sampler once, then b2wz1_filming.py
+# replaces it with NPZFilmingReplayCommandSampler.
+ee_command_path: "utils/dataset/reachable_kp0kp1kp2_plb_wholebody_v2.npy"
+
+# MuJoCo-recorded replay file.
+# Put your recorded file here:
+#   utils/dataset/filming/b2wz1_filming_forward_tracking.npz
+#
+# Expected keys:
+#   base_cmds / base_commands / base_cmd / base_command: shape (N, 3)
+#   ee_cmds_plb / ee_cmds / ee_commands_plb / ee_commands / ee_cmd_plb / ee_cmd: shape (N, 9)
+# Optional keys:
+#   t / time_s / timestamps / times: shape (N,)
+#   control_dt: scalar
+replay_npz_path: "utils/dataset/filming/b2wz1_filming_forward_tracking.npz"
+
+# Replay first 15 seconds. If the .npz is shorter, replay uses the available rows.
+replay_duration_s: 15.0
+replay_loop: false
+replay_hold_last_when_done: true
+
+# =============================================================================
+# High-level policy / deployment rate
+# =============================================================================
+
+control_dt: 0.02
+z1_control_dt: 0.02
+
+squat_transition_s: 2.0
+default_transition_s: 2.0
+arm_default_transition_s: 4.0
+
+# =============================================================================
+# Dimensions: must match training
+# =============================================================================
+
+history_length: 5
+obs_dim_per_step: 80
+obs_dim: 400
+action_dim: 22
+
+# =============================================================================
+# Joystick command scale
+# Used only after replay finishes or A interrupt enters takeover.
+# =============================================================================
+
+command_scale: [0.6, 0.6, 0.6]
+command_deadband_lin: 0.2
+command_deadband_ang: 0.2
+
+# =============================================================================
+# B2W policy-order joint poses
+#
+# Policy order:
+# leg =
+#   FL_hip, FR_hip, RL_hip, RR_hip,
+#   FL_thigh, FR_thigh, RL_thigh, RR_thigh,
+#   FL_calf, FR_calf, RL_calf, RR_calf
+# wheel =
+#   FL_wheel, FR_wheel, RL_wheel, RR_wheel
+# =============================================================================
+
+squat_b2w_pos_policy: [
+   0.1,  -0.1,   0.1,  -0.1,
+   1.57,  1.57,  1.57,  1.57,
+  -2.65, -2.65, -2.65, -2.65,
+   0.0,   0.0,   0.0,   0.0
+]
+
+default_b2w_pos_policy: [
+   0.1, -0.1,  0.1, -0.1,
+   0.8,  0.8,  1.0,  1.0,
+  -1.5, -1.5, -1.5, -1.5,
+   0.0,  0.0,  0.0,  0.0
+]
+
+# =============================================================================
+# Arm defaults
+# =============================================================================
+
+default_arm_pos: [0.0, 1.48, -1.0, -0.54, 0.0, 0.0]
+default_gripper_pos: 0.0
+
+# Observation default order = leg(12) + arm(6)
+default_joint_pos_policy: [
+   0.1, -0.1,  0.1, -0.1,
+   0.8,  0.8,  1.0,  1.0,
+  -1.5, -1.5, -1.5, -1.5,
+   0.0,  1.48, -1.0, -0.54, 0.0, 0.0
+]
+
+# =============================================================================
+# B2W gains in policy order [leg(12), wheel(4)]
+# =============================================================================
+
+kps_rl: [
+  200.0, 200.0, 200.0, 200.0,
+  200.0, 200.0, 200.0, 200.0,
+  300.0, 300.0, 300.0, 300.0,
+    0.0,   0.0,   0.0,   0.0
+]
+
+kds_rl: [
+   8.0,  8.0,  8.0,  8.0,
+   8.0,  8.0,  8.0,  8.0,
+  12.0, 12.0, 12.0, 12.0,
+  10.0, 10.0, 10.0, 10.0
+]
+
+kps_pd: [
+  500.0, 500.0, 500.0, 500.0,
+  500.0, 500.0, 500.0, 500.0,
+  500.0, 500.0, 500.0, 500.0,
+    0.0,   0.0,   0.0,   0.0
+]
+
+kds_pd: [
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0
+]
+
+# =============================================================================
+# Action scales: must match training
+# =============================================================================
+
+leg_action_scale: 0.25
+arm_action_scale: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
+wheel_action_scale: 4.0
+
+# =============================================================================
+# Z1 startup PD gains
+# Used for startup and for takeover arm return when takeover_use_startup_arm_gains=true.
+# =============================================================================
+
+arm_kps_startup: [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]
+arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
+
+# Z1 runtime PD gains
+arm_kps_runtime: [3.0, 4.8, 3.0, 3.0, 3.0, 3.0]
+arm_kds_runtime: [234.375, 234.375, 156.25, 156.25, 156.25, 156.25]
+
+# Gripper gain
+z1_gripper_kp: 20.0
+z1_gripper_kd: 2000.0
+
+# =============================================================================
+# Z1 SDK / FK
+# =============================================================================
+
+z1_has_gripper: true
+z1_fk_ee_index: 6
+
+arm_base_offset_pos: [0.1, 0.0, 0.088]
+arm_base_offset_rpy: [0.0, 0.0, 0.0]
+
+z1_fk_to_policy_ee_pos: [0.051, 0.0, 0.0]
+z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
+
+# =============================================================================
+# EE keypoint geometry
+# =============================================================================
+
+ee_kp_dx: 0.30
+ee_kp_dz: 0.30
+ee_command_seed: 0
+ee_cycle_duration_s: 8.0
+ee_ground_z: 0.0
+base_height: 0.6017
+
+# =============================================================================
+# Debug
+# =============================================================================
+
+z1_debug_print: true
+debug_obs_enabled: false
+debug_obs_print_max: 5
+
+# =============================================================================
+# SELECT protection mode
+#
+# B2W:
+#   kp=0, dq=0, tau=0, kd=large
+#
+# Z1:
+#   q_cmd=current q, qd=0, tau=0, kd=large
+# =============================================================================
+
+damping_kd_b2w: 150.0
+damping_kd_wheel: 10.0
+
+damping_kp_z1: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+damping_kd_z1: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
+damping_print_period: 100
+
+# =============================================================================
+# Full-policy arm warmup during replay
+# =============================================================================
+
+arm_enable_delay_s: 2.0
+arm_policy_warmup_s: 4.0
+
+# =============================================================================
+# Replay -> joystick takeover safety mode
+#
+# During replay:
+#   - base command comes from replay NPZ
+#   - EE command comes from replay NPZ
+#   - press A to interrupt replay and enter takeover
+#
+# After replay finishes:
+#   - automatically enter takeover
+#
+# During takeover:
+#   - joystick controls base velocity through command_scale/deadband
+#   - policy controls legs and wheels
+#   - arm policy output is ignored
+#   - arm smoothly moves to takeover_arm_target
+#   - SELECT enters high-KD damping protection mode
+# =============================================================================
+
+joystick_takeover_button: "A"
+
+# Prevent the A used to start the main loop from immediately interrupting replay.
+takeover_interrupt_enable_delay_s: 0.8
+
+# Z1 joint zero position.
+takeover_arm_target: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+# Smooth return duration. Larger is safer/slower.
+takeover_arm_transition_s: 4.0
+
+# During takeover, hold EE command at current measured EE keypoints.
+takeover_hold_ee_current: true
+
+# Use startup gains for smooth arm return to zero.
+takeover_use_startup_arm_gains: true

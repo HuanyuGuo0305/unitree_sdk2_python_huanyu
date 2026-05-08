@@ -115,7 +115,7 @@ z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
 
 # New EE command: direct sample-and-hold
 ee_command_mode: "direct"
-ee_command_path: "utils/dataset/reachable_kp0kp1kp2_plb_wholebody.npy"
+ee_command_path: "utils/dataset/reachable_kp0kp1kp2_plb_wholebody_v2.npy"
 
 ee_kp_dx: 0.30
 ee_kp_dz: 0.30

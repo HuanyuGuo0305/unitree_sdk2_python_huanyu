@@ -1,5 +1,5 @@
 # Paths
-policy_path: "exported_policies/b2wz1_locomanipulation_plb/policy.onnx"
+policy_path: "exported_policies/b2wz1_locomanipulation_plb/policy_3.onnx"
 
 z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"
 
@@ -115,7 +115,7 @@ z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
 
 # New EE command: direct sample-and-hold
 ee_command_mode: "direct"
-ee_command_path: "utils/dataset/reachable_kp0kp1kp2_plb_wholebody_v2.npy"
+ee_command_path: "utils/dataset/reachable_kp0kp1kp2_plb_wholebody_pickup.npy"
 
 ee_kp_dx: 0.30
 ee_kp_dz: 0.30

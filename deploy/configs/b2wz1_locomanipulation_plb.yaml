@@ -53,7 +53,7 @@ default_joint_pos_policy: [
    0.1, -0.1,  0.1, -0.1,
    0.8,  0.8,  1.0,  1.0,
   -1.5, -1.5, -1.5, -1.5,
-   0.0,  1.48, -1.0, -0.54, 0.0, 0.0
+   0.0,  1.48, -1.0, -0.54, 0.0, 1.57  # 1,57 if pickup.policy
 ]
 
 # B2W gains in policy order [leg(12), wheel(4)]
@@ -96,8 +96,8 @@ arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
 
 # Z1 runtime PD gains
 # These are protocol-side gains. Keep aligned with old working sim2real chain.
-arm_kps_runtime: [3.0, 4.8, 3.0, 3.0, 3.0, 3.0]  # [...] * 25.6
-arm_kds_runtime: [234.375, 234.375, 156.25, 156.25, 156.25, 156.25]  # [...] * 0.0128
+arm_kps_runtime: [3.0, 4.8, 3.5, 3.0, 3.0, 3.0]  # [...] * 25.6
+arm_kds_runtime: [234.375, 234.375, 234.375, 156.25, 156.25, 156.25]  # [...] * 0.0128
 
 # Gripper gain
 z1_gripper_kp: 20.0
@@ -105,9 +105,9 @@ z1_gripper_kd: 2000.0
 
 # Z1 SDK / FK
 z1_has_gripper: true
-z1_fk_ee_index: 6
+z1_fk_ee_index: 5
 
-arm_base_offset_pos: [0.1, 0.0, 0.088]
+arm_base_offset_pos: [0.19, 0.0, 0.0952]
 arm_base_offset_rpy: [0.0, 0.0, 0.0]
 
 z1_fk_to_policy_ee_pos: [0.051, 0.0, 0.0]
@@ -115,7 +115,7 @@ z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
 
 # New EE command: direct sample-and-hold
 ee_command_mode: "direct"
-ee_command_path: "utils/dataset/reachable_kp0kp1kp2_plb_wholebody_pickup.npy"
+ee_command_path: "utils/dataset/keypoints_plb_pickup.npy"
 
 ee_kp_dx: 0.30
 ee_kp_dz: 0.30

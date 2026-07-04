@@ -45,7 +45,7 @@ default_b2w_pos_policy: [
 ]
 
 # Arm defaults
-default_arm_pos: [0.0, 1.48, -1.0, -0.54, 0.0, 0.0]
+default_arm_pos: [0.0, 1.48, -1.0, -0.54, 0.0, 1.57]
 default_gripper_pos: 0.0
 
 # Observation default order = leg(12) + arm(6)
@@ -137,8 +137,8 @@ damping_kp_z1: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 damping_kd_z1: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
 damping_print_period: 100
 
-# Arm warmup
-arm_enable_delay_s: 2.0
+# Whole-body policy blend-in duration.
+# Applies to leg position actions, wheel velocity actions, and arm position actions.
 arm_policy_warmup_s: 4.0
 
 ee_ground_z: 0.0

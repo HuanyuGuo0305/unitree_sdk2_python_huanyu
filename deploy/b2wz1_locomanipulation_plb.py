@@ -313,9 +313,9 @@ class B2WZ1PLBLocoManipController:
         self.counter = 0
         self.policy_tick = 0
 
-        self.arm_enable_delay_s = float(self.cfg.get("arm_enable_delay_s", 2.0))
-        self.arm_enable_delay_steps = max(1, int(round(self.arm_enable_delay_s / self.control_dt)))
-
+        # Unified policy blend-in for leg, wheel, and arm actions.
+        # No arm enable delay: policy starts immediately, but its action contribution is
+        # smoothly blended from 0 to 1 over arm_policy_warmup_s.
         self.arm_policy_warmup_s = float(self.cfg.get("arm_policy_warmup_s", 4.0))
         self.arm_policy_warmup_steps = max(1, int(round(self.arm_policy_warmup_s / self.control_dt)))
 
@@ -340,6 +340,13 @@ class B2WZ1PLBLocoManipController:
         if os.path.isabs(path_str):
             return path_str
         return os.path.abspath(os.path.join(PROJECT_ROOT, path_str))
+
+    def _policy_blend_alpha(self) -> float:
+        """Return startup blend coefficient for policy action contribution."""
+        if not self.use_policy:
+            return 0.0
+        return min(1.0, float(self.policy_tick) / float(self.arm_policy_warmup_steps))
+
 
     def low_state_handler(self, msg: LowStateGo):
         self.low_state = msg
@@ -748,6 +755,8 @@ class B2WZ1PLBLocoManipController:
         raw_arm_act = action[self.arm_action_indices].copy()
         raw_wheel_act = action[self.wheel_action_indices].copy()
 
+        policy_blend_alpha = self._policy_blend_alpha()
+
         if self.mode == "pd-stand":
             self.leg_target = self.default_leg_pos_policy.copy()
             self.arm_target = self.default_arm_pos.copy()
@@ -755,9 +764,12 @@ class B2WZ1PLBLocoManipController:
             self._write_b2w_pd_stand_cmd()
 
         elif self.mode == "lock-arm-policy":
-            self.leg_target = self.default_leg_pos_policy + self.leg_action_scale * raw_leg_act
+            self.leg_target = (
+                self.default_leg_pos_policy
+                + policy_blend_alpha * self.leg_action_scale * raw_leg_act
+            ).astype(np.float32)
             self.arm_target = self.default_arm_pos.copy()
-            self.wheel_cmd[:] = self.wheel_action_scale * raw_wheel_act
+            self.wheel_cmd[:] = policy_blend_alpha * self.wheel_action_scale * raw_wheel_act
 
             self._write_b2w_rl_cmd(
                 leg_target_policy=self.leg_target,
@@ -765,21 +777,15 @@ class B2WZ1PLBLocoManipController:
             )
 
         elif self.mode == "full-policy":
-            self.leg_target = self.default_leg_pos_policy + self.leg_action_scale * raw_leg_act
-            self.wheel_cmd[:] = self.wheel_action_scale * raw_wheel_act
-
-            if self.policy_tick < self.arm_enable_delay_steps:
-                self.arm_target = self.default_arm_pos.copy()
-                warmup_alpha = 0.0
-            else:
-                arm_target_policy = self.default_arm_pos + self.arm_action_scale * raw_arm_act
-                warmup_progress_steps = self.policy_tick - self.arm_enable_delay_steps
-                warmup_alpha = min(1.0, float(warmup_progress_steps) / float(self.arm_policy_warmup_steps))
-
-                self.arm_target = (
-                    (1.0 - warmup_alpha) * self.default_arm_pos
-                    + warmup_alpha * arm_target_policy
-                ).astype(np.float32)
+            self.leg_target = (
+                self.default_leg_pos_policy
+                + policy_blend_alpha * self.leg_action_scale * raw_leg_act
+            ).astype(np.float32)
+            self.wheel_cmd[:] = policy_blend_alpha * self.wheel_action_scale * raw_wheel_act
+            self.arm_target = (
+                self.default_arm_pos
+                + policy_blend_alpha * self.arm_action_scale * raw_arm_act
+            ).astype(np.float32)
 
             self._write_b2w_rl_cmd(
                 leg_target_policy=self.leg_target,
@@ -803,19 +809,14 @@ class B2WZ1PLBLocoManipController:
 
         if self.counter % 100 == 0:
             if self.mode == "full-policy":
-                if self.policy_tick < self.arm_enable_delay_steps:
-                    arm_phase = "lock"
-                    warmup_alpha_dbg = 0.0
-                else:
-                    arm_phase = "warmup_or_policy"
-                    warmup_progress_steps = self.policy_tick - self.arm_enable_delay_steps
-                    warmup_alpha_dbg = min(
-                        1.0,
-                        float(warmup_progress_steps) / float(self.arm_policy_warmup_steps),
-                    )
+                arm_phase = "blend" if policy_blend_alpha < 1.0 else "policy"
+                warmup_alpha_dbg = policy_blend_alpha
+            elif self.mode == "lock-arm-policy":
+                arm_phase = "locked"
+                warmup_alpha_dbg = policy_blend_alpha
             else:
                 arm_phase = "n/a"
-                warmup_alpha_dbg = 1.0
+                warmup_alpha_dbg = 0.0
 
             leg_q_meas = self.b2w_joint_pos[:12].copy()
             wheel_dq_meas = self.b2w_joint_vel[12:16].copy()
@@ -861,8 +862,7 @@ class B2WZ1PLBLocoManipController:
         print(f"Obs stacked dim   : {self.obs_dim}")
         print(f"Action dim        : {self.action_dim}")
         print(f"Arm action scale  : {self.arm_action_scale}")
-        print(f"Arm enable delay  : {self.arm_enable_delay_s:.2f}s ({self.arm_enable_delay_steps} steps)")
-        print(f"Arm warmup        : {self.arm_policy_warmup_s:.2f}s ({self.arm_policy_warmup_steps} steps)")
+        print(f"Policy blend-in   : {self.arm_policy_warmup_s:.2f}s ({self.arm_policy_warmup_steps} steps)")
         print("EE command mode   : direct sample-and-hold")
         print("EE frame          : PLB = yaw-only + projected origin to ground")
         print("Actor obs         : no ee_err_plb")

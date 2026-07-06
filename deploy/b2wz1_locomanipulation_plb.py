@@ -367,7 +367,7 @@ class B2WZ1PLBLocoManipController:
             return 0.0
         return min(1.0, float(self.policy_tick) / float(self.arm_policy_warmup_steps))
 
-    def _reset_arm_target_rate_limiter(self, target: np.ndarray | None = None):
+    def _reset_arm_target_rate_limiter(self, target=None):
         """Reset previous limited arm target to a known safe target."""
         if target is None:
             target = self.default_arm_pos

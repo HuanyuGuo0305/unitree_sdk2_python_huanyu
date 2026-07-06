@@ -194,6 +194,21 @@ class B2WZ1PLBLocoManipController:
         self.arm_action_scale = np.array(self.cfg["arm_action_scale"], dtype=np.float32).reshape(6,)
         self.wheel_action_scale = float(self.cfg["wheel_action_scale"])
 
+        # Optional deployment-side arm joint-target rate limiter.
+        # This is a post-policy safety filter applied to the final Z1 joint target:
+        #   raw target = default_arm_pos + blend * arm_action_scale * policy_action
+        #   limited target = previous limited target + clip(raw - previous, +/- rate * control_dt)
+        self.enable_arm_target_rate_limit = bool(self.cfg.get("enable_arm_target_rate_limit", False))
+        self.arm_target_rate_limit = np.array(
+            self.cfg.get("arm_target_rate_limit", [np.inf] * 6),
+            dtype=np.float32,
+        ).reshape(6,)
+        if np.any(self.arm_target_rate_limit <= 0.0):
+            raise ValueError(
+                "arm_target_rate_limit must be positive for all 6 arm joints, "
+                f"got {self.arm_target_rate_limit}."
+            )
+
         self.default_arm_pos = np.array(self.cfg["default_arm_pos"], dtype=np.float32).reshape(6,)
         self.default_gripper_pos = float(self.cfg["default_gripper_pos"])
         self.default_joint_pos_policy = np.array(self.cfg["default_joint_pos_policy"], dtype=np.float32).reshape(18,)
@@ -299,6 +314,11 @@ class B2WZ1PLBLocoManipController:
         self.arm_target = self.default_arm_pos.copy()
         self.wheel_cmd = np.zeros(4, dtype=np.float32)
 
+        # State for deployment-side arm target rate limiter.
+        # Keep this initialized to the current/default command to avoid a first-step jump.
+        self._prev_limited_arm_target = self.default_arm_pos.copy()
+        self._arm_target_rate_limiter_initialized = True
+
         self.base_ang_vel_hist = deque(maxlen=self.history_length)
         self.projected_gravity_hist = deque(maxlen=self.history_length)
         self.base_cmd_hist = deque(maxlen=self.history_length)
@@ -346,6 +366,33 @@ class B2WZ1PLBLocoManipController:
         if not self.use_policy:
             return 0.0
         return min(1.0, float(self.policy_tick) / float(self.arm_policy_warmup_steps))
+
+    def _reset_arm_target_rate_limiter(self, target: np.ndarray | None = None):
+        """Reset previous limited arm target to a known safe target."""
+        if target is None:
+            target = self.default_arm_pos
+        self._prev_limited_arm_target = np.asarray(target, dtype=np.float32).reshape(6,).copy()
+        self._arm_target_rate_limiter_initialized = True
+
+    def _apply_arm_target_rate_limit(self, raw_target: np.ndarray) -> np.ndarray:
+        """Apply optional per-joint target rate limit to a raw Z1 joint target."""
+        raw_target = np.asarray(raw_target, dtype=np.float32).reshape(6,)
+
+        if not self.enable_arm_target_rate_limit:
+            self._prev_limited_arm_target = raw_target.copy()
+            self._arm_target_rate_limiter_initialized = True
+            return raw_target.copy()
+
+        if not self._arm_target_rate_limiter_initialized:
+            self._reset_arm_target_rate_limiter(self.default_arm_pos)
+
+        max_delta = self.arm_target_rate_limit * self.control_dt
+        delta = raw_target - self._prev_limited_arm_target
+        delta = np.clip(delta, -max_delta, max_delta).astype(np.float32)
+
+        limited_target = (self._prev_limited_arm_target + delta).astype(np.float32)
+        self._prev_limited_arm_target = limited_target.copy()
+        return limited_target
 
 
     def low_state_handler(self, msg: LowStateGo):
@@ -761,6 +808,7 @@ class B2WZ1PLBLocoManipController:
             self.leg_target = self.default_leg_pos_policy.copy()
             self.arm_target = self.default_arm_pos.copy()
             self.wheel_cmd[:] = 0.0
+            self._reset_arm_target_rate_limiter(self.arm_target)
             self._write_b2w_pd_stand_cmd()
 
         elif self.mode == "lock-arm-policy":
@@ -769,6 +817,7 @@ class B2WZ1PLBLocoManipController:
                 + policy_blend_alpha * self.leg_action_scale * raw_leg_act
             ).astype(np.float32)
             self.arm_target = self.default_arm_pos.copy()
+            self._reset_arm_target_rate_limiter(self.arm_target)
             self.wheel_cmd[:] = policy_blend_alpha * self.wheel_action_scale * raw_wheel_act
 
             self._write_b2w_rl_cmd(
@@ -782,10 +831,12 @@ class B2WZ1PLBLocoManipController:
                 + policy_blend_alpha * self.leg_action_scale * raw_leg_act
             ).astype(np.float32)
             self.wheel_cmd[:] = policy_blend_alpha * self.wheel_action_scale * raw_wheel_act
-            self.arm_target = (
+
+            raw_arm_target = (
                 self.default_arm_pos
                 + policy_blend_alpha * self.arm_action_scale * raw_arm_act
             ).astype(np.float32)
+            self.arm_target = self._apply_arm_target_rate_limit(raw_arm_target)
 
             self._write_b2w_rl_cmd(
                 leg_target_policy=self.leg_target,
@@ -862,6 +913,10 @@ class B2WZ1PLBLocoManipController:
         print(f"Obs stacked dim   : {self.obs_dim}")
         print(f"Action dim        : {self.action_dim}")
         print(f"Arm action scale  : {self.arm_action_scale}")
+        print(f"Arm target limiter: {self.enable_arm_target_rate_limit}")
+        if self.enable_arm_target_rate_limit:
+            print(f"Arm target rate   : {self.arm_target_rate_limit} rad/s")
+            print(f"Arm max step      : {self.arm_target_rate_limit * self.control_dt} rad/control-step")
         print(f"Policy blend-in   : {self.arm_policy_warmup_s:.2f}s ({self.arm_policy_warmup_steps} steps)")
         print("EE command mode   : direct sample-and-hold")
         print("EE frame          : PLB = yaw-only + projected origin to ground")
@@ -914,6 +969,7 @@ class B2WZ1PLBLocoManipController:
         self.last_action[:] = 0.0
         self.leg_target = self.default_leg_pos_policy.copy()
         self.arm_target = self.default_arm_pos.copy()
+        self._reset_arm_target_rate_limiter(self.arm_target)
         self.wheel_cmd[:] = 0.0
 
         self.base_ang_vel_hist.clear()

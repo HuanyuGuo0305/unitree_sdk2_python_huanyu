@@ -1,5 +1,5 @@
 # Paths
-policy_path: "exported_policies/b2wz1_locomanipulation_plb/policy_3.onnx"
+policy_path: "exported_policies/b2wz1_locomanipulation_plb/policy_pickup.onnx"
 
 z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"
 
@@ -53,7 +53,7 @@ default_joint_pos_policy: [
    0.1, -0.1,  0.1, -0.1,
    0.8,  0.8,  1.0,  1.0,
   -1.5, -1.5, -1.5, -1.5,
-   0.0,  1.48, -1.0, -0.54, 0.0, 1.57  # 1,57 if pickup.policy
+   0.0,  1.48, -1.0, -0.54, 0.0, 1.57  # 1.57 if pickup.policy
 ]
 
 # B2W gains in policy order [leg(12), wheel(4)]
@@ -85,10 +85,17 @@ kds_pd: [
   10.0, 10.0, 10.0, 10.0
 ]
 
-# Action scales: match new training
+# Action scales: match training
 leg_action_scale: 0.25
 arm_action_scale: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
 wheel_action_scale: 4.0
+
+# Deployment-side post-policy arm joint-target rate limiter.
+# When enabled, it limits the final Z1 joint position target before sending to the arm:
+#   max_delta_per_step = arm_target_rate_limit * control_dt
+# Example: 0.4 rad/s at control_dt=0.02 -> 0.008 rad/control-step.
+enable_arm_target_rate_limit: true
+arm_target_rate_limit: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
 
 # Z1 startup PD gains
 arm_kps_startup: [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]
@@ -96,8 +103,8 @@ arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
 
 # Z1 runtime PD gains
 # These are protocol-side gains. Keep aligned with old working sim2real chain.
-arm_kps_runtime: [3.0, 4.8, 3.5, 3.0, 3.0, 3.0]  # [...] * 25.6
-arm_kds_runtime: [234.375, 234.375, 234.375, 156.25, 156.25, 156.25]  # [...] * 0.0128
+arm_kps_runtime: [3.0, 3.5, 3.5, 3.0, 3.0, 3.0]  # [...] * 25.6
+arm_kds_runtime: [312.5, 312.5, 312.5, 312.5, 312.5, 312.5]  # [...] * 0.0128
 
 # Gripper gain
 z1_gripper_kp: 20.0
@@ -107,7 +114,7 @@ z1_gripper_kd: 2000.0
 z1_has_gripper: true
 z1_fk_ee_index: 5
 
-arm_base_offset_pos: [0.19, 0.0, 0.0952]
+arm_base_offset_pos: [0.19, 0.0, 0.1027]
 arm_base_offset_rpy: [0.0, 0.0, 0.0]
 
 z1_fk_to_policy_ee_pos: [0.051, 0.0, 0.0]

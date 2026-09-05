@@ -1,0 +1,135 @@
+# B2W mocap -> root frame calibration.
+#
+# Run from the repository root:
+#
+#   python3 deploy/b2w_mocap_root_calibration.py \
+#       deploy/configs/b2w_mocap_root_calibration.yaml
+#
+# What it solves
+# --------------
+# Motive streams a rigid body whose pivot sits near, but not at, the B2W's
+# base_link frame. This tool finds the constant transform between them:
+#
+#   p_root_world = p_mocap_world + R(q_mocap_world) @ mocap_root_offset_pos
+#   q_root_world = q_mocap_world (x) mocap_root_offset_quat_wxyz
+#
+# Because the offset is expressed in the MOCAP RIGID-BODY frame it is a fixed
+# mechanical attachment: valid for every pose the robot ever reaches.
+#
+# Before starting
+# ---------------
+# - Motive: Streaming pane ON with "Rigid Bodies" checked. Enabling "Markers"
+#   as well is optional but makes calibration much easier -- the raw marker
+#   cloud is what you align x/y against. (As observed, this server streams
+#   rigid bodies only, so no markers will be drawn until Markers is enabled.)
+# - Robot: powered, standing on FLAT ground with all four wheels down, and
+#   publishing LowState on robot_net_interface.
+# - The floor MuJoCo draws sits at ground_z in the MOCAP world frame. If the
+#   mocap origin was set on the floor this is 0.0.
+
+# ======================================================================
+# MuJoCo scene
+# ======================================================================
+
+mujoco_xml_path: "/home/huanyuguo/Workspace_huanyu/unitree_mujoco_huanyu/unitree_robots/b2w/b2w.xml"
+
+# Height of the physical floor in the mocap world frame. Both the rendered
+# ground plane and the automatic z solver ('b' / 'v') use it.
+ground_z: 0.0
+floor_half_extent: 4.0
+
+render_hz: 30.0
+status_hz: 10.0
+
+triad_axis_len_m: 0.25
+triad_axis_radius_m: 0.008
+marker_radius_m: 0.012
+
+# ======================================================================
+# Mocap (OptiTrack Motive 3.3 / NatNet 4.1)
+# ======================================================================
+
+# NIC on this PC that faces the mocap network. Multicast membership is joined
+# on this interface, so it must be the mocap-side address, not the robot one.
+mocap_local_ip: "192.168.0.17"
+
+# Motive host. Confirmed on this network as 192.168.0.118 (Motive 3.3.4.1,
+# NatNet 4.2.0.0, streaming at 60 Hz). null falls back to discovering it with
+# a subnet-broadcast ping.
+#
+# This address matters: Motive on this setup streams in UNICAST mode, sending
+# frame data back to whichever port sent the connect ping, so without a
+# reachable server there is no data at all.
+mocap_server_ip: "192.168.0.118"
+
+# Also join the multicast group, in case Motive is switched to Multicast mode.
+# The client listens on the multicast group AND its own command socket, so it
+# works in either mode without being told which.
+mocap_join_multicast: true
+mocap_multicast_group: "239.255.42.99"
+mocap_data_port: 1511
+mocap_command_port: 1510
+
+# "auto" asks Motive for its Streaming > Up Axis setting, which this server
+# reports as Z-up. Getting this wrong silently rotates the world 90 degrees
+# and there is nothing in the wire data to catch it, so leave it on "auto"
+# unless the server stops answering the query. x/y/z force a value.
+mocap_up_axis: "auto"
+
+# Streaming id of the B2W rigid body. Motive currently streams one rigid body,
+# id 9, named "B2". The tool prints every id it sees at startup, so if this is
+# wrong the correct one is one line away. --rigid-body-id overrides it.
+mocap_rigid_body_id: 9
+
+# Optional: resolve the id from the asset name instead, which survives someone
+# renumbering the asset in Motive. Falls back to the id above if the server
+# does not answer the model-definition request.
+mocap_rigid_body_name: "B2"
+
+# Marker set drawn highlighted (cyan). Defaults to mocap_rigid_body_name.
+mocap_marker_set_name: null
+
+# Poses older than this are treated as lost; the last good pose stays on
+# screen and the status line reports MOCAP:LOST.
+mocap_max_age_s: 0.5
+mocap_timeout_s: 10.0
+
+# ======================================================================
+# Robot telemetry
+# ======================================================================
+
+robot_net_interface: "enxa0cec819e15f"
+dds_timeout_s: 10.0
+
+# Joint pose rendered before the first LowState arrives, or under --no-dds.
+# Policy order: leg hip(4), thigh(4), calf(4), then wheel(4).
+fallback_joint_pos_policy: [
+   0.1, -0.1,  0.1, -0.1,
+   0.8,  0.8,  1.0,  1.0,
+  -1.5, -1.5, -1.5, -1.5,
+   0.0,  0.0,  0.0,  0.0
+]
+
+# ======================================================================
+# Starting offset and edit steps
+# ======================================================================
+#
+# Seed with a rough guess if you have one (e.g. the marker cluster sits about
+# 12 cm above the base plate) -- it only changes where the search starts.
+# 'r' returns to these values at any time.
+
+offset_pos: [0.0, 0.0, 0.0]
+offset_rpy: [0.0, 0.0, 0.0]   # radians, R = Rz(yaw) Ry(pitch) Rx(roll)
+
+initial_pos_step_m: 0.01
+initial_rot_step_deg: 1.0
+
+# Minimum straight-line travel before the 'y' yaw solver trusts a drive.
+yaw_solve_min_distance_m: 0.5
+
+# ======================================================================
+# Output
+# ======================================================================
+#
+# Enter saves here (any existing file is copied to <path>.bak first).
+output_path: "deploy/configs/b2w_mocap_root_offset.yaml"

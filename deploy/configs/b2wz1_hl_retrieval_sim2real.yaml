@@ -1,0 +1,521 @@
+# B2WZ1 hierarchical retrieval sim2real.
+#
+# Run from the unitree_sdk2_python_huanyu repository root:
+#
+#   python3 deploy/b2wz1_hl_retrieval_sim2real.py \
+#       enxa0cec819e15f \
+#       deploy/configs/b2wz1_hl_retrieval_sim2real.yaml
+#
+# Developer PC must already run:
+#
+#   python3 ~/b2w_vision/rear_vo_udp_server.py \
+#       --crl-host 192.168.123.222
+#
+# Policy alignment:
+# - low/high ONNX are the SAME policies used by the validated hierarchical sim2sim.
+# - LL: 50 Hz, 80-D/frame, 5-frame feature-major history => 400-D.
+# - HL: 10 Hz, 56-D/frame, 3-frame feature-major history => 168-D.
+# - no startup policy blend-in.
+# - no arm-target rate limiter.
+# - runtime gripper mode is "dcmotor":
+#       training-space IdealPD + exact IsaacLab DCMotor torque-speed law.
+# - DCMotor torque is sent directly through tau_f.
+# - there is NO post-DCMotor deployment-only torque cap.
+# - HL gripper observation and grasp proxy use TRAINING coordinates:
+#       q_train = q_sdk - z1_gripper_q_offset
+#       close   = 0
+#       open    = -pi/2
+# - grasp_proxy_mode can use the original heuristic or a testing mode where
+#   the first CLOSE/grasp command immediately latches proxy=true.
+
+# ======================================================================
+# Policies
+# ======================================================================
+low_policy_path: "exported_policies/b2wz1_object_retrieval/low_policy.onnx"
+high_policy_path: "exported_policies/b2wz1_object_retrieval/high_policy.onnx"
+
+# ======================================================================
+# Control hierarchy
+# ======================================================================
+control_dt: 0.02
+z1_control_dt: 0.02
+
+# 50 Hz / 5 = 10 Hz.
+ll_steps_per_hl_step: 5
+
+ll_history_length: 5
+ll_obs_dim_per_step: 80
+ll_obs_dim: 400
+ll_action_dim: 22
+
+hl_history_length: 3
+hl_obs_dim_per_step: 56
+hl_obs_dim: 168
+hl_action_dim: 9
+
+# ======================================================================
+# Startup transitions
+# These are validated hardware startup motions, not policy-action filters.
+# Startup uses the legacy Z1 position-servo API only to safely move/hold the
+# physical gripper before hierarchical control begins. The script converts the
+# training-space OPEN target to raw SDK coordinates using z1_gripper_q_offset.
+# Runtime hierarchical control then switches to external DCMotor torque control.
+# ======================================================================
+squat_transition_s: 2.0
+default_transition_s: 2.0
+arm_default_transition_s: 4.0
+
+# ======================================================================
+# B2W joint order used by policy
+#
+# leg:
+#   FL_hip, FR_hip, RL_hip, RR_hip,
+#   FL_thigh, FR_thigh, RL_thigh, RR_thigh,
+#   FL_calf, FR_calf, RL_calf, RR_calf
+#
+# wheel:
+#   FL_wheel, FR_wheel, RL_wheel, RR_wheel
+# ======================================================================
+
+squat_b2w_pos_policy: [
+   0.1,  -0.1,   0.1,  -0.1,
+   1.57,  1.57,  1.57,  1.57,
+  -2.65, -2.65, -2.65, -2.65,
+   0.0,   0.0,   0.0,   0.0
+]
+
+default_b2w_pos_policy: [
+   0.1, -0.1,  0.1, -0.1,
+   0.8,  0.8,  1.0,  1.0,
+  -1.5, -1.5, -1.5, -1.5,
+   0.0,  0.0,  0.0,  0.0
+]
+
+# Observation joint-position reference:
+# policy leg(12) + arm(6).
+default_joint_pos_policy: [
+   0.1, -0.1,  0.1, -0.1,
+   0.8,  0.8,  1.0,  1.0,
+  -1.5, -1.5, -1.5, -1.5,
+   0.0,  1.48, -1.0, -0.54, 0.0, 1.57
+]
+
+default_arm_pos: [0.0, 1.48, -1.0, -0.54, 0.0, 1.57]
+
+# Training observation reference for jointGripper.
+default_gripper_pos: 0.0
+
+# IMPORTANT: these are TRAINING-space targets, not raw SDK positions.
+# q_train = q_sdk - z1_gripper_q_offset
+# close = 0
+# open  = -pi/2
+gripper_open_pos: -1.5707963267948966
+gripper_close_pos: 0.0
+
+# ======================================================================
+# B2W gains in POLICY order [leg12, wheel4]
+# ======================================================================
+
+kps_rl: [
+  200.0, 200.0, 200.0, 200.0,
+  200.0, 200.0, 200.0, 200.0,
+  300.0, 300.0, 300.0, 300.0,
+    0.0,   0.0,   0.0,   0.0
+]
+
+kds_rl: [
+   8.0,  8.0,  8.0,  8.0,
+   8.0,  8.0,  8.0,  8.0,
+  12.0, 12.0, 12.0, 12.0,
+  10.0, 10.0, 10.0, 10.0
+]
+
+kps_pd: [
+  500.0, 500.0, 500.0, 500.0,
+  500.0, 500.0, 500.0, 500.0,
+  500.0, 500.0, 500.0, 500.0,
+    0.0,   0.0,   0.0,   0.0
+]
+
+kds_pd: [
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0
+]
+
+# ======================================================================
+# Frozen low-level action scales
+# action = [leg12 | arm6 | wheel4]
+# ======================================================================
+leg_action_scale: 0.25
+arm_action_scale: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
+wheel_action_scale: 4.0
+
+# ======================================================================
+# High-level action decode
+#
+# action[0:3] -> normalized base command
+# action[3:6] -> current EE kp0 delta
+# action[6]   -> current EE yaw delta
+# action[7]   -> current EE pitch delta
+# action[8]   -> binary gripper
+# ======================================================================
+
+base_cmd_scale: [0.5, 0.5, 0.5]
+
+kp0_delta_scale: [0.15, 0.15, 0.15]
+kp0_x_range: [0.40, 0.90]
+kp0_y_range: [-0.30, 0.30]
+kp0_z_range: [0.0, 1.15]
+
+ee_yaw_delta_scale: 0.174532925199433
+ee_pitch_delta_scale: 0.174532925199433
+
+ee_yaw_range: [-1.0471975511965976, 1.0471975511965976]
+ee_pitch_range: [-1.2217304763960306, 0.0]
+
+neutral_kp0: [0.55, 0.0, 1.12]
+neutral_ee_yaw: 0.0
+neutral_ee_pitch: -0.06
+fixed_ee_roll: 1.5707963267948966
+
+ee_kp_dx: 0.30
+ee_kp_dz: 0.30
+
+ground_z: 0.0
+
+# ======================================================================
+# VO-derived physical Base height
+# ======================================================================
+#
+# Correct sim2sim uses the CURRENT root height relative to the ground.
+# Therefore 0.6017 is NOT a permanent runtime height on the real robot.
+#
+# Startup semantics:
+#   B2W reaches DEFAULT
+#   -> object/retrieval current-valid
+#   -> user presses A
+#   -> current VO pose is anchored to vo_base_height_anchor_m
+#   -> LL/HL histories are initialized
+#
+# Runtime:
+#   h(t) = h_anchor + up_V^T (p_V(t) - p_V(anchor))
+#
+# where up_V is built from the B2 IMU gravity at the anchor.  During a
+# VO session/epoch reset, the last physical height is preserved and the
+# new VO frame is re-anchored with current IMU gravity.
+#
+# Stale/invalid VO height freezes the last valid height; it does NOT fall
+# back to 0.6017.  No extra deployment LPF is applied.
+vo_base_height_enabled: true
+vo_base_height_anchor_m: 0.6017
+
+# ======================================================================
+# Gripper + Stage-2 grasp proxy
+# ======================================================================
+
+# Strict training threshold:
+# action > 0 -> close
+# action <= 0 -> open
+gripper_binary_threshold: 0.0
+
+stage2_force_gripper_close_enabled: true
+
+# Grasp proxy deployment mode:
+#
+#   "heuristic"
+#       Deployable Stage-2 proxy:
+#         CLOSE commanded
+#         AND gripper is not fully closed
+#         AND gripper angle is holding
+#       with enter/exit hysteresis.
+#
+#       The object <-> gripper-center distance gate has been REMOVED, so this
+#       mode no longer depends on object perception. The distance is still
+#       computed and printed as grasp_err for diagnostics only.
+#
+#   "command_assumed"
+#       NEW testing mode:
+#       the FIRST executed CLOSE/grasp command immediately sets
+#           grasp_confidence_proxy = true
+#       and the proxy remains latched true until controller reset/restart.
+#       Object-distance and gripper-stall confirmation are not required.
+#
+# This generated YAML selects the new mode.
+grasp_proxy_mode: "heuristic"
+
+# Training-defined gripper center relative to gripperStator / policy EE frame.
+gripper_center_offset_local: [0.075, 0.0, 0.01]
+
+# grasp_proxy_error_threshold was removed together with the object-distance
+# gate; the heuristic proxy no longer reads it.
+
+# IMPORTANT: both angle thresholds below are in TRAINING gripper coordinates.
+gripper_not_fully_closed_angle_threshold: -0.08726646259971647
+gripper_angle_hold_threshold: 0.05235987755982989
+
+grasp_proxy_enter_steps: 3
+grasp_proxy_exit_steps: 3
+
+# Deployment semantics:
+# once grasp proxy is true, object_center_pos_base = gripper_center_pos_base.
+#
+# heuristic:
+#   object visual/VO is no longer required until the proxy exits.
+#
+# command_assumed:
+#   proxy stays latched after the first CLOSE/grasp command, therefore object
+#   visual/VO is no longer required for the rest of this controller run.
+
+# ======================================================================
+# Z1 SDK / FK
+# ======================================================================
+
+z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"
+
+z1_has_gripper: true
+z1_fk_ee_index: 5
+
+arm_base_offset_pos: [0.19, 0.0, 0.1027]
+arm_base_offset_rpy: [0.0, 0.0, 0.0]
+
+z1_fk_to_policy_ee_pos: [0.051, 0.0, 0.0]
+z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
+
+# Z1 startup PD gains.
+arm_kps_startup: [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]
+arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
+
+# Z1 runtime arm PD gains.
+arm_kps_runtime: [3.0, 3.5, 3.5, 3.0, 3.0, 3.0]
+arm_kds_runtime: [312.5, 312.5, 312.5, 312.5, 312.5, 312.5]
+
+# Legacy internal gripper position-PD gains.
+# These are used only during startup/hold paths. During hierarchical runtime,
+# track_target_pd_gripper_dcmotor_once() immediately calls setGripperZeroGain()
+# and drives the gripper with external tau_f instead.
+z1_gripper_kp: 20.0
+z1_gripper_kd: 2000.0
+
+# ----------------------------------------------------------------------
+# Real-robot Z1 runtime actuator modes
+# ----------------------------------------------------------------------
+#
+# GRIPPER: always "dcmotor". Not selectable.
+#   Internal gripper gains are zeroed via setGripperZeroGain() and the exact
+#   training/sim2sim IdealPD + IsaacLab DCMotor torque-speed law is sent
+#   through tau_f, using the z1_gripper_dcmotor_* constants below. There is no
+#   post-DCMotor deployment torque cap. The legacy position servo does not
+#   reproduce the trained grasp dynamics and is used only by startup/hold.
+z1_gripper_runtime_mode: "dcmotor"
+
+# ARM: selectable.
+#
+# "position_pd"  (default, safer):
+#   The Z1 firmware closes the arm position loop with arm_kps_runtime /
+#   arm_kds_runtime; tau_f = 0. This is the validated hardware arm path.
+#
+# "dcmotor"  (training-exact):
+#   Firmware arm gains are forced to ZERO and the arm is driven purely by
+#   external torque:
+#       tau = z1_arm_dcmotor_kp * (q_target - q) - z1_arm_dcmotor_kd * qd
+#       tau = clip(tau, -z1_arm_dcmotor_effort_limit, +...)
+#   This reproduces IsaacLab/sim2sim apply_low_level_actuation() exactly.
+#
+#   NOTE: training models the 6 arm joints as IdealPD + symmetric effort clip.
+#   Unlike jointGripper there is NO torque-speed envelope on the arm, so none
+#   is applied.
+#
+#   WARNING: with zero firmware position gains the arm is held up ONLY by the
+#   commanded torque. If the 50-Hz command stream stalls, the arm goes limp.
+#   Startup prints a [Z1-MODE][WARN] banner in this mode.
+#
+#   Startup/hold motions (move_to_pose_official, hold_pose_lowcmd, the squat
+#   recovery) always use the firmware position loop regardless of this key.
+z1_arm_runtime_mode: "position_pd"
+
+# Training arm actuator constants (IsaacLab / sim2sim), used only when
+# z1_arm_runtime_mode == "dcmotor". These are verified against training at
+# startup and must not be changed without retraining.
+z1_arm_dcmotor_kp: [76.8, 89.6, 89.6, 76.8, 76.8, 76.8]
+z1_arm_dcmotor_kd: [4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
+z1_arm_dcmotor_effort_limit: [30.0, 60.0, 30.0, 30.0, 30.0, 30.0]
+
+# ----------------------------------------------------------------------
+# External gripper actuator: EXACT training/sim2sim law
+#
+# Training-space coordinate:
+#     q_train = q_sdk - z1_gripper_q_offset
+#
+# IdealPD:
+#     tau_pd = Kp * (q_target_train - q_train) - Kd * qd
+#
+# Then exact IsaacLab DCMotor four-quadrant torque-speed clipping.
+# velocity_limit is the DCMotor torque-speed parameter, NOT a hard qd clamp.
+# ----------------------------------------------------------------------
+
+# Measured/calibrated SDK zero shift. With the robot powered on in the validated
+# fully-closed reference configuration:
+#   raw close is approximately +0.023 rad
+#   raw open  is approximately -1.548 rad
+# and subtracting this offset maps them to ~0 and ~-pi/2.
+z1_gripper_q_offset: 0.02367
+
+z1_gripper_dcmotor_kp: 76.8
+z1_gripper_dcmotor_kd: 4.0
+z1_gripper_dcmotor_effort_limit: 30.0
+z1_gripper_dcmotor_saturation_effort: 30.0
+z1_gripper_dcmotor_velocity_limit: 2.0
+
+# IMPORTANT:
+# The new z1_helper.py applies NO torque clipping after the IsaacLab DCMotor
+# envelope. tau_send == tau_dcmotor.
+#
+# Therefore do NOT add z1_gripper_real_tau_cap to this YAML.
+
+z1_debug_print: true
+
+# ======================================================================
+# Unified perception integration
+# ======================================================================
+
+developer_host: "192.168.123.164"
+perception_data_port: 50020
+perception_sync_port: 50021
+
+tag_id: 0
+tag_size_m: 0.195
+
+# Physical retrieval target in Tag frame.
+retrieval_target_tag: [0.0, 0.0, 1.0]
+
+tag_visual_max_age_s: 0.20
+object_max_age_ms: 300.0
+retrieval_max_age_ms: 250.0
+# Also used as the freshness threshold for VO-derived Base height.
+vo_max_age_ms: 250.0
+
+# Runtime behavior:
+# invalid perception -> safe hold (HL suspended, LL still 50 Hz)
+# continuous invalidity >= this duration -> damping protection.
+perception_fault_timeout_s: 0.50
+perception_status_print_s: 1.0
+
+# ======================================================================
+# High-damping protection mode
+# ======================================================================
+#
+# Entered automatically on:
+#   - SELECT pressed
+#   - the Z1 arm FSM dropping to PASSIVE (e.g. a physical Z1 fault/E-stop)
+
+damping_kd_b2w: 150.0
+damping_kd_wheel: 10.0
+
+damping_kp_z1: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+damping_kd_z1: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
+damping_print_period: 100
+
+# ----------------------------------------------------------------------
+# Manual LEG recovery while already in protection mode
+# ----------------------------------------------------------------------
+#
+# Safety semantics:
+#   - NEVER starts automatically when Z1 enters PASSIVE.
+#   - if A was already held when protection begins, it must be RELEASED first.
+#   - a fresh A press is explicit operator approval to move the LEGS.
+#   - recovery never resumes the hierarchical policy; after recovery the
+#     controller returns to the same high-damping protection loop.
+#
+# Recovery motion:
+#   B2W leg12 current measured q -> damping_recover_leg_target (SQUAT pose).
+#
+# The Z1 arm is NOT part of this recovery:
+#   - setFsmLowcmd() is never called, so a PASSIVE arm stays PASSIVE
+#   - the arm/gripper keep receiving the same protection command as the
+#     steady damping loop, so they simply stay where they are
+#
+# Wheel absolute angle is NOT servoed: wheel Kp remains 0 and the wheels stay
+# zero-velocity/damped.
+damping_leg_recovery_enabled: true
+damping_recover_leg_duration_s: 4.0
+
+# Measured-q verification before the recovery can be declared successful.
+damping_recover_leg_tolerance_rad: 0.15
+
+# Leg-only recovery target in POLICY leg order (12):
+#   FL_hip, FR_hip, RL_hip, RR_hip,
+#   FL_thigh, FR_thigh, RL_thigh, RR_thigh,
+#   FL_calf, FR_calf, RL_calf, RR_calf
+#
+# This is the SQUAT pose: identical to the leg block of squat_b2w_pos_policy,
+# so A in protection folds the robot down onto the same pose the startup
+# sequence squats through. Omitting this key gives the same squat target.
+damping_recover_leg_target: [
+   0.1,  -0.1,   0.1,  -0.1,
+   1.57,  1.57,  1.57,  1.57,
+  -2.65, -2.65, -2.65, -2.65
+]
+
+# ======================================================================
+# Diagnostics
+# ======================================================================
+
+# 50 steps = 1 second at 50 Hz.
+debug_print_period_steps: 50
+
+debug_hl_obs_enabled: true
+debug_ll_obs_enabled: true
+debug_obs_print_max: 5
+
+# ======================================================================
+# MuJoCo debug visualizer
+# ======================================================================
+#
+# Opens a passive MuJoCo GUI (background thread) that renders the live
+# B2W/Z1 kinematic pose plus debug markers, driven entirely by real
+# telemetry (forward kinematics only, no physics stepping):
+#
+#   green  sphere : detected object position       (obs["object"])
+#   magenta sphere: detected retrieval-target pos   (obs["retrieval"])
+#   red sphere+axes: decoded HL end-effector command (kp0 + local X/Z)
+#   yellow/green sphere: training-defined gripper center
+#                         (green once grasp_confidence_proxy is true)
+#
+# The control thread only ever pushes plain state under a short lock; all
+# MuJoCo/rendering calls run on the visualizer's own thread, so it cannot
+# affect the 50-Hz control loop's timing.
+#
+# NOTE: this points at the robot-only b2wz1.xml (not b2wz1_retrieval.xml).
+# b2wz1_retrieval.xml's "home" keyframe was never updated after the
+# retrieval_cube freejoint was added (keyframe qpos length 30 vs the
+# model's actual nq=37), so MuJoCo refuses to even load it standalone.
+# The visualizer does not need the cube body anyway -- object/retrieval/EE
+# markers are drawn directly from perception + HL-command telemetry -- so
+# b2wz1.xml avoids the bug entirely.
+#
+# b2wz1.xml is a robot-only model with no light and no floor, so the
+# visualizer injects both into the compiled model: a headlight + directional
+# light (visualizer_show_light) and a checkered ground plane at ground_z
+# (visualizer_show_floor). Injection failure falls back to the plain robot
+# model with a warning, so it can never stop the viewer from opening.
+visualizer_enabled: true
+visualizer_xml_path: "/home/huanyuguo/Workspace_huanyu/unitree_mujoco_huanyu/unitree_robots/b2wz1/b2wz1.xml"
+visualizer_update_hz: 30.0
+
+visualizer_object_marker_radius: 0.03
+visualizer_retrieval_marker_radius: 0.05
+visualizer_ee_target_sphere_radius: 0.03
+visualizer_ee_target_axis_len: 0.20
+visualizer_ee_target_axis_radius: 0.01
+
+visualizer_show_gripper_center: true
+visualizer_gripper_center_marker_radius: 0.018
+
+# Ground plane injected at ground_z. half_extent <= 0 gives an infinite plane.
+visualizer_show_floor: true
+visualizer_floor_half_extent: 3.0
+
+# Headlight + directional light injected into the model.
+visualizer_show_light: true

@@ -1,0 +1,85 @@
+# Rear D435i IR1 extrinsic calibration
+#
+# Transform convention:
+#
+#   T_A_FROM_B maps coordinates from frame B to frame A
+#
+#   p_A = R_A_B @ p_B + t_A_B
+#
+# Rear RealSense:
+#   Intel RealSense D435i
+#   serial: 233622073347
+#
+# Canonical rear VO camera frame:
+#   C_RSR_IR1 = Rear D435i IR1 optical frame
+
+camera:
+  name: rear_d435i_ir1
+  serial: "233622073347"
+
+frames:
+  base: Base
+  b2_rear_optical: C_B2R
+  rear_ir1_optical: C_RSR_IR1
+
+
+# ------------------------------------------------------------------
+# Direct ChArUco calibration result
+#
+# p_C_B2R =
+#     R_C_B2R_C_RSR_IR1 @ p_C_RSR_IR1
+#     + t_C_B2R_C_RSR_IR1
+#
+# T_C_B2R_FROM_C_RSR_IR1
+# ------------------------------------------------------------------
+
+T_C_B2R_FROM_C_RSR_IR1:
+  - [ 0.998893985, -0.011851002,  0.045501217, -0.017455620]
+  - [ 0.012642721,  0.999772963, -0.017151780, -0.121233653]
+  - [-0.045287621,  0.017708069,  0.998817028, -0.003463633]
+  - [ 0.0,          0.0,          0.0,          1.0         ]
+
+
+# ------------------------------------------------------------------
+# Runtime transform used by Rear D435i VO
+#
+# Constructed from:
+#
+#   T_BASE_FROM_C_RSR_IR1 =
+#       T_BASE_FROM_C_B2R
+#       @ T_C_B2R_FROM_C_RSR_IR1
+#
+# where T_BASE_FROM_C_B2R comes from the B2W URDF:
+#
+#   xyz = [-0.39143, 0.0, -0.026131]
+#   rpy = [-1.5708, 0.0, +1.5708]
+#
+# p_Base =
+#     R_BASE_C_RSR_IR1 @ p_C_RSR_IR1
+#     + t_BASE_C_RSR_IR1
+# ------------------------------------------------------------------
+
+T_BASE_FROM_C_RSR_IR1:
+  - [ 0.045283998296, -0.017704353097, -0.998817258124, -0.387966748198]
+  - [ 0.998894151344, -0.011851067032,  0.045497548140, -0.017455607279]
+  - [-0.012642554649, -0.999773028039,  0.017148111140,  0.095102665722]
+  - [ 0.0,             0.0,             0.0,             1.0           ]
+
+
+calibration_quality:
+  paired_poses: 30
+  usable_poses: 30
+  final_inliers: 29
+  final_outliers: 1
+
+  b2_intrinsic_rms_px: 0.182852
+  stereo_rms_px: 0.182731
+  median_cross_reprojection_rmse_px: 0.2339
+  median_translation_spread_mm: 3.903
+  median_rotation_spread_deg: 0.319
+
+notes:
+  - "Calibration accepted and frozen."
+  - "Rear VO canonical optical frame is D435i IR1."
+  - "Use T_BASE_FROM_C_RSR_IR1 for robot runtime geometry."
+  - "Keep calibration_result.json as the full solver diagnostic record."

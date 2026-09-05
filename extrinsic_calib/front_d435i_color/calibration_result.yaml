@@ -1,0 +1,1034 @@
+schema_version: 1
+transform_convention:
+  notation: T_A_FROM_B
+  meaning: maps coordinates from frame B to frame A
+  equation: p_A = R_A_FROM_B @ p_B + t_A_FROM_B
+frames:
+  base: Base
+  b2_front_optical: C_B2F
+  front_d435i_color_optical: C_RSF_COLOR
+charuco_board:
+  dictionary: DICT_4X4_50
+  squares_x: 7
+  squares_y: 5
+  square_length_m: 0.04
+  marker_length_m: 0.03
+  max_charuco_corners: 24
+front_d435i_color:
+  serial: '233522076316'
+  image_width: 848
+  image_height: 480
+  K:
+  - - 608.167724609375
+    - 0.0
+    - 416.6564025878906
+  - - 0.0
+    - 608.2047119140625
+    - 253.10433959960938
+  - - 0.0
+    - 0.0
+    - 1.0
+  D:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+b2_front_rgb:
+  image_width: 1920
+  image_height: 1080
+  K:
+  - - 722.48999675
+    - 0.0
+    - 954.61641613
+  - - 0.0
+    - 720.65884236
+    - 544.58259268
+  - - 0.0
+    - 0.0
+    - 1.0
+  D:
+  - 0.01388045
+  - -0.06327465
+  - 0.00097771
+  - 0.00019967
+  - 0.01539046
+  intrinsics_source: extrinsic_calib/front_rgb/front_intrinsics.npz
+dataset:
+  d435i_dir: /home/huanyuguo/front_d435i_extrinsic/front_color
+  b2_dir: /home/huanyuguo/front_d435i_extrinsic/b2_front
+  paired_poses: 26
+  usable_poses: 26
+  unusable_poses: []
+robust_rejection:
+  basis: initial symmetric cross-camera reprojection RMSE
+  median_px: 0.7272531248377099
+  mad_px: 0.0900077433243055
+  threshold_px: 1.127589565595556
+  formula: threshold = median + 3 * 1.4826 * MAD
+  final_inliers:
+  - pose_000.png
+  - pose_002.png
+  - pose_003.png
+  - pose_004.png
+  - pose_005.png
+  - pose_006.png
+  - pose_007.png
+  - pose_008.png
+  - pose_009.png
+  - pose_010.png
+  - pose_011.png
+  - pose_012.png
+  - pose_013.png
+  - pose_015.png
+  - pose_016.png
+  - pose_017.png
+  - pose_019.png
+  - pose_020.png
+  - pose_021.png
+  - pose_022.png
+  - pose_023.png
+  - pose_024.png
+  - pose_025.png
+  final_outliers:
+  - pose_001.png
+  - pose_014.png
+  - pose_018.png
+initial_solution:
+  stereo_rms_px: 0.41352017986225864
+  T_C_B2F_FROM_C_RSF_COLOR:
+  - - 0.9998155452574113
+    - -0.01920436033247115
+    - 0.0002607793046646052
+    - -0.027738249011359427
+  - - 0.017093601064295742
+    - 0.895952130243797
+    - 0.4438215735115373
+    - -0.07519459887913592
+  - - -0.008756955194577642
+    - -0.4437352508600402
+    - 0.8961151392984594
+    - 0.02877697378386824
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+final_solution:
+  stereo_rms_px: 0.3745995477849043
+  median_cross_reprojection_rmse_px: 0.684595870850799
+  median_translation_spread_mm: 13.131226400656358
+  median_rotation_spread_deg: 1.1779701880551334
+  initial_to_final_translation_delta_mm: 0.727078579659113
+  initial_to_final_rotation_delta_deg: 0.014269701975535315
+  T_C_B2F_FROM_C_RSF_COLOR:
+  - - 0.9998133072660398
+    - -0.01932176803599627
+    - 0.00014104505186377393
+    - -0.027696670801173263
+  - - 0.017253544173827663
+    - 0.8960307668844161
+    - 0.4436566014497778
+    - -0.07530981835927171
+  - - -0.008698610646837801
+    - -0.4435713404588808
+    - 0.8961968534291596
+    - 0.028060287670681947
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  translation_C_B2F_m:
+  - -0.027696670801173263
+  - -0.07530981835927171
+  - 0.028060287670681947
+  quaternion_wxyz_C_B2F_FROM_C_RSF_COLOR:
+  - 0.973658169942051
+  - -0.22780786144932763
+  - 0.002269702029827286
+  - 0.009391209702477199
+base_composition:
+  urdf_xyz_m:
+  - 0.3993
+  - 0.0
+  - -0.01576
+  urdf_rpy_rad:
+  - -1.5708
+  - 0.0
+  - -1.5708
+  urdf_rotation_convention: Rz(yaw) @ Ry(pitch) @ Rx(roll)
+  T_BASE_FROM_C_B2F:
+  - - -3.673205103346574e-06
+    - -3.6732051033217936e-06
+    - 0.9999999999865075
+    - 0.3993
+  - - -0.9999999999932537
+    - 1.3492435731251315e-11
+    - -3.6732051033217936e-06
+    - 0.0
+  - - 0.0
+    - -0.9999999999932537
+    - -3.673205103346574e-06
+    - -0.01576
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  T_BASE_FROM_C_RSF_COLOR:
+  - - -0.008702346541869589
+    - -0.4435745607848646
+    - 0.8961952232572876
+    - 0.427360666034265
+  - - -0.9998132753072809
+    - 0.01932339737646702
+    - -0.00014433696073241114
+    - 0.027696567728778425
+  - - -0.017253512221930247
+    - -0.8960291375498598
+    - -0.44365989336164036
+    - 0.059549715287571775
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+  translation_BASE_m:
+  - 0.427360666034265
+  - 0.027696567728778425
+  - 0.059549715287571775
+  quaternion_wxyz_BASE_FROM_C_RSF_COLOR:
+  - 0.3764841156918035
+  - -0.5949021241858412
+  - 0.6065652556155804
+  - -0.36936399926216495
+per_pose_diagnostics:
+- pose: pose_000.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.7001053941725862
+    translation_spread_mm: 9.124486730728078
+    rotation_spread_deg: 0.8346129535032488
+  final:
+    cross_rmse_d435i_to_b2_px: 0.7257533316225285
+    cross_rmse_b2_to_d435i_px: 0.5546466316546839
+    cross_rmse_symmetric_px: 0.6458911612520667
+    translation_spread_mm: 9.132378048254045
+    rotation_spread_deg: 0.8429821615271365
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9998305693760877
+      - -0.017850138238063366
+      - -0.004495009006713674
+      - -0.02478158196209891
+    - - 0.017935538718132346
+      - 0.8897704031994795
+      - 0.4560558584659624
+      - -0.08373197650119776
+    - - -0.004141134141607168
+      - -0.456059209045402
+      - 0.8899398006904194
+      - 0.03005273292938415
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_001.png
+  is_final_inlier: false
+  common_charuco_corners: 18
+  d435i_charuco_corners: 18
+  b2_charuco_corners: 18
+  initial:
+    cross_rmse_symmetric_px: 1.2944077720867657
+    translation_spread_mm: 5.525580431057603
+    rotation_spread_deg: 0.7485893667260441
+  final:
+    cross_rmse_d435i_to_b2_px: 1.5940909963099834
+    cross_rmse_b2_to_d435i_px: 1.8401796395981365
+    cross_rmse_symmetric_px: 1.721538150972566
+    translation_spread_mm: 5.921073833810448
+    rotation_spread_deg: 0.7512088589690225
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9998036374373176
+      - -0.017325114903537026
+      - -0.00961909354815018
+      - -0.02397310987598085
+    - - 0.019801602616115514
+      - 0.8921693414280369
+      - 0.4512668420676357
+      - -0.07743355718729551
+    - - 0.0007636104650097404
+      - -0.45136870362204146
+      - 0.8923372178104058
+      - 0.03214488590945147
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_002.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.7337021851477704
+    translation_spread_mm: 13.031278374732716
+    rotation_spread_deg: 1.242132333750657
+  final:
+    cross_rmse_d435i_to_b2_px: 0.726495993297506
+    cross_rmse_b2_to_d435i_px: 0.6399582677757963
+    cross_rmse_symmetric_px: 0.684595870850799
+    translation_spread_mm: 13.131226400656358
+    rotation_spread_deg: 1.2501508102048953
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9998096968776194
+      - -0.018257940707391777
+      - -0.006871508612216306
+      - -0.023371962939649882
+    - - 0.019366942158281213
+      - 0.8866447350382084
+      - 0.4620454905963943
+      - -0.08693417453547894
+    - - -0.0023434122386354448
+      - -0.46209064200668504
+      - 0.8868296042582979
+      - 0.03237310023169648
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_003.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.7927044304490908
+    translation_spread_mm: 10.813274307482946
+    rotation_spread_deg: 0.6559051915215335
+  final:
+    cross_rmse_d435i_to_b2_px: 0.8242578281064442
+    cross_rmse_b2_to_d435i_px: 0.6090442926324469
+    cross_rmse_symmetric_px: 0.7246847306183946
+    translation_spread_mm: 10.643551421951686
+    rotation_spread_deg: 0.6672472430038954
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.999783623808978
+      - -0.020486887441275442
+      - 0.0036045813011516816
+      - -0.030478803918809055
+    - - 0.01662427768066188
+      - 0.8910819161558223
+      - 0.4535379279527397
+      - -0.08556044250996281
+    - - -0.012503557693086751
+      - -0.45337986958293236
+      - 0.8912296869505522
+      - 0.02737499451534464
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_004.png
+  is_final_inlier: true
+  common_charuco_corners: 22
+  d435i_charuco_corners: 22
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.7830625215869829
+    translation_spread_mm: 13.155124076402977
+    rotation_spread_deg: 0.7336765756901219
+  final:
+    cross_rmse_d435i_to_b2_px: 0.7958074647825588
+    cross_rmse_b2_to_d435i_px: 0.6020109002530296
+    cross_rmse_symmetric_px: 0.7055943044792478
+    translation_spread_mm: 13.014491242059519
+    rotation_spread_deg: 0.7449348484526879
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9997541800399571
+      - -0.021372958085035167
+      - 0.005897131110003344
+      - -0.03310479737486305
+    - - 0.016368373224198547
+      - 0.890897430893461
+      - 0.45390951078978753
+      - -0.08713160498900753
+    - - -0.014955127904052838
+      - -0.4537014043290215
+      - 0.8910282710774374
+      - 0.027448315339940077
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_005.png
+  is_final_inlier: true
+  common_charuco_corners: 16
+  d435i_charuco_corners: 16
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.5910559918748493
+    translation_spread_mm: 24.830739336360477
+    rotation_spread_deg: 1.5140600355552258
+  final:
+    cross_rmse_d435i_to_b2_px: 0.5687451437608563
+    cross_rmse_b2_to_d435i_px: 0.514551438945988
+    cross_rmse_symmetric_px: 0.5423256502660297
+    translation_spread_mm: 25.058040691918727
+    rotation_spread_deg: 1.5238796524057119
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9994500409230339
+      - -0.025836552547244204
+      - 0.020786732581609846
+      - -0.04684463344733704
+    - - 0.013472121985329908
+      - 0.889155399072709
+      - 0.4574070159377355
+      - -0.0885333440686597
+    - - -0.03030045590677248
+      - -0.45687541940043663
+      - 0.8890144731777526
+      - 0.03735540992012687
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_006.png
+  is_final_inlier: true
+  common_charuco_corners: 20
+  d435i_charuco_corners: 20
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.6403485377200935
+    translation_spread_mm: 27.095641609873073
+    rotation_spread_deg: 2.030419291364729
+  final:
+    cross_rmse_d435i_to_b2_px: 0.6562709206283901
+    cross_rmse_b2_to_d435i_px: 0.5821718634296813
+    cross_rmse_symmetric_px: 0.620328783723447
+    translation_spread_mm: 27.361144041218715
+    rotation_spread_deg: 2.0410505682830196
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.999386213520995
+      - -0.027802612859378968
+      - 0.02131222518554377
+      - -0.043337266078056366
+    - - 0.014602042247237396
+      - 0.883616564251754
+      - 0.46798349088630853
+      - -0.09392982685369322
+    - - -0.03184299901670272
+      - -0.4673850469346631
+      - 0.8834801872795481
+      - 0.04060218809672311
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_007.png
+  is_final_inlier: true
+  common_charuco_corners: 20
+  d435i_charuco_corners: 20
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.6254491934341339
+    translation_spread_mm: 14.27487742770865
+    rotation_spread_deg: 1.3733849311766146
+  final:
+    cross_rmse_d435i_to_b2_px: 0.498777418704814
+    cross_rmse_b2_to_d435i_px: 0.7273749775918804
+    cross_rmse_symmetric_px: 0.6236398285214896
+    translation_spread_mm: 14.553302317189914
+    rotation_spread_deg: 1.3843586792537703
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9997306128877396
+      - -0.022390574062821307
+      - 0.006112597503651348
+      - -0.03076412551338773
+    - - 0.01699304867309401
+      - 0.8854962130021973
+      - 0.4643357546598804
+      - -0.08726421137297857
+    - - -0.015809426045817927
+      - -0.4641067969249148
+      - 0.8856381558493271
+      - 0.035772733300822535
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_008.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.62360617625858
+    translation_spread_mm: 11.551699547834765
+    rotation_spread_deg: 1.0354057766118725
+  final:
+    cross_rmse_d435i_to_b2_px: 0.568037026294793
+    cross_rmse_b2_to_d435i_px: 0.5361305765284846
+    cross_rmse_symmetric_px: 0.5523142485626261
+    translation_spread_mm: 11.644404590271696
+    rotation_spread_deg: 1.044736691752075
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9998171083576473
+      - -0.018899386244925435
+      - -0.0029262663784419274
+      - -0.02555060582124554
+    - - 0.018129172632310283
+      - 0.8878960944804201
+      - 0.4596866960290287
+      - -0.0861288776126445
+    - - -0.0060895759310783
+      - -0.4596556739625672
+      - 0.888076335941341
+      - 0.03179318470058745
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_009.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.7027562621869407
+    translation_spread_mm: 8.134415049893123
+    rotation_spread_deg: 0.7268029251218299
+  final:
+    cross_rmse_d435i_to_b2_px: 0.8228722441308941
+    cross_rmse_b2_to_d435i_px: 0.6428059379724189
+    cross_rmse_symmetric_px: 0.7383489026380465
+    translation_spread_mm: 8.47860340785369
+    rotation_spread_deg: 0.7358683252828487
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.99978449531449
+      - -0.020739810519251646
+      - -0.0009072972919238441
+      - -0.026424149784516265
+    - - 0.01888115910491705
+      - 0.8902806003957863
+      - 0.4550208285230174
+      - -0.08167453393216385
+    - - -0.008629296588088847
+      - -0.4549399002269904
+      - 0.8904803324172021
+      - 0.033515358860503275
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_010.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.8398308140319879
+    translation_spread_mm: 17.963507350576602
+    rotation_spread_deg: 1.506852403471248
+  final:
+    cross_rmse_d435i_to_b2_px: 0.7944738561563791
+    cross_rmse_b2_to_d435i_px: 0.6602139373963882
+    cross_rmse_symmetric_px: 0.7304351960469967
+    translation_spread_mm: 18.159349389759825
+    rotation_spread_deg: 1.5186455882513097
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9999082843680519
+      - -0.013537151708346282
+      - 0.00041033616010625884
+      - -0.028099060498527006
+    - - 0.011781102938604791
+      - 0.8843455473399177
+      - 0.4666842171250398
+      - -0.09165180459403084
+    - - -0.006680454003214986
+      - -0.4666365806746044
+      - 0.8844239216069545
+      - 0.035968482072299635
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_011.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.8064354804516606
+    translation_spread_mm: 9.314139499683213
+    rotation_spread_deg: 0.7229361614762659
+  final:
+    cross_rmse_d435i_to_b2_px: 0.6648499014483371
+    cross_rmse_b2_to_d435i_px: 0.6390012449901358
+    cross_rmse_symmetric_px: 0.6520536720833673
+    translation_spread_mm: 9.106137854228475
+    rotation_spread_deg: 0.7217670734930006
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9998403016702423
+      - -0.014086906149242129
+      - -0.010996828229138778
+      - -0.019115719227642214
+    - - 0.01751346566819545
+      - 0.894829991585759
+      - 0.4460634088096884
+      - -0.07803304524139847
+    - - 0.0035566383352372277
+      - -0.44618476580198557
+      - 0.8949337992779017
+      - 0.02669169274836558
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_012.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.9804700709742122
+    translation_spread_mm: 17.302530359268385
+    rotation_spread_deg: 1.3444515441332516
+  final:
+    cross_rmse_d435i_to_b2_px: 0.8393330397154718
+    cross_rmse_b2_to_d435i_px: 0.9081147596472435
+    cross_rmse_symmetric_px: 0.8744004712507836
+    translation_spread_mm: 17.30417197633693
+    rotation_spread_deg: 1.3397459193796044
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9996780537343675
+      - -0.012336458084886315
+      - -0.02217206990306636
+      - -0.01044985016865252
+    - - 0.020892513366636254
+      - 0.8960731159412144
+      - 0.4434145619762932
+      - -0.07487666704558327
+    - - 0.014397630606858391
+      - -0.44373503658075386
+      - 0.8960423681632389
+      - 0.02939966282191897
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_013.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.6834100611269565
+    translation_spread_mm: 5.125351412597729
+    rotation_spread_deg: 0.5462114579086207
+  final:
+    cross_rmse_d435i_to_b2_px: 0.5230710638095684
+    cross_rmse_b2_to_d435i_px: 0.6360463234438803
+    cross_rmse_symmetric_px: 0.5823050160188176
+    translation_spread_mm: 5.091334675125177
+    rotation_spread_deg: 0.5520981819094934
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9998682993196333
+      - -0.015254622556256564
+      - -0.005538998675792772
+      - -0.024253412724554335
+    - - 0.01611613055194098
+      - 0.893085943263373
+      - 0.44959734016273306
+      - -0.07894791576515368
+    - - -0.001911635869374484
+      - -0.4496273951129286
+      - 0.8932141687256564
+      - 0.028971281554989292
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_014.png
+  is_final_inlier: false
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 1.141996407104367
+    translation_spread_mm: 6.430122159152621
+    rotation_spread_deg: 0.7732469598221973
+  final:
+    cross_rmse_d435i_to_b2_px: 1.643923738181472
+    cross_rmse_b2_to_d435i_px: 1.0288369119244354
+    cross_rmse_symmetric_px: 1.3713115343157354
+    translation_spread_mm: 6.915984545655456
+    rotation_spread_deg: 0.7867119703321088
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.999841010220085
+      - -0.01684464497299687
+      - 0.005849121114629041
+      - -0.03053721827953601
+    - - 0.012345281507225043
+      - 0.8906213629685563
+      - 0.45457802613912
+      - -0.07875453528575724
+    - - -0.012866557682118251
+      - -0.4544335438320599
+      - 0.8906877151581514
+      - 0.033341959522974196
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_015.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.6341422253067153
+    translation_spread_mm: 8.499395530376194
+    rotation_spread_deg: 0.9560980581537467
+  final:
+    cross_rmse_d435i_to_b2_px: 0.5646395892144807
+    cross_rmse_b2_to_d435i_px: 0.5708822269744712
+    cross_rmse_symmetric_px: 0.5677694879013969
+    translation_spread_mm: 8.715222795772798
+    rotation_spread_deg: 0.9637469798656494
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.999782762192259
+      - -0.020315558620382534
+      - -0.004659023627169273
+      - -0.025133990941727774
+    - - 0.020193051426895012
+      - 0.8887167372261042
+      - 0.45801179204061804
+      - -0.08246785403604721
+    - - -0.005164213133430434
+      - -0.45800637446669823
+      - 0.888933907470394
+      - 0.032320605213771836
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_016.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.946672937525505
+    translation_spread_mm: 12.766212183035456
+    rotation_spread_deg: 1.2390335343820045
+  final:
+    cross_rmse_d435i_to_b2_px: 1.158660009046609
+    cross_rmse_b2_to_d435i_px: 0.8032559982746825
+    cross_rmse_symmetric_px: 0.9969235716262669
+    translation_spread_mm: 13.226770339748548
+    rotation_spread_deg: 1.2469045219720534
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9995476735924121
+      - -0.029239448987966293
+      - 0.007035825387048278
+      - -0.030710856142585497
+    - - 0.022731429354247414
+      - 0.887718425974372
+      - 0.4598252693198759
+      - -0.08357714797239275
+    - - -0.019690869343677364
+      - -0.4594573438399518
+      - 0.8879815419568284
+      - 0.03793517508351252
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_017.png
+  is_final_inlier: true
+  common_charuco_corners: 22
+  d435i_charuco_corners: 22
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.7115807039970642
+    translation_spread_mm: 12.446345922399919
+    rotation_spread_deg: 1.03433415815825
+  final:
+    cross_rmse_d435i_to_b2_px: 0.7841417814965451
+    cross_rmse_b2_to_d435i_px: 0.741278320805795
+    cross_rmse_symmetric_px: 0.7630111016181989
+    translation_spread_mm: 12.776007290418562
+    rotation_spread_deg: 1.0413128776500515
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9995548836705297
+      - -0.024556381769862967
+      - 0.016941624620056495
+      - -0.03899550847041369
+    - - 0.014376932115110222
+      - 0.8940719554861702
+      - 0.44769257558741476
+      - -0.07684836905123217
+    - - -0.026140741254824296
+      - -0.4472497317243559
+      - 0.8940270348927597
+      - 0.03382184053230264
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_018.png
+  is_final_inlier: false
+  common_charuco_corners: 17
+  d435i_charuco_corners: 17
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 1.1587537203150604
+    translation_spread_mm: 8.563441604262243
+    rotation_spread_deg: 0.8616339077607588
+  final:
+    cross_rmse_d435i_to_b2_px: 1.482097355876466
+    cross_rmse_b2_to_d435i_px: 1.5416887750414072
+    cross_rmse_symmetric_px: 1.5121866371887909
+    translation_spread_mm: 9.131514496713606
+    rotation_spread_deg: 0.8706062600886817
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9996785016221842
+      - -0.024831448346317536
+      - 0.005127627857863748
+      - -0.02926353765294748
+    - - 0.01977108364127831
+      - 0.8900153553278574
+      - 0.455501670175069
+      - -0.07949452668888368
+    - - -0.015874433724519188
+      - -0.4552538483677561
+      - 0.8902201614770775
+      - 0.03602381085257689
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_019.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.7208040645276492
+    translation_spread_mm: 10.545090688390811
+    rotation_spread_deg: 1.1743360978598258
+  final:
+    cross_rmse_d435i_to_b2_px: 0.8203093791402374
+    cross_rmse_b2_to_d435i_px: 0.5578430305251367
+    cross_rmse_symmetric_px: 0.7014614473408037
+    translation_spread_mm: 10.58282844073719
+    rotation_spread_deg: 1.1779701880551334
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9997333334132448
+      - -0.019017014362779777
+      - -0.013100199508706448
+      - -0.02098386107075151
+    - - 0.02290446686742665
+      - 0.8888342915929839
+      - 0.45765597066564895
+      - -0.08307915596771188
+    - - 0.002940656382687281
+      - -0.4578339821956472
+      - 0.8890328437616435
+      - 0.03062384700397386
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_020.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.8576861287257959
+    translation_spread_mm: 10.138599158782455
+    rotation_spread_deg: 0.8875848086166744
+  final:
+    cross_rmse_d435i_to_b2_px: 0.9767361466103605
+    cross_rmse_b2_to_d435i_px: 0.5361241814050451
+    cross_rmse_symmetric_px: 0.7878586922737114
+    translation_spread_mm: 9.870321765973955
+    rotation_spread_deg: 0.8819561732271952
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9997110765525826
+      - -0.01864736049135311
+      - -0.015167048651005516
+      - -0.018417517444161174
+    - - 0.02344919477101577
+      - 0.8952633183446006
+      - 0.44491990974916473
+      - -0.07759377102112913
+    - - 0.005281920357920217
+      - -0.4451470170329343
+      - 0.8954419213684452
+      - 0.02558963492711297
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_021.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.6903992620202629
+    translation_spread_mm: 17.808991436240454
+    rotation_spread_deg: 1.1599873059718302
+  final:
+    cross_rmse_d435i_to_b2_px: 0.6987054416834396
+    cross_rmse_b2_to_d435i_px: 0.4900216074727483
+    cross_rmse_symmetric_px: 0.6034527612117732
+    translation_spread_mm: 17.652930189569474
+    rotation_spread_deg: 1.1670478127084978
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9998174491818288
+      - -0.01695026381751493
+      - -0.008817985487500068
+      - -0.019952389732302622
+    - - 0.01910672993893999
+      - 0.8878015981104667
+      - 0.45982959372308996
+      - -0.09116567594785213
+    - - 3.4388683210345716e-05
+      - -0.4599141343218517
+      - 0.8879633933155131
+      - 0.02756649101739106
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_022.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.6423442281952607
+    translation_spread_mm: 17.83817908672246
+    rotation_spread_deg: 1.4282104791689825
+  final:
+    cross_rmse_d435i_to_b2_px: 0.6844706308707221
+    cross_rmse_b2_to_d435i_px: 0.4858798673386409
+    cross_rmse_symmetric_px: 0.5935399270519127
+    translation_spread_mm: 17.80639752569427
+    rotation_spread_deg: 1.41759065065467
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9996002429711736
+      - -0.027776126763528676
+      - 0.005276460365322311
+      - -0.03289725152689282
+    - - 0.022933630691406665
+      - 0.9057292364975771
+      - 0.42323586655294965
+      - -0.0586238253502471
+    - - -0.01653489749833975
+      - -0.4229456666470675
+      - 0.9060041723023061
+      - 0.024654499911424654
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_023.png
+  is_final_inlier: true
+  common_charuco_corners: 16
+  d435i_charuco_corners: 16
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.5099523475921391
+    translation_spread_mm: 19.114920786220193
+    rotation_spread_deg: 1.5195671123007681
+  final:
+    cross_rmse_d435i_to_b2_px: 0.6388611868400701
+    cross_rmse_b2_to_d435i_px: 0.4623273801128034
+    cross_rmse_symmetric_px: 0.5576245253092226
+    translation_spread_mm: 19.212310890356555
+    rotation_spread_deg: 1.523958200058494
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9994093274492959
+      - -0.022132017730342714
+      - 0.02629011218176941
+      - -0.046685230108980874
+    - - 0.008311041309031514
+      - 0.8979610295853535
+      - 0.4399964953705559
+      - -0.07277947493362757
+    - - -0.03334550643948592
+      - -0.43951810330997254
+      - 0.8976145687671847
+      - 0.02952482422191094
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_024.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.7737098674329334
+    translation_spread_mm: 30.175636611068327
+    rotation_spread_deg: 2.4535392924240633
+  final:
+    cross_rmse_d435i_to_b2_px: 0.9493266861196089
+    cross_rmse_b2_to_d435i_px: 0.5275451106458499
+    cross_rmse_symmetric_px: 0.7679599601363277
+    translation_spread_mm: 30.084427496163666
+    rotation_spread_deg: 2.4430591101623316
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9997615544530384
+      - -0.008992466423399802
+      - -0.01989898955396202
+      - -0.012101056291259318
+    - - 0.016378120504485005
+      - 0.9115108789919475
+      - 0.410949722774049
+      - -0.05043384651424636
+    - - 0.014442693875632295
+      - -0.4111776416914606
+      - 0.9114408129805597
+      - 0.0215001344258563
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+- pose: pose_025.png
+  is_final_inlier: true
+  common_charuco_corners: 24
+  d435i_charuco_corners: 24
+  b2_charuco_corners: 24
+  initial:
+    cross_rmse_symmetric_px: 0.8890491453243843
+    translation_spread_mm: 16.316325055789555
+    rotation_spread_deg: 1.6053019253789174
+  final:
+    cross_rmse_d435i_to_b2_px: 1.1594453763253858
+    cross_rmse_b2_to_d435i_px: 1.0174319241995853
+    cross_rmse_symmetric_px: 1.0907523323520298
+    translation_spread_mm: 16.435283749908887
+    rotation_spread_deg: 1.6030235770472911
+    T_C_B2F_FROM_C_RSF_COLOR_pose:
+    - - 0.9998463823837511
+      - -0.009416368110394799
+      - 0.014783221764394228
+      - -0.034677774072919665
+    - - 0.0022601679568185484
+      - 0.9056565578897964
+      - 0.4240060032499695
+      - -0.060433715106635574
+    - - -0.017381118345281665
+      - -0.4239074558943447
+      - 0.9055387156617059
+      - 0.02835063412948524
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0

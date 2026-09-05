@@ -1,0 +1,21 @@
+# Rear D435i IR1 extrinsic calibration
+# Convention: p_A = R_A_B @ p_B + t_A_B
+frames:
+  parent: C_B2R
+  child: C_RSR_IR1
+T_C_B2R_from_C_RSR_IR1:
+  matrix:
+    - [0.998893984854, -0.0118510021031, 0.045501217252, -0.0174556195426]
+    - [0.0126427214102, 0.999772963242, -0.0171517802385, -0.121233652623]
+    - [-0.0452876210194, 0.0177080693233, 0.99881702812, -0.00346363326173]
+    - [0, 0, 0, 1]
+  translation_m: [-0.0174556195426, -0.121233652623, -0.00346363326173]
+  quaternion_wxyz: [0.999685447555, -0.00871770456575, -0.022704351277, -0.00612535762453]
+metrics:
+  stereo_rms_px: 0.18273102722556944
+  b2_intrinsic_rms_px: 0.18285205514719813
+  inlier_pair_count: 29
+  total_pair_count: 30
+  median_pair_cross_reproj_px: 0.23385843911386384
+  median_independent_translation_residual_m: 0.0039032220208927693
+  median_independent_rotation_residual_deg: 0.3194361843569964

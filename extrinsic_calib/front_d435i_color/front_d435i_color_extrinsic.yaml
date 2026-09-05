@@ -1,0 +1,104 @@
+# Front D435i Color extrinsic calibration
+#
+# Transform convention:
+#
+#   T_A_FROM_B maps coordinates from frame B to frame A
+#
+#   p_A = R_A_B @ p_B + t_A_B
+#
+# Front RealSense:
+#   Intel RealSense D435i
+#   serial: 233522076316
+#
+# Canonical front perception camera frame:
+#   C_RSF_COLOR = Front D435i Color optical frame
+
+camera:
+  name: front_d435i_color
+  serial: "233522076316"
+  stream:
+    width: 848
+    height: 480
+    fps: 30
+    format: BGR8
+  factory_intrinsics:
+    fx: 608.167724609375
+    fy: 608.2047119140625
+    cx: 416.6564025878906
+    cy: 253.10433959960938
+    distortion_model: inverse_brown_conrady
+    coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+frames:
+  base: Base
+  b2_front_optical: C_B2F
+  front_color_optical: C_RSF_COLOR
+
+
+# ------------------------------------------------------------------
+# Direct ChArUco calibration result
+#
+# p_C_B2F =
+#     R_C_B2F_C_RSF_COLOR @ p_C_RSF_COLOR
+#     + t_C_B2F_C_RSF_COLOR
+#
+# T_C_B2F_FROM_C_RSF_COLOR
+# ------------------------------------------------------------------
+
+T_C_B2F_FROM_C_RSF_COLOR:
+  - [ 0.999813307266, -0.019321768036,  0.000141045052, -0.027696670801]
+  - [ 0.017253544174,  0.896030766884,  0.443656601450, -0.075309818359]
+  - [-0.008698610647, -0.443571340459,  0.896196853429,  0.028060287671]
+  - [ 0.0,             0.0,             0.0,             1.0           ]
+
+
+# ------------------------------------------------------------------
+# Runtime transform used by Front D435i object perception
+#
+# Constructed from:
+#
+#   T_BASE_FROM_C_RSF_COLOR =
+#       T_BASE_FROM_C_B2F
+#       @ T_C_B2F_FROM_C_RSF_COLOR
+#
+# where T_BASE_FROM_C_B2F comes from the B2W URDF:
+#
+#   xyz = [0.3993, 0.0, -0.01576]
+#   rpy = [-1.5708, 0.0, -1.5708]
+#
+# p_Base =
+#     R_BASE_C_RSF_COLOR @ p_C_RSF_COLOR
+#     + t_BASE_C_RSF_COLOR
+# ------------------------------------------------------------------
+
+T_BASE_FROM_C_RSF_COLOR:
+  - [-0.008702346542, -0.443574560785,  0.896195223257,  0.427360666034]
+  - [-0.999813275307,  0.019323397376, -0.000144336961,  0.027696567729]
+  - [-0.017253512222, -0.896029137550, -0.443659893362,  0.059549715288]
+  - [ 0.0,             0.0,             0.0,             1.0           ]
+
+
+calibration_quality:
+  paired_poses: 26
+  usable_poses: 26
+  final_inliers: 23
+  final_outliers: 3
+  outlier_poses:
+    - pose_001
+    - pose_014
+    - pose_018
+
+  initial_stereo_rms_px: 0.413520
+  stereo_rms_px: 0.374600
+  median_cross_reprojection_rmse_px: 0.684596
+  median_translation_spread_mm: 13.131
+  median_rotation_spread_deg: 1.178
+  initial_to_final_translation_delta_mm: 0.727
+  initial_to_final_rotation_delta_deg: 0.0143
+
+notes:
+  - "Calibration accepted and frozen."
+  - "Front D435i canonical optical frame is Color."
+  - "Use T_BASE_FROM_C_RSF_COLOR for runtime object geometry."
+  - "Offline board-center validation: median 3.046 mm, p90 4.465 mm, max 5.583 mm; median board-normal disagreement 1.104 deg."
+  - "Keep front_d435i_color_extrinsic_result.json as the full solver diagnostic record."

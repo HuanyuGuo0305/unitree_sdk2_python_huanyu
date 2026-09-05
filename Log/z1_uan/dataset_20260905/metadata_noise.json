@@ -1,0 +1,262 @@
+{
+  "created": "2026-09-05T15:25:07",
+  "config_path": "/home/huanyuguo/Workspace_huanyu/unitree_sdk2_python_huanyu/deploy/configs/z1_uan_data_collection.yaml",
+  "mode": "position_pd",
+  "phases": [
+    "noise"
+  ],
+  "results": {
+    "noise": {
+      "path": "/home/huanyuguo/Workspace_huanyu/unitree_sdk2_python_huanyu/Log/z1_uan/20260905_151951/noise_log.pkl",
+      "num_samples": 75500,
+      "complete": true,
+      "abort_reason": null
+    }
+  },
+  "config": {
+    "z1_sdk_lib": "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib",
+    "z1_has_gripper": true,
+    "z1_fk_ee_index": 5,
+    "control_dt": 0.002,
+    "z1_control_dt": 0.002,
+    "arm_base_offset_pos": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "arm_base_offset_rpy": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "z1_fk_to_policy_ee_pos": [
+      0.051,
+      0.0,
+      0.0
+    ],
+    "z1_fk_to_policy_ee_rpy": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "default_arm_pos": [
+      0.0,
+      1.5,
+      -1.5,
+      -0.2,
+      0.0,
+      0.0
+    ],
+    "default_gripper_pos": 0.0,
+    "arm_kps_startup": [
+      20.0,
+      30.0,
+      30.0,
+      20.0,
+      15.0,
+      10.0
+    ],
+    "arm_kds_startup": [
+      2000.0,
+      2000.0,
+      2000.0,
+      2000.0,
+      2000.0,
+      2000.0
+    ],
+    "arm_kps_runtime": [
+      2.5,
+      4.5,
+      2.5,
+      2.5,
+      2.5,
+      2.5
+    ],
+    "arm_kds_runtime": [
+      234.375,
+      312.5,
+      234.375,
+      234.75,
+      234.375,
+      234.375
+    ],
+    "z1_gripper_kp": 20.0,
+    "z1_gripper_kd": 2000.0,
+    "z1_gripper_runtime_mode": "dcmotor",
+    "z1_gripper_q_offset": 0.02367,
+    "z1_gripper_dcmotor_kp": 76.8,
+    "z1_gripper_dcmotor_kd": 3.0,
+    "z1_gripper_dcmotor_effort_limit": 30.0,
+    "z1_gripper_dcmotor_saturation_effort": 30.0,
+    "z1_gripper_dcmotor_velocity_limit": 2.0,
+    "z1_arm_runtime_mode": "position_pd",
+    "z1_debug_print": false,
+    "uan": {
+      "output_root": "Log/z1_uan",
+      "loop_hz": 500.0,
+      "log_hz": 250.0,
+      "target_update_hz": 50.0,
+      "home_q": [
+        0.0,
+        1.5,
+        -1.5,
+        -0.2,
+        0.0,
+        0.0
+      ],
+      "gripper_hold_q": 0.0,
+      "q_min": [
+        -2.0,
+        0.35,
+        -2.7,
+        -1.4,
+        -1.25,
+        -2.4
+      ],
+      "q_max": [
+        2.0,
+        2.65,
+        -0.25,
+        1.25,
+        1.25,
+        2.4
+      ],
+      "home_move_s": 5.0,
+      "home_move_max_speed": 0.4,
+      "home_tolerance": 0.05,
+      "safety": {
+        "max_abs_qd": 4.5,
+        "qd_hold_s": 0.2,
+        "max_abs_qd_hard": 6.5,
+        "max_abs_tau_est": [
+          28.0,
+          55.0,
+          28.0,
+          28.0,
+          28.0,
+          28.0
+        ],
+        "tau_hold_s": 0.3,
+        "max_tracking_error": 1.0,
+        "tracking_error_hold_s": 0.5,
+        "stale_hold_s": 0.1,
+        "liveness_samples": 60,
+        "liveness_min_distinct": 3,
+        "q_limit_margin": 0.15,
+        "rated_torque": [
+          30.0,
+          60.0,
+          30.0,
+          30.0,
+          30.0,
+          30.0
+        ],
+        "overtorque_budget_s": 0.1,
+        "overtorque_decay_s": 60.0
+      },
+      "square_sine": {
+        "joints": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "wave_shapes": [
+          "square",
+          "sine"
+        ],
+        "amplitude_fracs": [
+          0.25,
+          0.5,
+          0.75,
+          1.0
+        ],
+        "frequencies_hz": [
+          0.25,
+          0.6,
+          1.2
+        ],
+        "segment_duration_s": 4.2,
+        "amplitude_max": [
+          0.9,
+          0.7,
+          0.7,
+          0.7,
+          0.9,
+          1.2
+        ],
+        "kp_effective": [
+          40.8,
+          100.4,
+          51.8,
+          46.9,
+          38.7,
+          31.4
+        ],
+        "torque_budget": [
+          22.0,
+          45.0,
+          22.0,
+          22.0,
+          22.0,
+          22.0
+        ],
+        "square_torque_gain": [
+          4.1,
+          4.6,
+          3.9
+        ],
+        "sine_torque_gain": [
+          1.0,
+          1.2,
+          2.0
+        ],
+        "max_peak_speed": 3.0,
+        "transition_s": 1.0
+      },
+      "noise": {
+        "duration_s": 300.0,
+        "torque_gain": [
+          2.94,
+          3.1,
+          2.82,
+          1.87,
+          3.22,
+          3.55
+        ],
+        "sigma_frac": 0.5,
+        "hold_ms_min": 5.0,
+        "hold_ms_max": 400.0,
+        "seed": 0,
+        "target_update_hz": 200.0,
+        "max_target_speed": [
+          4.0,
+          4.0,
+          4.0,
+          4.0,
+          4.0,
+          4.0
+        ],
+        "transition_s": 1.0
+      }
+    }
+  },
+  "sdk_q_lower": [
+    -2.6179938779914944,
+    0.0,
+    -2.885592653589793,
+    -1.5184364492350666,
+    -1.3439035240356338,
+    -2.792526803190927
+  ],
+  "sdk_q_upper": [
+    2.6179938779914944,
+    2.8797932657906435,
+    0.0,
+    1.5184364492350666,
+    1.3439035240356338,
+    2.792526803190927
+  ]
+}

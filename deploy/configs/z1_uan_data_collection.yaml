@@ -1,0 +1,373 @@
+# =====================================================================
+# Z1 Unsupervised Actuator Net (UAN) hardware data collection.
+#
+# Companion config for deploy/z1_uan_data_collection.py.
+#
+# Method reference:
+#   "Bridging the Sim-to-Real Gap for Athletic Loco-Manipulation"
+#   (arXiv:2502.10894), Section II-A.2 "Data collection":
+#
+#     "we opted not to use policy data, and instead, collected data with
+#      three types of action sequences: 1) square waves, 2) sine waves,
+#      and 3) gaussian noise. For the square and sine wave data, we passed
+#      torque commands to one actuator at a time, while keeping the rest of
+#      the actuators at a fixed position target. We swept 12 different
+#      combinations of amplitude and frequency for each wave, resulting in
+#      about 50 seconds of data for each actuator. For the gaussian noise
+#      data, we passed torque commands to all the robot's joints
+#      simultaneously. We sampled a new action from a gaussian distribution
+#      every 5 to 400 ms for about 5 minutes."
+#
+# SETUP ASSUMED BY THESE DEFAULTS
+#   - Z1 detached from the B2W, bolted to a fixed stand, base LEVEL and
+#     world-aligned (gravity = -z in the arm base frame).  The replaying
+#     simulation must fix the arm base at identity orientation to match.
+#   - Nothing in the gripper. The gripper is held at a constant position
+#     target for the whole session and is NOT excited.
+#   - Clear workspace: the arm sweeps large amplitudes at speed.
+#
+# The collector uses only the deployed Z1 firmware position-PD path and
+# writes one position_pd subdirectory per timestamped session.
+# =====================================================================
+
+
+# ---------------------------------------------------------------------
+# Z1 SDK / Z1ArmAdapter construction
+#
+# Keys in this block are consumed by utils.z1_helper.Z1ArmAdapter and keep
+# the same names/values as deploy/configs/b2wz1_hl_retrieval_sim2real.yaml
+# so the collected data describes the arm as you actually deploy it.
+# ---------------------------------------------------------------------
+z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"
+z1_has_gripper: true
+z1_fk_ee_index: 5
+
+# Both are the raw SDK send rate. The collector overrides its own loop rate
+# with uan.loop_hz; these only feed adapter bookkeeping.
+control_dt: 0.002
+z1_control_dt: 0.002
+
+# Standalone level mount: the arm base IS the reference frame, so no offset.
+# (The deployment YAML uses [0.10, 0.0, 0.12] for the B2W-mounted arm.)
+arm_base_offset_pos: [0.0, 0.0, 0.0]
+arm_base_offset_rpy: [0.0, 0.0, 0.0]
+z1_fk_to_policy_ee_pos: [0.051, 0.0, 0.0]
+z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
+
+# Adapter "default" pose. The collector uses uan.home_q for the excitation
+# center; this only matters for adapter internals.
+default_arm_pos: [0.0, 1.5, -1.5, -0.2, 0.0, 0.0]
+default_gripper_pos: 0.0
+
+# Startup gains: used only by the slow, supervised move-to-home ramp.
+arm_kps_startup: [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]
+arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
+
+# Runtime firmware gains: these ARE the control law the data is collected
+# under, so they MUST equal the gains you deploy with. Cross-check against
+# arm_kps_runtime / arm_kds_runtime in the deployment YAML before every
+# session -- data collected under different gains describes a different
+# plant, and the UAN will close the wrong gap.
+arm_kps_runtime: [2.5, 4.5, 2.5, 2.5, 2.5, 2.5]
+arm_kds_runtime: [234.375, 312.5, 234.375, 234.75, 234.375, 234.375]
+
+# Gripper firmware position servo. The collector always holds the gripper
+# through the firmware position loop (never the DCMotor torque path), so
+# these are the gains that hold it still.
+z1_gripper_kp: 20.0
+z1_gripper_kd: 2000.0
+
+# Required by the adapter constructor, but the collector never calls the
+# gripper DCMotor path.
+z1_gripper_runtime_mode: "dcmotor"
+z1_gripper_q_offset: 0.02367
+z1_gripper_dcmotor_kp: 76.8
+z1_gripper_dcmotor_kd: 3.0
+z1_gripper_dcmotor_effort_limit: 30.0
+z1_gripper_dcmotor_saturation_effort: 30.0
+z1_gripper_dcmotor_velocity_limit: 2.0
+
+# The arm collector always uses the firmware position-PD path.
+z1_arm_runtime_mode: "position_pd"
+
+z1_debug_print: false
+
+
+# ---------------------------------------------------------------------
+# Data collection
+# ---------------------------------------------------------------------
+uan:
+
+  # One subdirectory per timestamped session.
+  output_root: "Log/z1_uan"
+
+  # Actuation is fixed: the Z1 firmware closes the position loop with
+  # arm_kps_runtime / arm_kds_runtime and tau_f = 0. This matches the deployed
+  # WBC path. The collector sends q_des; the replaying sim uses its own
+  # physical PD gains and the UAN learns the remaining sim-to-real residual.
+
+  # Command rate: how fast lowcmd packets go out. 500 Hz is the Z1's native
+  # lowcmd rate and what the firmware loop expects to be fed. Safety checks
+  # also run at this rate, so a fault is caught on the step it happens.
+  loop_hz: 500.0
+
+  # Log rate: how fast state rows are recorded. Must divide loop_hz evenly.
+  # The arm publishes state at about half the send rate -- a 500 Hz run came
+  # back 51.6% duplicated rows -- so 250 Hz records the same information
+  # without padding the dataset. The phase report prints the measured
+  # duplicate fraction; if it is still high here, lower this further.
+  log_hz: 250.0
+
+  # Rate at which the excitation target is refreshed (zero-order held in
+  # between). 50 Hz matches the deployed arm command rate. Raising it
+  # widens the excitation bandwidth; the replaying sim sees exactly the
+  # logged per-step q_des either way.
+  target_update_hz: 50.0
+
+  # Excitation center. Chosen mid-range so every joint has room to swing.
+  home_q: [0.0, 1.5, -1.5, -0.2, 0.0, 0.0]
+
+  # Raw SDK gripper coordinate, held constant all session. 0.0 = closed.
+  gripper_hold_q: 0.0
+
+  # Soft position limits for the excitation, deliberately inside the limits
+  # the Z1 SDK itself enforces (Z1Model.getJointQMin/Max):
+  #   j1 [-2.618, 2.618]  j2 [0.000, 2.880]  j3 [-2.886,  0.000]
+  #   j4 [-1.518, 1.518]  j5 [-1.344, 1.344] j6 [-2.793,  2.793]
+  # These are NOT the paper's URDF numbers -- that model is looser on j3, j4
+  # and j5 -- and the SDK's are what matter, because jointProtect() clamps
+  # every command into them. A target outside is silently turned into a step
+  # to the boundary, so the log would not describe what the arm was told.
+  # The collector re-reads these from the live model and refuses to run if
+  # this box escapes them.
+  #
+  # Note this box excludes the arm's own zero pose (j2=0, j3=0) by design:
+  # it bounds where excitation targets may go, not where the arm may sit.
+  q_min: [-2.00, 0.35, -2.70, -1.40, -1.25, -2.40]
+  q_max: [ 2.00, 2.65, -0.25,  1.25,  1.25,  2.40]
+
+  # Slow supervised ramp into home, under startup gains. A long move is
+  # stretched so that distance never turns into speed: the actual duration
+  # is max(home_move_s, distance / home_move_max_speed).
+  home_move_s: 5.0
+  home_move_max_speed: 0.4    # rad/s
+
+  # The sweep refuses to start unless the arm actually arrived at home. It
+  # plans every target relative to home_q, so starting somewhere else turns
+  # each one into a large step.
+  home_tolerance: 0.05        # rad
+
+  # ---- safety aborts -------------------------------------------------
+  # Any trip ramps the arm back to home and ends the session.
+  safety:
+    # The SDK's pi rad/s (Z1Model.getJointSpeedMax) clamps *commanded* qd.
+    # It is NOT a ceiling on measured speed: in position_pd mode we command
+    # qd=0 and the firmware generates the motion, so a square edge flings the
+    # joint past pi for a few ms. Measured peaks on joint1 were 1.28 / 2.51 /
+    # 3.13 rad/s at square amplitudes 0.076 / 0.152 / 0.228 rad, and the
+    # longest continuous excursion above 2.5 rad/s was 24 ms.
+    #
+    # So the moderate limit only aborts when overspeed persists (0.2 s is 8x
+    # that longest legitimate burst), and a separate hard limit at ~2x rated
+    # aborts instantly on something genuinely impossible.
+    max_abs_qd: 4.5                                       # rad/s, sustained
+    qd_hold_s: 0.2
+    max_abs_qd_hard: 6.5                                  # rad/s, instant
+    # A square edge drives the actuator into its own firmware torque clip
+    # (30 Nm on every joint but joint2, 60 Nm there) for a few milliseconds.
+    # That is the excitation working, and the replaying sim clips identically,
+    # so it must not abort. Only sustained saturation -- a stall or a
+    # collision -- does. tau_hold_s must stay above the time a legitimate
+    # square edge spends saturated, which is well under 100 ms.
+    max_abs_tau_est: [28.0, 55.0, 28.0, 28.0, 28.0, 28.0] # Nm, per joint
+    tau_hold_s: 0.3
+    # |q_des - q| is briefly large by design on every square-wave edge, so
+    # it only aborts when it stays above the threshold this long.
+    max_tracking_error: 1.0                               # rad
+    tracking_error_hold_s: 0.5
+    # When the Z1 faults it stops publishing state and the SDK keeps handing
+    # back the last packet, so q/qd/tau freeze at plausible values and every
+    # other check stays happy while the arm is limp. Some duplication is
+    # normal (the arm publishes slower than we send), so this only trips on
+    # a freeze far longer than that.
+    stale_hold_s: 0.1
+
+    # The same failure mode at STARTUP: if the controller has stopped
+    # publishing, connect() reads a plausible-looking pose that is simply
+    # stale, and every later check reasons about a number that is not where
+    # the arm is. Encoder LSB is ~1e-5 rad, so a live but stationary arm
+    # still gave 238 distinct readings in 500 consecutive rows, while a
+    # frozen one repeated byte-identically 2550 times. Sampling this many
+    # and requiring this many distinct separates the two with wide margin.
+    liveness_samples: 60
+    liveness_min_distinct: 3
+    # Trips if the arm leaves the soft box by this much.
+    q_limit_margin: 0.15                                  # rad
+
+    # The Z1's own protection trips on ACCUMULATED overcurrent, not on any
+    # single sample: the 20260905_142932 run exceeded rated torque in only 33
+    # scattered steps out of 61,714 and still faulted four minutes in. A
+    # consecutive-run check cannot see that, so time spent above the rating
+    # is accumulated with an exponential decay and aborts once it exceeds the
+    # budget. If this fires, reduce the amplitudes -- do not raise it.
+    # rated_torque is enforced two ways. Instantaneously: cells are sized to
+    # 75% of rating, so touching it at all means the amplitude model is wrong
+    # for that joint, and the excursions before the last fault were 20 ms
+    # spikes that no hold-based check could see. And cumulatively, as a
+    # backstop against repeated moderate excursions.
+    #
+    # Honest note: the cumulative guard would NOT have caught the
+    # 20260905_142932 fault -- that run spent only 0.13 s above rating across
+    # four minutes and still tripped the arm's protection. The amplitude
+    # budget above is the real defence; these are the net beneath it.
+    rated_torque: [30.0, 60.0, 30.0, 30.0, 30.0, 30.0]    # Nm, per joint
+    overtorque_budget_s: 0.10
+    overtorque_decay_s: 60.0
+
+  # ---- square + sine sweep -------------------------------------------
+  # One joint excited at a time, the rest held at home. 4 amplitudes x 3
+  # frequencies = the paper's 12 combinations, x segment_duration_s ~= 50 s
+  # per joint per wave shape.
+  square_sine:
+    joints: [0, 1, 2, 3, 4, 5]
+    wave_shapes: ["square", "sine"]
+    amplitude_fracs: [0.25, 0.5, 0.75, 1.0]
+    frequencies_hz: [0.25, 0.6, 1.2]
+    segment_duration_s: 4.2
+
+    # Per-joint amplitude ceiling. The four amplitude_fracs are fractions of
+    # whatever is achievable at each frequency after max_peak_speed and the
+    # soft box are applied, so all 12 cells stay distinct.
+    amplitude_max: [0.90, 0.70, 0.70, 0.70, 0.90, 1.20]
+
+    # Square amplitude is sized from a torque budget, not a blind scale.
+    # A square edge steps 2A against a stationary joint, so the firmware
+    # demands ~kp_effective * 2A instantly; the damping term contributes
+    # nothing at the edge. A step that exceeds the joint's rating trips the
+    # Z1's own protection, which drops it out of LOWCMD and the arm falls.
+    #
+    # kp_effective is the firmware position loop's real stiffness in Nm/rad.
+    # It is NOT arm_kps_runtime: the firmware number is ~14-22x smaller.
+    # Values below were fit as tau ~ kp*(q_des-q) - kd*qd on the 20260905_134623
+    # run (R^2 0.82-0.98), at arm_kps_runtime [2.5,4.5,3.0,2.5,2.5,2.5].
+    # RE-FIT THESE IF YOU CHANGE arm_kps_runtime -- they scale with it.
+    # joint6 was never reached before that run aborted; 40.0 is an estimate
+    # from the ~16x ratio the other joints show.
+    # Refit on the 20260905_142301 run at the current gains:
+    #   joint1 40.6 Nm/rad (R^2 0.84, was 36.2 -- the old value under-sized
+    #   the budget, so the widest cell peaked at 25.9 Nm instead of 22).
+    #   joint2 103.4 agrees with the earlier 101.1. joint3 is the earlier
+    #   52.7 rescaled for its kp dropping 3.0 -> 2.5, plus margin. joints
+    #   4-6 were never excited in either run; they are estimates from the
+    #   ~16-23x ratio the measured joints show, biased HIGH because a high
+    #   kp_effective yields a smaller, safer amplitude.
+    # MEASURED on the complete 6-joint sweep (20260905_145044, 187,450
+    # samples, 24k+ excited samples per joint, R^2 0.84-0.95). These replace
+    # the earlier estimates. joint6 was the one that mattered: estimated at
+    # 45.0, actually 31.4 -- 30% off, and it is the joint that tripped.
+    #   fit ratio to arm_kps_runtime: 16.3 22.3 20.7 18.8 15.5 12.6 x
+    kp_effective: [40.8, 100.4, 51.8, 46.9, 38.7, 31.4]
+
+    # Peak torque any cell may demand, per joint, in Nm. Applies to sine
+    # cells as well as square: on the 20260905_142932 run the worst offender
+    # was j1_sine_a1_f1.2 at 67.5 Nm on a 60 Nm joint, because sines had no
+    # budget at all.
+    torque_budget: [22.0, 45.0, 22.0, 22.0, 22.0, 22.0]
+
+    # Measured peak torque per (kp_effective * amplitude), one entry per
+    # frequency in frequencies_hz. The static model kp*2A underestimates by
+    # 1.4-1.7x for two reasons, both visible in the logs:
+    #
+    #   overshoot  the loop is very lightly damped (zeta ~ 0.03), so the joint
+    #              sails past the target and the next square edge starts from
+    #              further away than 2A -- measured peak error hit 1.3x the
+    #              commanded step.
+    #   resonance  joint2's natural frequency, sqrt(kp_eff/J), lands near the
+    #              top of the sweep. Measured sine gain on j1 climbs
+    #              0.81 -> 0.98 -> 1.72 across 0.25 / 0.6 / 1.2 Hz.
+    #
+    # Values are the worst case over the joints measured so far, plus ~15%.
+    # Square gains include the factor of 2 for the 2A step.
+    #   measured square: j0 2.84/2.74/3.30   j1 2.88/3.16/3.16
+    #   measured sine  : j0 0.19/0.42/1.04   j1 0.81/0.98/1.72
+    # RE-MEASURE after a full sweep; joints 3-6 have never been excited.
+    # Fitted as peak_tau = baseline + gain*kp_effective*A across the four
+    # amplitudes of each cell, which separates the gravity baseline from the
+    # dynamic term. (Dividing peak_tau by A directly, as I did first, folds
+    # the static torque in and badly inflates the small-amplitude cells.)
+    #   square, worst joint per frequency: 3.32 3.67 3.03  -> x1.25 margin
+    #   sine,   worst joint per frequency: 0.17 0.68 1.32  -> already below
+    #                                      the values here, so these stand
+    # The sweep completed with peak [17.0, 35.8, 20.3, 13.2, 16.2, 13.7] Nm
+    # against budget [22, 45, 22, 22, 22, 22], so sine is left conservative.
+    square_torque_gain: [4.1, 4.6, 3.9]
+    sine_torque_gain:   [1.0, 1.2, 2.0]
+
+    # Sine amplitude is additionally capped so that the commanded peak
+    # speed 2*pi*f*A never exceeds this. Prevents the high-amplitude /
+    # high-frequency corner from commanding absurd velocities.
+    max_peak_speed: 3.0     # rad/s
+
+    # Smooth cosine blend between consecutive segments, logged and tagged
+    # as "transition" so you can drop it when training.
+    transition_s: 1.0
+
+  # ---- gaussian noise ------------------------------------------------
+  # All joints excited simultaneously; each joint independently draws a new
+  # target after its own uniformly sampled hold time.
+  noise:
+    duration_s: 300.0
+
+    # The noise excursion is sized from the SAME torque budget as the sweep.
+    # It previously had none, which is why the square/sine sweep completed
+    # with peak torque [17.0, 35.8, 20.3, 13.2, 16.2, 13.7] Nm while noise
+    # tripped joint2 at 62 Nm on a 60 Nm joint within 2.5 seconds.
+    #
+    # Here the arm lags the target almost completely, so the tracking error
+    # IS the excursion and torque ~ kp_effective * excursion. Measured
+    # peak|tau| / (kp_effective * peak|err|) came to 0.74-1.28 across the six
+    # joints, hence 1.3 with margin.
+    # PER JOINT, measured as peak_tau / (kp_effective * excursion) on the
+    # 20260905_151203 run: [1.55, 1.17, 1.00, 0.80, 1.05, 2.56], x1.4 margin.
+    # A single shared 1.3 was the bug: joint6 needs 2.56 and reached 30.2 Nm
+    # on a 30 Nm joint within 5 s, while joint4 at 0.80 was over-restricted.
+    # PER JOINT, and fitted on a run long enough to see the tail. Peak
+    # torque in this phase keeps climbing as rarer target sequences occur,
+    # so a short sample under-reads it badly:
+    #     5 s  -> [1.55, 1.17, 1.00, 0.80, 1.05, 2.56]
+    #    50 s  -> [1.96, 2.07, 1.88, 1.25, 2.15, 2.37]   (up to 2x higher)
+    # The 5 s numbers let joint5 reach 31.5 Nm on a 30 Nm joint at t=50 s.
+    # These are the 50 s values x1.5, because the full run is 300 s and the
+    # peak was still rising at the end of the 50 s one.
+    torque_gain: [2.94, 3.10, 2.82, 1.87, 3.22, 3.55]
+
+    # Gaussian sigma as a fraction of that excursion bound, so the draws
+    # rescale automatically if the gains or budget change. At 0.5 the bound
+    # is 2 sigma: most draws land inside, and the ones that clip at the
+    # boundary give useful step excitation.
+    sigma_frac: 0.5
+    hold_ms_min: 5.0
+    hold_ms_max: 400.0
+    seed: 0
+    # The noise phase overrides the global target rate: the paper resamples
+    # as fast as every 5 ms, which 50 Hz targets cannot represent. 200 Hz
+    # makes a 5 ms hold exact. Set to null to use uan.target_update_hz.
+    target_update_hz: 200.0
+    # Consecutive noise draws can be far apart. This caps how fast the
+    # commanded target may slew toward a new draw, in rad/s, so it means the
+    # same thing at any target_update_hz. Set to null to send raw draws
+    # (paper-faithful, much harsher). Applies to the noise phase only --
+    # square-wave edges are never rate limited, because the step IS the
+    # excitation. This slew limit is extra mechanical margin for noise only.
+    #
+    # NB: a log will appear to exceed these. The plan ticks at 200 Hz (5 ms)
+    # while rows are logged at 250 Hz (4 ms), so a single 0.04 rad plan step
+    # measured across one 4 ms log interval reads as 10 rad/s. That is
+    # aliasing between the two rates, not a limiter fault.
+    # Was [8, 6, 6, 8, 8, 10]. The arm's own rated speed is pi rad/s and it
+    # measured 3.35-3.94 rad/s peaks, so anything past ~4 only made the
+    # target run away from an arm that could never follow it -- visible as
+    # needlessly violent motion for no extra excitation. 4.0 keeps the step
+    # character (the arm still cannot quite track it) without the overshoot.
+    max_target_speed: [4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
+    transition_s: 1.0

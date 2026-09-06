@@ -69,7 +69,7 @@ arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
 # session -- data collected under different gains describes a different
 # plant, and the UAN will close the wrong gap.
 arm_kps_runtime: [2.5, 4.5, 2.5, 2.5, 2.5, 2.5]
-arm_kds_runtime: [234.375, 312.5, 234.375, 234.75, 234.375, 234.375]
+arm_kds_runtime: [234.375, 312.5, 234.375, 234.375, 234.375, 234.375]
 
 # Gripper firmware position servo. The collector always holds the gripper
 # through the firmware position loop (never the DCMotor torque path), so

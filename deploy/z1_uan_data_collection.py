@@ -1,75 +1,67 @@
 """
 Z1 hardware data collection for an Unsupervised Actuator Net (UAN).
 
-Step 1 of reproducing "Bridging the Sim-to-Real Gap for Athletic
-Loco-Manipulation" (arXiv:2502.10894) on this robot: drive the real Z1 with
-excitation signals that cover the state space, and log the transitions
-{(s_t, tau_t, s_t+1)} the UAN is trained against.
+This version keeps the proven-safe position-PD collection path and recollects
+all data with three complementary excitation families:
 
-WHAT IS COMMANDED
------------------
-Exactly the paper's three action sequences (Section II-A.2):
+    square_sine          original one-joint-at-a-time identification sweep
+    noise                original all-joint Gaussian excitation
+    multi_pose_coupled   NEW conservative multi-center, multi-joint data:
+                         correlated local random motion plus pair chirps
 
-    square waves   one joint at a time, the other five held at home,
-                   12 amplitude x frequency combinations, ~50 s per joint
-    sine waves     same sweep, same 12 combinations, ~50 s per joint
-    gaussian noise all six joints simultaneously, each joint redrawing its
-                   target after its own uniform 5-400 ms hold, ~5 min
+The goal is broader actuator coverage without replaying a WBC and without
+making the arm substantially more aggressive.  The new phase deliberately
+uses small local excursions, explicit target-slew limits, slow cosine moves
+between operating points, and a settle/preflight check before exciting each
+new center.
+
+Default useful-data duration is about 25 minutes:
+    square_sine        ~12.5 min
+    noise               ~5.0 min
+    multi_pose_coupled  ~7.5 min
 
 ACTUATION
 ---------
-The collector uses only the deployed Z1 position-PD path:
+Only the deployed Z1 firmware position-PD path is used:
 
-    position_pd   The Z1 firmware closes the position loop with
-                  arm_kps_runtime / arm_kds_runtime and tau_f = 0. The
-                  script sends q_des at the collection loop rate. The log
-                  carries q_des plus the firmware gains; a replaying sim
-                  uses its own physical PD gains, e.g.
-                      tau = Kp_sim * (q_des - q) - Kd_sim * qd,
-                  and the UAN learns the remaining sim-to-real residual.
+    q_des -> firmware position-PD -> real Z1
+
+arm_kps_runtime / arm_kds_runtime are fixed to the deployment gains and
+tau_f = 0.  The UAN is trained later by replaying q_des in simulation and
+matching the resulting simulated trajectory to the recorded real trajectory.
+
+TIMING
+------
+    command/send + safety: 500 Hz
+    state logging:         250 Hz
+    square/sine targets:    50 Hz
+    Gaussian-noise targets: 200 Hz
+    multi-pose targets:     50 Hz
 
 OUTPUT
 ------
     <output_root>/<timestamp>/metadata.json
-    <output_root>/<timestamp>/square_sine_log.pkl
-    <output_root>/<timestamp>/noise_log.pkl
-    <output_root>/<timestamp>/*.npz                 (same data, convenient)
+    <output_root>/<timestamp>/square_sine_log.pkl/.npz
+    <output_root>/<timestamp>/noise_log.pkl/.npz
+    <output_root>/<timestamp>/multi_pose_coupled_log.pkl/.npz
 
-The .pkl files use the schema that athletic-loco-manipulation's
-omniisaacgymenvs.utils.utils.load_hardware_data() reads, with the same file
-names it expects, so they can be pointed at directly:
+Every .pkl uses the same arm_pd_tau_targets / arm_control_data / uan_meta
+schema as the previous collector.  Column 6 remains the gripper.
 
-    data['arm_pd_tau_targets'] : q_des (N,6), gripperQ_des (N,), kp (N,7),
-                                 kd (N,7), timestamp (N,) microseconds
-    data['arm_control_data']   : q (N,7), qd (N,7), tau_est (N,7),
-                                 timestamp (N,) microseconds
-    data['uan_meta']           : PD gains, segment table, config echo
+SETUP ASSUMED
+-------------
+    - standalone Z1 on a fixed, level, world-aligned stand
+    - empty gripper, held fixed
+    - clear workspace for every configured center and trajectory
+    - operator ready to stop the arm if the Z1 enters PASSIVE
 
-Column 6 of the arm_control_data arrays is the gripper, matching the 7-DOF
-layout that loader assumes.
-
-SETUP THIS SCRIPT ASSUMES
--------------------------
-    - Z1 on a fixed stand, base LEVEL and world-aligned. The replaying sim
-      must fix the arm base at identity orientation to match the gravity
-      direction seen here.
-    - Nothing in the gripper; it is held at a constant position target
-      through the firmware servo and is never excited.
-    - A clear workspace. The sweep is large and fast.
-
-Run (from the repository root):
-
-    # inspect the whole plan, touch no hardware
+Run:
     python3 deploy/z1_uan_data_collection.py --dry-run
-
-    # collect
     python3 deploy/z1_uan_data_collection.py
+    python3 deploy/z1_uan_data_collection.py --phases multi_pose_coupled
 
-    # one phase only
-    python3 deploy/z1_uan_data_collection.py --phases noise
-
-Ctrl+C at any time ramps the arm back to home under firmware gains and
-saves everything recorded so far.
+Ctrl+C or any safety trip saves completed/partial data and attempts a safe
+return to home only if the arm is still in LOWCMD.
 """
 
 from __future__ import annotations
@@ -132,6 +124,7 @@ class Segment:
     frequency_hz: float            # 0 for noise and transitions
     num_ticks: int                 # length in target-update ticks
     start_tick: int = 0
+    meta: Dict = field(default_factory=dict)
 
     def as_dict(self) -> Dict:
         return {
@@ -142,6 +135,7 @@ class Segment:
             "frequency_hz": float(self.frequency_hz),
             "start_tick": int(self.start_tick),
             "num_ticks": int(self.num_ticks),
+            "meta": dict(self.meta),
         }
 
 
@@ -184,6 +178,7 @@ class PlanBuilder:
         self.global_target_hz = float(u["target_update_hz"])
         self.ss = u["square_sine"]
         self.noise = u["noise"]
+        self.multi = u["multi_pose_coupled"]
 
         if np.any(self.q_min >= self.q_max):
             raise ValueError("uan.q_min must be strictly below uan.q_max.")
@@ -204,6 +199,50 @@ class PlanBuilder:
             )
         if np.any(self.home < self.q_min) or np.any(self.home > self.q_max):
             raise ValueError("uan.home_q is outside the soft box uan.q_min/q_max.")
+
+        self.multi_centers = np.asarray(
+            self.multi["centers"], dtype=np.float64
+        ).reshape(-1, NUM_ARM_JOINTS)
+        self.multi_amp = np.asarray(
+            self.multi["local_amplitude"], dtype=np.float64
+        ).reshape(NUM_ARM_JOINTS)
+        if self.multi_centers.shape[0] < 2:
+            raise ValueError("multi_pose_coupled.centers must contain at least 2 poses.")
+        if np.any(self.multi_amp <= 0.0):
+            raise ValueError("multi_pose_coupled.local_amplitude must be > 0.")
+        # Require the entire local random/chirp box to remain inside the soft
+        # target box.  This avoids silently clipping a center-specific plan.
+        lo = self.multi_centers - self.multi_amp[None, :]
+        hi = self.multi_centers + self.multi_amp[None, :]
+        bad = np.argwhere((lo < self.q_min[None, :]) | (hi > self.q_max[None, :]))
+        if bad.size:
+            ci, ji = map(int, bad[0])
+            raise ValueError(
+                "multi_pose_coupled center/local amplitude leaves the soft box: "
+                f"center {ci}, joint{ji+1}, center={self.multi_centers[ci, ji]:+.3f}, "
+                f"amp={self.multi_amp[ji]:.3f}, allowed "
+                f"[{self.q_min[ji]:+.3f}, {self.q_max[ji]:+.3f}]"
+            )
+
+        chirp_amp = np.asarray(
+            self.multi["chirp_amplitude"], dtype=np.float64
+        ).reshape(NUM_ARM_JOINTS)
+        if np.any(chirp_amp > self.multi_amp + 1.0e-12):
+            raise ValueError(
+                "multi_pose_coupled.chirp_amplitude must not exceed "
+                "local_amplitude on any joint."
+            )
+
+        groups = self.multi["coupled_groups"]
+        for gi, group in enumerate(groups):
+            group = [int(j) for j in group]
+            if len(group) not in (2, 3) or len(set(group)) != len(group):
+                raise ValueError(
+                    f"multi_pose_coupled.coupled_groups[{gi}] must contain "
+                    "2 or 3 distinct joints."
+                )
+            if min(group) < 0 or max(group) >= NUM_ARM_JOINTS:
+                raise ValueError(f"Invalid joint index in coupled group {group}.")
 
     # -- amplitude resolution ------------------------------------------
 
@@ -362,6 +401,322 @@ class PlanBuilder:
         targets = np.clip(np.concatenate(blocks, axis=0), self.q_min, self.q_max)
         return Plan(
             phase="square_sine",
+            target_update_hz=hz,
+            targets=targets,
+            seg_ids=np.concatenate(seg_ids, axis=0),
+            segments=segments,
+        )
+
+
+    # -- conservative multi-pose / coupled excitation ------------------
+
+    def _center_transition(
+        self, a: np.ndarray, b: np.ndarray, hz: float
+    ) -> np.ndarray:
+        """Cosine center-to-center move with an explicit peak-speed bound."""
+        a = np.asarray(a, dtype=np.float64).reshape(NUM_ARM_JOINTS)
+        b = np.asarray(b, dtype=np.float64).reshape(NUM_ARM_JOINTS)
+        dmax = float(np.max(np.abs(b - a)))
+        if dmax < 1.0e-12:
+            return np.zeros((0, NUM_ARM_JOINTS), dtype=np.float64)
+
+        min_s = float(self.multi["center_transition_min_s"])
+        vmax = float(self.multi["center_transition_max_speed"])
+        if vmax <= 0.0:
+            raise ValueError("center_transition_max_speed must be > 0.")
+
+        # For q=a+(b-a)*0.5*(1-cos(pi*t/T)), peak speed is
+        # |b-a|*pi/(2T).  Pick T so even the largest joint stays below vmax.
+        duration_s = max(min_s, np.pi * dmax / (2.0 * vmax))
+        n = max(1, int(np.ceil(duration_s * hz)))
+        block = _cosine_blend(a, b, n)
+
+        qd_cmd = np.abs(np.diff(np.vstack((a[None, :], block)), axis=0)) * hz
+        if qd_cmd.size and float(qd_cmd.max()) > vmax * 1.02:
+            raise RuntimeError(
+                f"internal center-transition speed audit failed: "
+                f"{qd_cmd.max():.3f} > {vmax:.3f} rad/s"
+            )
+        return block
+
+    def _coupled_random_block(
+        self, center: np.ndarray, center_idx: int, hz: float
+    ) -> np.ndarray:
+        """Small, rate-limited, correlated 2/3-joint random excitation."""
+        m = self.multi
+        duration_s = float(m["coupled_random_duration_s"])
+        n = max(1, int(round(duration_s * hz)))
+        return_s = float(m.get("return_to_center_s", 2.0))
+        n_return = min(n - 1, max(1, int(round(return_s * hz))))
+        n_random = n - n_return
+        dt = 1.0 / hz
+
+        amp = np.asarray(m["local_amplitude"], dtype=np.float64).reshape(6)
+        speed = np.asarray(m["max_target_speed"], dtype=np.float64).reshape(6)
+        corr = float(m.get("correlation", 0.7))
+        corr = float(np.clip(corr, 0.0, 0.999))
+        groups = [[int(j) for j in g] for g in m["coupled_groups"]]
+
+        hold_min_ticks = max(
+            1, int(np.ceil(float(m["hold_ms_min"]) * 1.0e-3 * hz))
+        )
+        hold_max_ticks = max(
+            hold_min_ticks,
+            int(np.ceil(float(m["hold_ms_max"]) * 1.0e-3 * hz)),
+        )
+
+        rng = np.random.default_rng(int(m["seed"]) + 1009 * int(center_idx))
+        block = np.zeros((n, NUM_ARM_JOINTS), dtype=np.float64)
+        emitted = center.copy()
+        held = center.copy()
+        next_event = 0
+
+        for i in range(n_random):
+            if i >= next_event:
+                # Random group, but each event excites exactly 2 or 3 joints.
+                group = groups[int(rng.integers(0, len(groups)))]
+                held = center.copy()
+
+                common = float(rng.normal())
+                independent = rng.normal(size=len(group))
+                x = corr * common + np.sqrt(1.0 - corr * corr) * independent
+                # tanh keeps a smooth bounded distribution instead of hard
+                # clipping a Gaussian at the local-amplitude limit.
+                x = np.tanh(x)
+                held[group] += amp[group] * x
+                held = np.clip(held, self.q_min, self.q_max)
+
+                next_event = i + int(
+                    rng.integers(hold_min_ticks, hold_max_ticks + 1)
+                )
+
+            emitted = emitted + np.clip(
+                held - emitted,
+                -speed * dt,
+                speed * dt,
+            )
+            block[i] = emitted
+
+        # Always finish exactly at the center.  This guarantees the next chirp
+        # begins from a known, quiet target without an abrupt step.
+        block[n_random:] = _cosine_blend(emitted, center, n_return)
+
+        qd_cmd = np.abs(np.diff(np.vstack((center[None, :], block)), axis=0)) * hz
+        if qd_cmd.size and np.any(qd_cmd.max(axis=0) > speed * 1.02):
+            raise RuntimeError(
+                "internal coupled-random speed audit failed: "
+                f"peak={np.round(qd_cmd.max(axis=0), 3)}, "
+                f"limit={np.round(speed, 3)}"
+            )
+        return block
+
+    def _pair_chirp_block(
+        self,
+        center: np.ndarray,
+        pair: Sequence[int],
+        phase_offset_deg: float,
+        hz: float,
+    ) -> np.ndarray:
+        """Two-joint linear chirp with a smooth amplitude envelope."""
+        m = self.multi
+        pair = [int(j) for j in pair]
+        if len(pair) != 2 or pair[0] == pair[1]:
+            raise ValueError(f"chirp pair must contain 2 distinct joints: {pair}")
+
+        duration_s = float(m["chirp_duration_s"])
+        n = max(2, int(round(duration_s * hz)))
+        t = np.arange(n, dtype=np.float64) / hz
+        f0 = float(m["chirp_f_start_hz"])
+        f1 = float(m["chirp_f_end_hz"])
+        k = (f1 - f0) / max(duration_s, 1.0e-9)
+        theta = 2.0 * np.pi * (f0 * t + 0.5 * k * t * t)
+
+        ramp_s = float(m.get("chirp_ramp_s", 1.5))
+        ramp_n = max(1, min(n // 2, int(round(ramp_s * hz))))
+        env = np.ones(n, dtype=np.float64)
+        ramp_x = np.linspace(0.0, 1.0, ramp_n, dtype=np.float64)
+        ramp = 0.5 * (1.0 - np.cos(np.pi * ramp_x))
+        env[:ramp_n] = ramp
+        env[-ramp_n:] = ramp[::-1]
+
+        amp = np.asarray(m["chirp_amplitude"], dtype=np.float64).reshape(6)
+        block = np.repeat(center[None, :], n, axis=0)
+        block[:, pair[0]] += amp[pair[0]] * env * np.sin(theta)
+        block[:, pair[1]] += amp[pair[1]] * env * np.sin(
+            theta + np.deg2rad(float(phase_offset_deg))
+        )
+        block = np.clip(block, self.q_min, self.q_max)
+
+        peak_limit = float(m["chirp_max_target_speed"])
+        qd_cmd = np.abs(np.diff(np.vstack((center[None, :], block)), axis=0)) * hz
+        peak = float(qd_cmd.max()) if qd_cmd.size else 0.0
+        if peak > peak_limit * 1.02:
+            raise ValueError(
+                f"chirp target-speed {peak:.3f} rad/s exceeds configured "
+                f"chirp_max_target_speed={peak_limit:.3f}; lower amplitude/frequency."
+            )
+
+        # Numerical endpoint is forced exactly to center so there is no
+        # discontinuity into the next segment.
+        block[-1] = center
+        return block
+
+    def build_multi_pose_coupled(self) -> Plan:
+        """Build the conservative ~7.5 min coverage-extension phase."""
+        m = self.multi
+        hz = float(m.get("target_update_hz") or self.global_target_hz)
+        settle_n = max(1, int(round(float(m["settle_s"]) * hz)))
+
+        blocks: List[np.ndarray] = []
+        segments: List[Segment] = []
+        seg_ids: List[np.ndarray] = []
+        cursor = 0
+        prev_target = self.home.copy()
+
+        def push(block: np.ndarray, seg: Segment) -> None:
+            nonlocal cursor, prev_target
+            if block.shape[0] == 0:
+                return
+            seg.start_tick = cursor
+            seg.num_ticks = int(block.shape[0])
+            blocks.append(block)
+            seg_ids.append(np.full(block.shape[0], len(segments), dtype=np.int32))
+            segments.append(seg)
+            cursor += block.shape[0]
+            prev_target = block[-1].copy()
+
+        pairs = [[int(j) for j in p] for p in m["chirp_pairs"]]
+        phase_table = m["chirp_phase_offsets_deg"]
+        if len(phase_table) != len(self.multi_centers):
+            raise ValueError(
+                "chirp_phase_offsets_deg must have one row per excitation center."
+            )
+
+        for ci, center in enumerate(self.multi_centers):
+            transition = self._center_transition(prev_target, center, hz)
+            push(
+                transition,
+                Segment(
+                    name=f"transition->center{ci}",
+                    kind="center_transition",
+                    joint=-1,
+                    amplitude=0.0,
+                    frequency_hz=0.0,
+                    num_ticks=transition.shape[0],
+                    meta={"center_id": ci, "center": center.tolist()},
+                ),
+            )
+
+            settle = np.repeat(center[None, :], settle_n, axis=0)
+            push(
+                settle,
+                Segment(
+                    name=f"center{ci}_settle",
+                    kind="settle_center",
+                    joint=-1,
+                    amplitude=0.0,
+                    frequency_hz=0.0,
+                    num_ticks=settle_n,
+                    meta={"center_id": ci, "center": center.tolist()},
+                ),
+            )
+
+            random_block = self._coupled_random_block(center, ci, hz)
+            push(
+                random_block,
+                Segment(
+                    name=f"center{ci}_coupled_random",
+                    kind="coupled_random",
+                    joint=-1,
+                    amplitude=float(np.max(self.multi_amp)),
+                    frequency_hz=0.0,
+                    num_ticks=random_block.shape[0],
+                    meta={
+                        "center_id": ci,
+                        "center": center.tolist(),
+                        "groups": m["coupled_groups"],
+                    },
+                ),
+            )
+
+            offsets = phase_table[ci]
+            if len(offsets) != len(pairs):
+                raise ValueError(
+                    f"chirp_phase_offsets_deg[{ci}] must have {len(pairs)} values."
+                )
+            for pi, pair in enumerate(pairs):
+                chirp = self._pair_chirp_block(
+                    center=center,
+                    pair=pair,
+                    phase_offset_deg=float(offsets[pi]),
+                    hz=hz,
+                )
+                push(
+                    chirp,
+                    Segment(
+                        name=(
+                            f"center{ci}_chirp_j{pair[0]+1}_j{pair[1]+1}"
+                            f"_phase{float(offsets[pi]):g}"
+                        ),
+                        kind="pair_chirp",
+                        joint=-1,
+                        amplitude=float(
+                            max(
+                                np.asarray(m["chirp_amplitude"])[pair[0]],
+                                np.asarray(m["chirp_amplitude"])[pair[1]],
+                            )
+                        ),
+                        frequency_hz=float(m["chirp_f_end_hz"]),
+                        num_ticks=chirp.shape[0],
+                        meta={
+                            "center_id": ci,
+                            "center": center.tolist(),
+                            "joints": pair,
+                            "phase_offset_deg": float(offsets[pi]),
+                            "f_start_hz": float(m["chirp_f_start_hz"]),
+                            "f_end_hz": float(m["chirp_f_end_hz"]),
+                        },
+                    ),
+                )
+
+            # Return through HOME between non-home centers.  This deliberately
+            # avoids one large direct move from the +J6 WBC-like center to the
+            # negative-J6 center.
+            if not np.allclose(center, self.home, atol=1.0e-12):
+                transition = self._center_transition(prev_target, self.home, hz)
+                push(
+                    transition,
+                    Segment(
+                        name=f"center{ci}->home",
+                        kind="center_transition",
+                        joint=-1,
+                        amplitude=0.0,
+                        frequency_hz=0.0,
+                        num_ticks=transition.shape[0],
+                        meta={"center_id": ci, "center": center.tolist()},
+                    ),
+                )
+
+        if not np.allclose(prev_target, self.home, atol=1.0e-9):
+            transition = self._center_transition(prev_target, self.home, hz)
+            push(
+                transition,
+                Segment(
+                    name="transition->home",
+                    kind="center_transition",
+                    joint=-1,
+                    amplitude=0.0,
+                    frequency_hz=0.0,
+                    num_ticks=transition.shape[0],
+                ),
+            )
+
+        targets = np.concatenate(blocks, axis=0)
+        if np.any(targets < self.q_min) or np.any(targets > self.q_max):
+            raise RuntimeError("multi_pose_coupled plan escaped the soft target box.")
+
+        return Plan(
+            phase="multi_pose_coupled",
             target_update_hz=hz,
             targets=targets,
             seg_ids=np.concatenate(seg_ids, axis=0),
@@ -574,6 +929,7 @@ class Z1UANDataCollector:
         self.liveness_min_distinct = int(self.safety["liveness_min_distinct"])
         self.home_tolerance = float(self.u["home_tolerance"])
         self.home_move_max_speed = float(self.u["home_move_max_speed"])
+        self.inter_phase_rest_s = float(self.u.get("inter_phase_rest_s", 0.0))
         self.max_abs_qd = float(self.safety["max_abs_qd"])
         self.max_abs_qd_hard = float(self.safety["max_abs_qd_hard"])
         self.qd_hold_steps = int(
@@ -601,10 +957,15 @@ class Z1UANDataCollector:
             round(float(self.safety["tracking_error_hold_s"]) * self.loop_hz)
         )
 
-        self.phases: List[str] = list(cli.phases or ["square_sine", "noise"])
+        self.phases: List[str] = list(
+            cli.phases or ["square_sine", "noise", "multi_pose_coupled"]
+        )
+        valid_phases = ("square_sine", "noise", "multi_pose_coupled")
         for p in self.phases:
-            if p not in ("square_sine", "noise"):
-                raise ValueError(f"Unknown phase {p!r}.")
+            if p not in valid_phases:
+                raise ValueError(
+                    f"Unknown phase {p!r}; expected one of {valid_phases}."
+                )
 
         self.builder = PlanBuilder(self.cfg)
         self.plans: Dict[str, Plan] = {}
@@ -612,6 +973,10 @@ class Z1UANDataCollector:
             self.plans["square_sine"] = self.builder.build_square_sine()
         if "noise" in self.phases:
             self.plans["noise"] = self.builder.build_noise()
+        if "multi_pose_coupled" in self.phases:
+            self.plans["multi_pose_coupled"] = (
+                self.builder.build_multi_pose_coupled()
+            )
 
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.session_dir = os.path.join(
@@ -671,7 +1036,7 @@ class Z1UANDataCollector:
             )
             if name == "square_sine":
                 self._print_square_sine_table(plan)
-            else:
+            elif name == "noise":
                 exc = getattr(self.builder, "noise_excursion", None)
                 if exc is not None:
                     kp = np.asarray(self.builder.ss["kp_effective"])
@@ -685,6 +1050,33 @@ class Z1UANDataCollector:
                         f"{np.round(kp * exc * g, 1)} Nm "
                         f"(rated {np.round(self.rated_torque, 0)})"
                     )
+            elif name == "multi_pose_coupled":
+                m = self.builder.multi
+                print(
+                    f"  centers ({len(self.builder.multi_centers)}): "
+                    + "; ".join(
+                        np.array2string(c, precision=2)
+                        for c in self.builder.multi_centers
+                    )
+                )
+                print(
+                    "  local amplitude: "
+                    f"{np.round(np.asarray(m['local_amplitude']), 3)} rad"
+                )
+                print(
+                    "  coupled target slew <= "
+                    f"{np.round(np.asarray(m['max_target_speed']), 2)} rad/s"
+                )
+                print(
+                    "  pair chirp: "
+                    f"{m['chirp_f_start_hz']}-{m['chirp_f_end_hz']} Hz, "
+                    f"{m['chirp_duration_s']} s/pair, "
+                    f"target slew <= {m['chirp_max_target_speed']} rad/s"
+                )
+                print(
+                    "  center move: cosine, peak target speed <= "
+                    f"{m['center_transition_max_speed']} rad/s"
+                )
             total += plan.duration_s
 
         print("-" * 78)
@@ -1054,6 +1446,55 @@ class Z1UANDataCollector:
         else:
             self._track_err_streak = 0
 
+    def _check_center_settle_preflight(
+        self, plan: Plan, tick: int, q_des: np.ndarray
+    ) -> None:
+        """Before exciting a new center, prove the real arm can hold it quietly.
+
+        This is intentionally stricter than the generic safety thresholds.
+        A configuration that already needs large torque or cannot settle under
+        the deployment gains is not a good place to start a coupled excitation.
+        """
+        if plan.phase != "multi_pose_coupled":
+            return
+        seg = plan.segments[int(plan.seg_ids[tick])]
+        if seg.kind != "settle_center":
+            return
+
+        m = self.u["multi_pose_coupled"]
+        elapsed = (tick - seg.start_tick) / plan.target_update_hz
+        if elapsed < float(m.get("settle_check_after_s", 1.0)):
+            return
+
+        assert self.z1 is not None
+        q = self.z1.q.astype(np.float64)
+        qd = self.z1.qd.astype(np.float64)
+        tau = self.z1.tau.astype(np.float64)
+
+        max_err = float(np.max(np.abs(np.asarray(q_des) - q)))
+        max_qd = float(np.max(np.abs(qd)))
+        tau_frac = np.abs(tau) / np.maximum(self.rated_torque, 1.0e-9)
+
+        if max_err > float(m["settle_max_tracking_error"]):
+            raise SafetyAbort(
+                f"center preflight failed: tracking error {max_err:.3f} rad "
+                f"> {m['settle_max_tracking_error']} rad at {seg.name}. "
+                "Do not excite this operating point."
+            )
+        if max_qd > float(m["settle_max_abs_qd"]):
+            raise SafetyAbort(
+                f"center preflight failed: |qd|={max_qd:.3f} rad/s "
+                f"> {m['settle_max_abs_qd']} at {seg.name}."
+            )
+        if np.any(tau_frac > float(m["settle_max_rated_torque_fraction"])):
+            j = int(np.argmax(tau_frac))
+            raise SafetyAbort(
+                f"center preflight failed: joint{j+1} static/load torque "
+                f"{tau[j]:+.1f} Nm is {tau_frac[j]*100:.0f}% of rating, above "
+                f"the configured {100*float(m['settle_max_rated_torque_fraction']):.0f}% "
+                "limit. Remove or modify this center instead of exciting it."
+            )
+
     # -- the collection loop --------------------------------------------
 
     def run_phase(self, plan: Plan):
@@ -1130,6 +1571,7 @@ class Z1UANDataCollector:
             # Always at the command rate, never decimated: a fault must be
             # caught on the step it happens, not on the next logged one.
             self._check_safety(q_des)
+            self._check_center_settle_preflight(plan, tick, q_des)
 
             if t >= next_report:
                 seg = plan.segments[int(plan.seg_ids[tick])]
@@ -1241,7 +1683,14 @@ class Z1UANDataCollector:
     def _save_phase(self, plan: Plan, rec: Recorder) -> str:
         out_dir = self.session_dir
         os.makedirs(out_dir, exist_ok=True)
-        stem = "square_sine_log" if plan.phase == "square_sine" else "noise_log"
+        stem_map = {
+            "square_sine": "square_sine_log",
+            "noise": "noise_log",
+            "multi_pose_coupled": "multi_pose_coupled_log",
+        }
+        if plan.phase not in stem_map:
+            raise ValueError(f"No output stem configured for phase {plan.phase!r}.")
+        stem = stem_map[plan.phase]
 
         assert self.z1 is not None
         n = rec.n
@@ -1355,6 +1804,22 @@ class Z1UANDataCollector:
             json.dump(meta, f, indent=2, default=str)
         print(f"[UAN] wrote {path}")
 
+    def _rest_at_home(self, duration_s: float) -> None:
+        """Unlogged low-load hold between long phases to reduce passive-mode risk."""
+        if duration_s <= 0.0:
+            return
+        assert self.z1 is not None
+        print(
+            f"[UAN] inter-phase cooldown: holding home for {duration_s:.1f}s "
+            "(not logged)"
+        )
+        n = max(1, int(round(duration_s * self.loop_hz)))
+        t0 = time.perf_counter()
+        for i in range(n):
+            self._send_step(self.home)
+            self._check_safety(self.home)
+            _sleep_until(t0 + (i + 1) * self.loop_dt)
+
     # -- top level -------------------------------------------------------
 
     def run(self) -> None:
@@ -1380,7 +1845,7 @@ class Z1UANDataCollector:
         try:
             self._move_to_home()
             self._engage()
-            for phase in self.phases:
+            for phase_index, phase in enumerate(self.phases):
                 plan = self.plans[phase]
                 rec, aborted = self.run_phase(plan)
                 results[phase] = {
@@ -1391,6 +1856,8 @@ class Z1UANDataCollector:
                 }
                 if aborted is not None:
                     raise aborted
+                if phase_index + 1 < len(self.phases):
+                    self._rest_at_home(self.inter_phase_rest_s)
             self._disengage()
             self._move_to_home()
 
@@ -1493,7 +1960,7 @@ def main() -> None:
         nargs="+",
         default=None,
         metavar="PHASE",
-        help="Override the phases to run: square_sine and/or noise.",
+        help="Override phases: square_sine, noise, and/or multi_pose_coupled.",
     )
     parser.add_argument(
         "-y",

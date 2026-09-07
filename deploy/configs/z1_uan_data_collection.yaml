@@ -1,35 +1,36 @@
 # =====================================================================
-# Z1 Unsupervised Actuator Net (UAN) hardware data collection.
+# Z1 Unsupervised Actuator Net (UAN) hardware data collection -- coverage v2.
 #
-# Companion config for deploy/z1_uan_data_collection.py.
+# This version recollects the whole dataset (~25 min usable motion) while
+# keeping the already-proven firmware position-PD path and safety logic.
 #
-# Method reference:
-#   "Bridging the Sim-to-Real Gap for Athletic Loco-Manipulation"
-#   (arXiv:2502.10894), Section II-A.2 "Data collection":
+# Data mix:
+#   1) square_sine         ~12.5 min, original one-joint-at-a-time sweep
+#   2) noise                ~5.0 min, original all-joint Gaussian phase
+#   3) multi_pose_coupled   ~7.5 min, NEW conservative coverage extension
 #
-#     "we opted not to use policy data, and instead, collected data with
-#      three types of action sequences: 1) square waves, 2) sine waves,
-#      and 3) gaussian noise. For the square and sine wave data, we passed
-#      torque commands to one actuator at a time, while keeping the rest of
-#      the actuators at a fixed position target. We swept 12 different
-#      combinations of amplitude and frequency for each wave, resulting in
-#      about 50 seconds of data for each actuator. For the gaussian noise
-#      data, we passed torque commands to all the robot's joints
-#      simultaneously. We sampled a new action from a gaussian distribution
-#      every 5 to 400 ms for about 5 minutes."
+# The new phase is NOT WBC replay. It broadens the operating region using:
+#   - 3 safe excitation centers
+#   - correlated 2/3-joint local random motion
+#   - pair chirps on J2/J3 and J3/J4
 #
-# SETUP ASSUMED BY THESE DEFAULTS
-#   - Z1 detached from the B2W, bolted to a fixed stand, base LEVEL and
-#     world-aligned (gravity = -z in the arm base frame).  The replaying
-#     simulation must fix the arm base at identity orientation to match.
-#   - Nothing in the gripper. The gripper is held at a constant position
-#     target for the whole session and is NOT excited.
-#   - Clear workspace: the arm sweeps large amplitudes at speed.
+# Passive-mode risk is controlled by:
+#   - small local amplitudes
+#   - explicit target-slew limits
+#   - slow cosine center transitions
+#   - 2 s settle/preflight at every center
+#   - 10 s unlogged cooldown between long phases
+#   - unchanged instantaneous rated-torque / FSM / stale-state safety aborts
 #
-# The collector uses only the deployed Z1 firmware position-PD path and
-# writes one position_pd subdirectory per timestamped session.
+# Setup:
+#   - standalone Z1, bolted down, base LEVEL/world-aligned
+#   - empty gripper, held fixed
+#   - verify every configured center is collision-free in your physical setup
+#
+# Runtime gains remain exactly the deployment gains. Do NOT randomize them:
+# the UAN actor does not observe Kp/Kd, so mixing gains would create an
+# ambiguous actuator mapping.
 # =====================================================================
-
 
 # ---------------------------------------------------------------------
 # Z1 SDK / Z1ArmAdapter construction
@@ -99,7 +100,7 @@ z1_debug_print: false
 uan:
 
   # One subdirectory per timestamped session.
-  output_root: "Log/z1_uan"
+  output_root: "Log/z1_uan_v2"
 
   # Actuation is fixed: the Z1 firmware closes the position loop with
   # arm_kps_runtime / arm_kds_runtime and tau_f = 0. This matches the deployed
@@ -123,6 +124,11 @@ uan:
   # widens the excitation bandwidth; the replaying sim sees exactly the
   # logged per-step q_des either way.
   target_update_hz: 50.0
+
+  # Unlogged home hold between the three long phases. This is deliberately
+  # outside the dataset: it gives the hardware/controller a short low-load
+  # cooldown without adding another pile of near-zero-velocity samples.
+  inter_phase_rest_s: 10.0
 
   # Excitation center. Chosen mid-range so every joint has room to swing.
   home_q: [0.0, 1.5, -1.5, -0.2, 0.0, 0.0]
@@ -371,3 +377,104 @@ uan:
     # character (the arm still cannot quite track it) without the overshoot.
     max_target_speed: [4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
     transition_s: 1.0
+
+  # ---- multi-pose coupled coverage ------------------------------------
+  #
+  # NEW phase, ~7.5 min. This is deliberately conservative: the point is to
+  # cover different arm configurations and coupled motion, not to chase the
+  # torque/speed limits.
+  #
+  # At each center:
+  #   2 s settle + strict preflight
+  #   80 s correlated 2/3-joint local random motion
+  #   30 s J2/J3 chirp
+  #   30 s J3/J4 chirp
+  #
+  # Center-to-center moves use a cosine trajectory whose peak target speed is
+  # analytically bounded. Non-home centers return through HOME before moving
+  # to the next one, avoiding one large direct J6 sweep.
+  multi_pose_coupled:
+    target_update_hz: 50.0
+
+    # Center 0: original identification home.
+    # Center 1: WBC-like operating configuration (NOT trajectory replay).
+    # Center 2: moderate alternate pose with opposite wrist/shoulder signs.
+    #
+    # All centers + local_amplitude must remain inside uan.q_min/q_max.
+    centers:
+      - [0.00, 1.50, -1.50, -0.20,  0.00,  0.00]
+      - [0.00, 1.48, -1.00, -0.54,  0.00,  1.57]
+      - [0.45, 1.25, -1.65, -0.45,  0.30, -0.90]
+
+    # Slow operating-point moves. For a cosine blend the builder chooses
+    # duration >= pi*max_joint_distance/(2*speed_limit), so this is a true
+    # peak target-speed bound, not just average speed.
+    center_transition_min_s: 6.0
+    center_transition_max_speed: 0.35   # rad/s
+
+    # Before any excitation at a center, hold still and verify the real arm
+    # can actually support this configuration under the deployment gains.
+    settle_s: 2.0
+    settle_check_after_s: 1.0
+    settle_max_tracking_error: 0.15     # rad
+    settle_max_abs_qd: 0.40             # rad/s
+    settle_max_rated_torque_fraction: 0.70
+
+    # Correlated local random motion.
+    coupled_random_duration_s: 80.0
+
+    # Maximum local excursion around every center, joint1..joint6.
+    # Intentionally much smaller than the original global noise/sweep bounds.
+    local_amplitude: [0.16, 0.10, 0.12, 0.12, 0.14, 0.16]
+
+    # Each random event excites exactly one of these 2/3-joint groups.
+    # Zero-based joint indices:
+    #   [1,2]   = J2/J3
+    #   [2,3]   = J3/J4
+    #   [0,5]   = J1/J6
+    #   [1,2,3] = J2/J3/J4
+    #   [0,4,5] = J1/J5/J6
+    coupled_groups:
+      - [1, 2]
+      - [2, 3]
+      - [0, 5]
+      - [1, 2, 3]
+      - [0, 4, 5]
+
+    # Shared latent component within each active group. 0 = independent,
+    # 1 = perfectly correlated. tanh-bounded draws prevent hard Gaussian clips.
+    correlation: 0.70
+
+    # 50-Hz target process: 40-140 ms gives 2-7 target ticks per random hold.
+    hold_ms_min: 40.0
+    hold_ms_max: 140.0
+
+    # Explicit q_des slew limits for the new random phase.
+    max_target_speed: [1.20, 1.00, 1.10, 1.10, 1.20, 1.30]  # rad/s
+    return_to_center_s: 2.0
+    seed: 20260907
+
+    # Pair chirps broaden the dynamic bandwidth without a harsh step input.
+    chirp_pairs:
+      - [1, 2]   # J2/J3
+      - [2, 3]   # J3/J4
+
+    chirp_duration_s: 30.0
+    chirp_f_start_hz: 0.20
+    chirp_f_end_hz: 2.00
+    chirp_ramp_s: 1.5
+
+    # Per-joint sinusoid amplitude. Only the joints in the active pair are used.
+    # Kept <= local_amplitude by construction.
+    chirp_amplitude: [0.12, 0.10, 0.12, 0.10, 0.10, 0.12]
+
+    # Hard preflight on generated q_des derivative. If a YAML change makes the
+    # chirp more aggressive than this, --dry-run construction fails.
+    chirp_max_target_speed: 2.0         # rad/s
+
+    # One phase offset per chirp pair, one row per center.
+    # This covers same-direction, opposite-direction and quadrature coupling.
+    chirp_phase_offsets_deg:
+      - [  0.0, 180.0]
+      - [180.0,  90.0]
+      - [ 90.0, -90.0]

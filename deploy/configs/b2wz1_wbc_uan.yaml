@@ -1,0 +1,179 @@
+# B2W + Z1 real-robot deployment for the WBC policy trained with UAN.
+#
+# IMPORTANT:
+#   - UAN is simulation-only. There is intentionally NO uan_model_path here.
+#   - WBC inference: 50 Hz.
+#   - B2W lowcmd + Z1 lowcmd refresh: 500 Hz.
+#   - Arm action: direct JointPositionAction semantics, NO target rate limiter.
+#   - EE command: direct random sample-and-hold only.
+
+policy_path: "exported_policy/b2wz1_wbc_uan_plb/policy_wbc_uan_1.onnx"
+
+# ----------------------------------------------------------------------
+# Timing / policy layout
+# ----------------------------------------------------------------------
+control_hz: 500.0
+policy_hz: 50.0
+max_duration_s: 180.0
+report_period_s: 1.0
+
+startup_hold_s: 1.0
+startup_blend_s: 2.0
+move_to_default_s: 3.0
+z1_runtime_settle_s: 0.5
+
+history_length: 5
+obs_dim_per_step: 80
+obs_dim: 400
+action_dim: 22
+
+base_command: [0.0, 0.0, 0.0]
+
+# Policy-space leg order is the SAME order used by the working MuJoCo sim2sim:
+#   [FL_hip, FR_hip, RL_hip, RR_hip,
+#    FL_thigh, FR_thigh, RL_thigh, RR_thigh,
+#    FL_calf, FR_calf, RL_calf, RR_calf]
+default_leg_pos_policy:
+  [0.10, -0.10, 0.10, -0.10,
+   0.80,  0.80, 1.00,  1.00,
+  -1.50, -1.50, -1.50, -1.50]
+
+# Z1 joint order: [joint1, joint2, joint3, joint4, joint5, joint6]
+default_arm_pos: [0.0, 1.48, -1.0, -0.54, 0.0, 1.57]
+default_gripper_pos: 0.0
+gripper_hold_q: 0.0
+
+leg_action_scale: 0.25
+arm_action_scale: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
+wheel_action_scale: 4.0
+
+# Live Z1 SDK hard range.
+arm_q_lower: [-2.6180, 0.0, -2.8856, -1.5184, -1.3439, -2.7925]
+arm_q_upper: [ 2.6180, 2.8798, 0.0,  1.5184,  1.3439,  2.7925]
+
+# ----------------------------------------------------------------------
+# B2W low-level DDS
+# ----------------------------------------------------------------------
+b2w:
+  # CHANGE THIS to the Ethernet interface connected to B2W.
+  network_interface: "enp3s0"
+  lowcmd_topic: "rt/lowcmd"
+  lowstate_topic: "rt/lowstate"
+  state_timeout_s: 5.0
+  release_motion_service: true
+
+  # SDK motor order is assumed to be:
+  #   0..2 FR, 3..5 FL, 6..8 RR, 9..11 RL,
+  #   12 FR wheel, 13 FL wheel, 14 RR wheel, 15 RL wheel.
+  #
+  # These mappings convert SDK order -> the policy order used above.
+  # Verify once against your existing B2W sim2real motor mapping before enabling motors.
+  policy_leg_motor_indices: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
+  policy_wheel_motor_indices: [13, 12, 15, 14]
+
+  # Training-aligned B2W gains in policy leg order.
+  leg_kp:
+    [200.0, 200.0, 200.0, 200.0,
+     200.0, 200.0, 200.0, 200.0,
+     300.0, 300.0, 300.0, 300.0]
+  leg_kd:
+    [8.0, 8.0, 8.0, 8.0,
+     8.0, 8.0, 8.0, 8.0,
+     12.0, 12.0, 12.0, 12.0]
+
+  wheel_kd: [10.0, 10.0, 10.0, 10.0]
+  wheel_velocity_limits: [50.0, 50.0, 50.0, 50.0]
+
+# ----------------------------------------------------------------------
+# EE command -- direct sample-and-hold only
+# ----------------------------------------------------------------------
+ee_command_path: "utilities/data/keypoints_plb_pickup.npy"
+ee_command_seed: 0
+ee_cycle_duration_s: 8.0
+ee_ground_z: 0.0
+ee_kp_dx: 0.30
+ee_kp_dz: 0.30
+
+# ----------------------------------------------------------------------
+# Z1 SDK / adapter
+# ----------------------------------------------------------------------
+z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"
+z1_has_gripper: true
+z1_fk_ee_index: 5
+
+# Native Z1 lowcmd send period.
+control_dt: 0.002
+z1_control_dt: 0.002
+
+# B2W-mounted arm transform used by the existing Z1 adapter stack.
+arm_base_offset_pos: [0.10, 0.0, 0.12]
+arm_base_offset_rpy: [0.0, 0.0, 0.0]
+z1_fk_to_policy_ee_pos: [0.051, 0.0, 0.0]
+z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
+
+# Adapter default pose must match the WBC policy default arm pose.
+# Keep this identical to default_arm_pos above.
+# Some adapter versions read this exact key.
+# (Do not use the UAN data-collection home pose here.)
+# 
+# YAML aliases are intentionally avoided for compatibility.
+# 
+# joint1..joint6
+#
+# NOTE: the script itself uses default_arm_pos for the WBC.
+#
+# Adapter fields:
+#
+# default_arm_pos is already defined above.
+#
+# Gripper:
+#
+# default_gripper_pos is already defined above.
+
+# Slow supervised startup gains used only for move-to-default.
+arm_kps_startup: [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]
+arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
+
+# ----------------------------------------------------------------------
+# CRITICAL: Z1 runtime firmware gains aligned with WBC-UAN training.
+#
+# Unitree Z1 protocol:
+#   Kp_effective = kp_fw * 25.6
+#   Kd_effective = kd_fw * 0.0128
+#
+# Therefore:
+#   [2.5, 4.5, 2.5, ...] * 25.6
+#       = [64, 115.2, 64, 64, 64, 64]
+#   [234.375, 312.5, 234.375, ...] * 0.0128
+#       = [3, 4, 3, 3, 3, 3]
+# ----------------------------------------------------------------------
+arm_kps_runtime: [2.5, 4.5, 2.5, 2.5, 2.5, 2.5]
+arm_kds_runtime: [234.375, 312.5, 234.375, 234.375, 234.375, 234.375]
+
+z1_kp_protocol_scale: 25.6
+z1_kd_protocol_scale: 0.0128
+
+# Training-space nominal PD; script audits the scaled SDK gains against these.
+arm_kp_training: [64.0, 115.2, 64.0, 64.0, 64.0, 64.0]
+arm_kd_training: [3.0, 4.0, 3.0, 3.0, 3.0, 3.0]
+
+# Real arm uses firmware position-PD; no UAN and no Python residual torque.
+z1_arm_runtime_mode: "position_pd"
+
+# Gripper is not part of the WBC action; hold it at gripper_hold_q.
+z1_gripper_kp: 20.0
+z1_gripper_kd: 2000.0
+z1_gripper_runtime_mode: "dcmotor"
+z1_gripper_q_offset: 0.02367
+z1_gripper_dcmotor_kp: 76.8
+z1_gripper_dcmotor_kd: 4.0
+z1_gripper_dcmotor_effort_limit: 30.0
+z1_gripper_dcmotor_saturation_effort: 30.0
+z1_gripper_dcmotor_velocity_limit: 2.0
+
+# Kept for adapter compatibility even though arm runtime mode is position_pd.
+z1_arm_dcmotor_kp: [64.0, 115.2, 64.0, 64.0, 64.0, 64.0]
+z1_arm_dcmotor_kd: [3.0, 4.0, 3.0, 3.0, 3.0, 3.0]
+z1_arm_dcmotor_effort_limit: [30.0, 60.0, 30.0, 30.0, 30.0, 30.0]
+
+z1_debug_print: false

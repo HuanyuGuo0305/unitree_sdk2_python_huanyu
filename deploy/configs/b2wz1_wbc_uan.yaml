@@ -7,7 +7,7 @@
 #   - Arm action: direct JointPositionAction semantics, NO target rate limiter.
 #   - EE command: direct random sample-and-hold only.
 
-policy_path: "exported_policy/b2wz1_wbc_uan_plb/policy_wbc_uan_1.onnx"
+policy_path: "exported_policy/b2wz1_wbc_uan_plb/policy_wbc_uan_2.onnx"
 
 # ----------------------------------------------------------------------
 # Timing / policy layout

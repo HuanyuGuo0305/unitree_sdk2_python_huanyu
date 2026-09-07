@@ -14,7 +14,11 @@ from cyclonedds.util import duration
 from cyclonedds.internal import dds_c_t, InvalidSample
 
 # for channel config
-from .channel_config import ChannelConfigAutoDetermine, ChannelConfigHasInterface
+from .channel_config import (
+    ChannelConfigAutoDetermine,
+    ChannelConfigHasInterface,
+    ChannelTraceOutputFile,
+)
 
 # for singleton
 from ..utils.singleton import Singleton
@@ -212,7 +216,9 @@ class ChannelFactory(Singleton):
             if networkInterface is None:
                 config = ChannelConfigAutoDetermine
             else:
-                config = ChannelConfigHasInterface.replace('$__IF_NAME__$', networkInterface)
+                config = ChannelConfigHasInterface.replace(
+                    '$__IF_NAME__$', networkInterface
+                ).replace('$__TRACE_FILE__$', ChannelTraceOutputFile)
 
             try:
                 self.__class__.__domain = Domain(id, config)

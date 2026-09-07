@@ -44,6 +44,8 @@ for _p in (_PROJECT_ROOT, _DEPLOY_DIR):
         sys.path.insert(0, _p)
 
 
+from utils.remote_controller import KeyMap, RemoteController
+
 POS_STOP_F = 2.146e9
 VEL_STOP_F = 16000.0
 
@@ -135,11 +137,12 @@ class B2WLowLevel:
     the policy/IsaacLab order.
     """
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, interface: str = None):
         self.cfg = cfg
         b = cfg["b2w"]
 
-        self.interface = str(b["network_interface"])
+        self.interface = str(interface) if interface else str(b["network_interface"])
+        self.remote_controller = RemoteController()
         self.lowcmd_topic = str(b.get("lowcmd_topic", "rt/lowcmd"))
         self.lowstate_topic = str(b.get("lowstate_topic", "rt/lowstate"))
         self.release_motion_service = bool(b.get("release_motion_service", True))
@@ -149,6 +152,16 @@ class B2WLowLevel:
 
         self.leg_kp = np.asarray(b["leg_kp"], dtype=np.float32)
         self.leg_kd = np.asarray(b["leg_kd"], dtype=np.float32)
+
+        # Stiffer gains for the startup ramp and the operator-hold gates: the
+        # training-aligned RL gains are too soft to lift the robot into the
+        # default pose cleanly. Falls back to the RL gains if unset.
+        self.leg_kp_startup = np.asarray(
+            b.get("leg_kp_startup", b["leg_kp"]), dtype=np.float32
+        )
+        self.leg_kd_startup = np.asarray(
+            b.get("leg_kd_startup", b["leg_kd"]), dtype=np.float32
+        )
         self.wheel_kd = np.asarray(b["wheel_kd"], dtype=np.float32)
         self.wheel_vel_limit = np.asarray(b["wheel_velocity_limits"], dtype=np.float32)
 
@@ -182,7 +195,6 @@ class B2WLowLevel:
     def connect(self):
         # Lazy imports allow --dry-run on a machine without the robot SDK.
         from unitree_sdk2py.core.channel import (
-            ChannelFactoryInitialize,
             ChannelPublisher,
             ChannelSubscriber,
         )
@@ -196,8 +208,6 @@ class B2WLowLevel:
             "LowCmd_": LowCmd_,
             "LowState_": LowState_,
         }
-
-        ChannelFactoryInitialize(0, self.interface)
 
         self.low_cmd = unitree_go_msg_dds__LowCmd_()
         self.low_cmd.head[0] = 0xFE
@@ -250,6 +260,7 @@ class B2WLowLevel:
 
     def _lowstate_handler(self, msg):
         self.low_state = msg
+        self.remote_controller.set(msg.wireless_remote)
 
     def get_state(self) -> B2WState:
         if self.low_state is None:
@@ -272,9 +283,38 @@ class B2WLowLevel:
             imu_gyro=gyro,
         )
 
-    def send(self, leg_q_target_policy: np.ndarray, wheel_dq_target_policy: np.ndarray):
+    def send_zero(self):
+        """Zero-torque B2W command: keeps the lowcmd stream alive without holding.
+
+        Used by the startup gates, where the legs must stay compliant while we
+        wait on the operator.
+        """
         if self.low_cmd is None or self.publisher is None:
             raise RuntimeError("B2W low-level interface is not connected.")
+
+        for motor_idx in list(self.leg_idx) + list(self.wheel_idx):
+            mc = self.low_cmd.motor_cmd[int(motor_idx)]
+            mc.mode = 0x01
+            mc.q = 0.0
+            mc.kp = 0.0
+            mc.dq = 0.0
+            mc.kd = 0.0
+            mc.tau = 0.0
+
+        self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+        self.publisher.Write(self.low_cmd)
+
+    def send(
+        self,
+        leg_q_target_policy: np.ndarray,
+        wheel_dq_target_policy: np.ndarray,
+        use_startup_gains: bool = False,
+    ):
+        if self.low_cmd is None or self.publisher is None:
+            raise RuntimeError("B2W low-level interface is not connected.")
+
+        leg_kp = self.leg_kp_startup if use_startup_gains else self.leg_kp
+        leg_kd = self.leg_kd_startup if use_startup_gains else self.leg_kd
 
         leg_q_target_policy = np.asarray(leg_q_target_policy, dtype=np.float32).reshape(12)
         wheel_dq_target_policy = np.asarray(wheel_dq_target_policy, dtype=np.float32).reshape(4)
@@ -287,9 +327,9 @@ class B2WLowLevel:
             mc = self.low_cmd.motor_cmd[int(motor_idx)]
             mc.mode = 0x01
             mc.q = float(leg_q_target_policy[j])
-            mc.kp = float(self.leg_kp[j])
+            mc.kp = float(leg_kp[j])
             mc.dq = 0.0
-            mc.kd = float(self.leg_kd[j])
+            mc.kd = float(leg_kd[j])
             mc.tau = 0.0
 
         # Velocity-PD wheels.
@@ -307,13 +347,17 @@ class B2WLowLevel:
 
 
 class WBCUANSim2Real:
-    def __init__(self, cfg_path: str, mode: str, dry_run: bool = False):
+    def __init__(self, cfg_path: str, mode: str, dry_run: bool = False, net: str = None):
         self.cfg_path = os.path.abspath(cfg_path)
+        self.net = net
         with open(self.cfg_path, "r") as f:
             self.cfg = yaml.safe_load(f)
 
         self.mode = mode
         self.dry_run = dry_run
+
+        # A-button kill switch; armed only after A is seen released once.
+        self._kill_armed = False
 
         # Explicitly reject stale deployment semantics.
         if "uan_model_path" in self.cfg:
@@ -350,6 +394,18 @@ class WBCUANSim2Real:
             raise ValueError("Expected WBC action_dim=22.")
 
         self.base_command = np.asarray(self.cfg["base_command"], dtype=np.float32).reshape(3)
+
+        # Remote-driven base velocity command (vx, vy, wz), matching
+        # b2wz1_locomanipulation_plb.py. base_command stays the fallback used
+        # when the sticks are inside the deadband or the remote is disabled.
+        self.use_remote_base_command = bool(
+            self.cfg.get("use_remote_base_command", True)
+        )
+        self.command_scale = np.asarray(
+            self.cfg.get("command_scale", [0.6, 0.6, 0.6]), dtype=np.float32
+        ).reshape(3)
+        self.command_deadband_lin = float(self.cfg.get("command_deadband_lin", 0.2))
+        self.command_deadband_ang = float(self.cfg.get("command_deadband_ang", 0.2))
 
         # Policy-space order matches the working MuJoCo sim2sim:
         # legs = [FL,FR,RL,RR] hips, then thighs, then calves.
@@ -606,44 +662,145 @@ class WBCUANSim2Real:
         if not np.allclose(kd_actual, self.arm_kd_fw, atol=1e-9, rtol=0.0):
             raise RuntimeError(f"Z1 adapter Kd differs from YAML: {kd_actual} vs {self.arm_kd_fw}")
 
-        self.b2w = B2WLowLevel(self.cfg)
+        self.b2w = B2WLowLevel(self.cfg, interface=self.net)
         self.b2w.connect()
 
-    def _move_to_default(self):
-        """Slowly bring B2W legs and Z1 arm to policy default pose."""
+    def _move_arm_to_default(self):
+        """Startup phase 1: Z1 arm to policy default, B2W left uncommanded.
+
+        Mirrors b2wz1_locomanipulation_plb.py, which drives the arm with the
+        official Z1 trajectory generator before any B2W motion, so the arm is
+        already parked at the default pose when the legs start moving.
+        """
+        assert self.z1 is not None
+
+        self.z1.read_state()
+        arm0 = np.asarray(self.z1.q, dtype=np.float32).reshape(6).copy()
+        duration_s = float(
+            self.cfg.get("arm_default_transition_s", self.move_to_default_s)
+        )
+        print(
+            f"[startup 1/2] moving arm to default over {duration_s:.1f}s\n"
+            f"  arm start={np.round(arm0, 3)} -> {np.round(self.default_arm, 3)}"
+        )
+
+        self.z1.move_to_pose_official(
+            target_q=self.default_arm.astype(np.float32).copy(),
+            target_gripper=self.gripper_hold_q,
+            duration_s=duration_s,
+            step_callback=None,
+        )
+
+        self.z1.read_state()
+        arm_err = np.asarray(self.z1.q, dtype=np.float32).reshape(6) - self.default_arm
+        print(f"[startup 1/2] arm at default, max err={np.max(np.abs(arm_err)):.4f} rad")
+
+    def _move_legs_to_default(self):
+        """Startup phase 2: B2W legs to policy default while the arm holds default."""
         assert self.b2w is not None and self.z1 is not None
 
         bs0 = self.b2w.get_state()
-        self.z1.read_state()
         leg0 = bs0.leg_q_policy.astype(np.float32).copy()
-        arm0 = np.asarray(self.z1.q, dtype=np.float32).reshape(6).copy()
 
         n = max(1, int(round(self.move_to_default_s * self.control_hz)))
         t0 = time.perf_counter()
         print(
-            f"[startup] moving to policy default over {self.move_to_default_s:.1f}s\n"
-            f"  leg start={np.round(leg0, 3)}\n"
-            f"  arm start={np.round(arm0, 3)} -> {np.round(self.default_arm, 3)}"
+            f"[startup 2/2] moving legs to default over {self.move_to_default_s:.1f}s\n"
+            f"  leg start={np.round(leg0, 3)}"
         )
 
         for i in range(n):
             u = (i + 1) / n
-            s = 0.5 * (1.0 - np.cos(np.pi * u))
-            leg_cmd = (1.0 - s) * leg0 + s * self.default_leg
-            arm_cmd = (1.0 - s) * arm0 + s * self.default_arm
-            self.b2w.send(leg_cmd, np.zeros(4, dtype=np.float32))
+            blend = 0.5 * (1.0 - np.cos(np.pi * u))
+            leg_cmd = (1.0 - blend) * leg0 + blend * self.default_leg
+            self.b2w.send(
+                leg_cmd, np.zeros(4, dtype=np.float32), use_startup_gains=True
+            )
             self.z1.hold_pose_lowcmd(
-                q_cmd=arm_cmd.astype(np.float32),
+                q_cmd=self.default_arm.astype(np.float32),
                 gripper_q_cmd=self.gripper_hold_q,
             )
             _sleep_until(t0 + (i + 1) * self.control_dt)
+
+        print("[startup 2/2] legs at default.")
+
+    def _wait_for_a_press(
+        self, prompt: str, leg_hold=None, arm_hold=None, leg_startup_gains: bool = True
+    ):
+        """Block until A is pressed, streaming a hold command the whole time.
+
+        leg_hold=None keeps the B2W in zero torque; otherwise the legs are held
+        at that policy-space pose with PD gains. arm_hold=None leaves the Z1
+        alone; otherwise the arm is held there via lowcmd.
+
+        A press is edge-detected: the button must first be seen released, so one
+        long press cannot cascade through several gates.
+        """
+        assert self.b2w is not None and self.z1 is not None
+
+        def _stream_once():
+            if leg_hold is None:
+                self.b2w.send_zero()
+            else:
+                self.b2w.send(
+                    leg_hold,
+                    np.zeros(4, dtype=np.float32),
+                    use_startup_gains=leg_startup_gains,
+                )
+            if arm_hold is not None:
+                self.z1.hold_pose_lowcmd(
+                    q_cmd=np.asarray(arm_hold, dtype=np.float32).reshape(6),
+                    gripper_q_cmd=self.gripper_hold_q,
+                )
+
+        rc = self.b2w.remote_controller
+        print(f"[startup] {prompt}")
+
+        while rc.button[KeyMap.A] == 1:
+            _stream_once()
+            time.sleep(self.control_dt)
+
+        while rc.button[KeyMap.A] != 1:
+            _stream_once()
+            time.sleep(self.control_dt)
+
+        print("[startup] A pressed.")
+
+    def _move_to_default(self):
+        """A-gated staged startup: A -> arm to default, A -> legs to default."""
+        assert self.b2w is not None and self.z1 is not None
+
+        self.z1.read_state()
+        arm_at_connect = np.asarray(self.z1.q, dtype=np.float32).reshape(6).copy()
+
+        self._wait_for_a_press(
+            "Press A to move the ARM to default.",
+            leg_hold=None,
+            arm_hold=arm_at_connect,
+        )
+        self._move_arm_to_default()
+
+        self._wait_for_a_press(
+            "Press A to move the LEGS to default.",
+            leg_hold=None,
+            arm_hold=self.default_arm,
+        )
+        self._move_legs_to_default()
+
+        self._wait_for_a_press(
+            "Press A to START the RL policy.",
+            leg_hold=self.default_leg,
+            arm_hold=self.default_arm,
+        )
 
         # Hand off from startup gains to deployment runtime firmware gains.
         self.z1.arm_runtime_mode = "position_pd"
         settle_n = max(1, int(round(self.z1_runtime_settle_s * self.control_hz)))
         t0 = time.perf_counter()
         for i in range(settle_n):
-            self.b2w.send(self.default_leg, np.zeros(4, dtype=np.float32))
+            self.b2w.send(
+                self.default_leg, np.zeros(4, dtype=np.float32), use_startup_gains=False
+            )
             self.z1.track_target_pd_once(
                 q_target=self.default_arm.astype(np.float32),
                 gripper_q_target=self.gripper_hold_q,
@@ -652,6 +809,48 @@ class WBCUANSim2Real:
             _sleep_until(t0 + (i + 1) * self.control_dt)
 
         print("[startup] default pose reached; runtime gains engaged.")
+
+    def _update_base_command_from_remote(self):
+        """Map the left/right sticks onto the base velocity command.
+
+        Axis mapping and deadband follow b2wz1_locomanipulation_plb.py:
+        ly -> vx, -lx -> vy, -rx -> wz. The linear deadband is applied to the
+        vx/vy norm so a diagonal push is not clipped per-axis.
+        """
+        if not self.use_remote_base_command or self.b2w is None:
+            return
+
+        rc = self.b2w.remote_controller
+        cmd = np.zeros(3, dtype=np.float32)
+        cmd[0] = np.clip(rc.ly, -1.0, 1.0) * self.command_scale[0]
+        cmd[1] = np.clip(-rc.lx, -1.0, 1.0) * self.command_scale[1]
+        cmd[2] = np.clip(-rc.rx, -1.0, 1.0) * self.command_scale[2]
+
+        lin_norm = float(np.linalg.norm(cmd[:2], ord=2))
+        if lin_norm < self.command_deadband_lin * max(
+            self.command_scale[0], self.command_scale[1]
+        ):
+            cmd[0] = 0.0
+            cmd[1] = 0.0
+        if abs(cmd[2]) < self.command_deadband_ang * self.command_scale[2]:
+            cmd[2] = 0.0
+
+        self.base_command[:] = cmd
+
+    def _kill_requested(self) -> bool:
+        """True when A on the B2W remote asks the policy loop to stop.
+
+        The switch arms only after A has been observed released once, so a
+        button still held when the loop starts cannot kill it instantly.
+        """
+        if self.b2w is None:
+            return False
+
+        pressed = self.b2w.remote_controller.button[KeyMap.A] == 1
+        if not self._kill_armed:
+            self._kill_armed = not pressed
+            return False
+        return pressed
 
     def _safe_hold_current(self, duration_s: float = 0.5):
         if self.b2w is None or self.z1 is None:
@@ -663,7 +862,11 @@ class WBCUANSim2Real:
             arm_hold = np.asarray(self.z1.q, dtype=np.float32).copy()
             n = max(1, int(round(duration_s * self.control_hz)))
             for _ in range(n):
-                self.b2w.send(leg_hold, np.zeros(4, dtype=np.float32))
+                # Stiff hold at the measured pose: the pose error is ~0 at this
+                # instant, so the higher gains resist sagging without a jerk.
+                self.b2w.send(
+                    leg_hold, np.zeros(4, dtype=np.float32), use_startup_gains=True
+                )
                 self.z1.track_target_pd_once(
                     q_target=arm_hold,
                     gripper_q_target=self.gripper_hold_q,
@@ -681,14 +884,14 @@ class WBCUANSim2Real:
 
         print("\nREAL ROBOT LOW-LEVEL CONTROL WILL BE ENABLED.")
         print("Confirm B2W is supported, workspace is clear, E-stop is ready.")
-        if input("Type 'go' to connect and enable low-level control: ").strip().lower() != "go":
-            print("Aborted before hardware connection.")
-            return
+        print("Startup is gated by the remote: A -> arm, A -> legs, A -> RL.")
 
         self._connect_hardware()
 
         try:
             self._move_to_default()
+
+            self._update_base_command_from_remote()
 
             sample_first = self.mode != "pd-stand"
             self.ee_sampler.reset(sample_first=sample_first)
@@ -700,7 +903,8 @@ class WBCUANSim2Real:
             self.wheel_cmd[:] = 0.0
             self.last_action[:] = 0.0
 
-            print("[run] WBC active.")
+            self._kill_armed = False
+            print("[run] WBC active. Press A on the remote to kill the policy.")
             t0 = time.perf_counter()
             tick = 0
             last_report = -1.0
@@ -713,7 +917,12 @@ class WBCUANSim2Real:
                     print("[run] max_duration_s reached.")
                     break
 
+                if self._kill_requested():
+                    print(f"[run] A pressed at t={t:.2f}s -- killing policy.")
+                    break
+
                 if tick % self.policy_decimation == 0:
+                    self._update_base_command_from_remote()
                     if self.mode != "pd-stand":
                         ee_cmd = self.ee_sampler.update()
                     blend = self._compute_blend(t)
@@ -725,6 +934,8 @@ class WBCUANSim2Real:
                         arm_err = self.arm_target - np.asarray(self.z1.q, dtype=np.float32)
                         print(
                             f"[{t:7.2f}s] blend={blend:.2f} "
+                            f"| cmd=[{self.base_command[0]:+.2f},"
+                            f"{self.base_command[1]:+.2f},{self.base_command[2]:+.2f}] "
                             f"| action arm=[{self.last_action[12:18].min():+.2f},"
                             f"{self.last_action[12:18].max():+.2f}] "
                             f"| max arm err={np.max(np.abs(arm_err)):.3f} rad "
@@ -759,7 +970,8 @@ class WBCUANSim2Real:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("yaml_path", type=str)
+    parser.add_argument("net", type=str, help="Network interface, e.g. enp3s0")
+    parser.add_argument("yaml_path", type=str, help="Path to yaml config")
     parser.add_argument(
         "--mode",
         choices=["pd-stand", "lock-arm-policy", "full-policy"],
@@ -772,7 +984,18 @@ def main():
     )
     args = parser.parse_args()
 
-    runner = WBCUANSim2Real(args.yaml_path, mode=args.mode, dry_run=args.dry_run)
+    runner = WBCUANSim2Real(
+        args.yaml_path, mode=args.mode, dry_run=args.dry_run, net=args.net
+    )
+
+    # DDS must come up before the Z1 SDK and the B2W adapter, exactly as in
+    # b2wz1_locomanipulation_plb.py. --dry-run stays completely offline.
+    if not args.dry_run:
+        # Lazy import keeps --dry-run usable on machines without the robot SDK.
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+
+        ChannelFactoryInitialize(0, args.net)
+
     runner.run()
 
 

@@ -7,7 +7,7 @@
 #   - Arm action: direct JointPositionAction semantics, NO target rate limiter.
 #   - EE command: direct random sample-and-hold only.
 
-policy_path: "exported_policy/b2wz1_wbc_uan_plb/policy_wbc_uan_2.onnx"
+policy_path: "exported_policies/b2wz1_wbc_uan_plb/policy_wbc_uan_2.onnx"
 
 # ----------------------------------------------------------------------
 # Timing / policy layout
@@ -19,6 +19,9 @@ report_period_s: 1.0
 
 startup_hold_s: 1.0
 startup_blend_s: 2.0
+# Startup is staged: arm to default first (arm_default_transition_s),
+# then legs to default (move_to_default_s).
+arm_default_transition_s: 4.0
 move_to_default_s: 3.0
 z1_runtime_settle_s: 0.5
 
@@ -27,7 +30,15 @@ obs_dim_per_step: 80
 obs_dim: 400
 action_dim: 22
 
+# Fallback base velocity command, used when the sticks are inside the
+# deadband or use_remote_base_command is false.
 base_command: [0.0, 0.0, 0.0]
+
+# Remote-driven base velocity: ly -> vx, -lx -> vy, -rx -> wz.
+use_remote_base_command: true
+command_scale: [0.6, 0.6, 0.6]
+command_deadband_lin: 0.2
+command_deadband_ang: 0.2
 
 # Policy-space leg order is the SAME order used by the working MuJoCo sim2sim:
 #   [FL_hip, FR_hip, RL_hip, RR_hip,
@@ -55,8 +66,8 @@ arm_q_upper: [ 2.6180, 2.8798, 0.0,  1.5184,  1.3439,  2.7925]
 # B2W low-level DDS
 # ----------------------------------------------------------------------
 b2w:
-  # CHANGE THIS to the Ethernet interface connected to B2W.
-  network_interface: "enp3s0"
+  # Fallback only: the first CLI positional (net) overrides this.
+  network_interface: "enxa0cec819e15f"
   lowcmd_topic: "rt/lowcmd"
   lowstate_topic: "rt/lowstate"
   state_timeout_s: 5.0
@@ -81,13 +92,25 @@ b2w:
      8.0, 8.0, 8.0, 8.0,
      12.0, 12.0, 12.0, 12.0]
 
+  # Stiffer than the RL gains, used for the startup ramp, the operator-hold
+  # gates, and the safe hold on exit. Matches kps_pd/kds_pd in
+  # b2wz1_locomanipulation_plb.yaml.
+  leg_kp_startup:
+    [500.0, 500.0, 500.0, 500.0,
+     500.0, 500.0, 500.0, 500.0,
+     500.0, 500.0, 500.0, 500.0]
+  leg_kd_startup:
+    [10.0, 10.0, 10.0, 10.0,
+     10.0, 10.0, 10.0, 10.0,
+     10.0, 10.0, 10.0, 10.0]
+
   wheel_kd: [10.0, 10.0, 10.0, 10.0]
   wheel_velocity_limits: [50.0, 50.0, 50.0, 50.0]
 
 # ----------------------------------------------------------------------
 # EE command -- direct sample-and-hold only
 # ----------------------------------------------------------------------
-ee_command_path: "utilities/data/keypoints_plb_pickup.npy"
+ee_command_path: "utils/dataset/keypoints_plb_pickup.npy"
 ee_command_seed: 0
 ee_cycle_duration_s: 8.0
 ee_ground_z: 0.0

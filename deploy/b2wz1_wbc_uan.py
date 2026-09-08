@@ -837,20 +837,25 @@ class WBCUANSim2Real:
 
         self.base_command[:] = cmd
 
-    def _kill_requested(self) -> bool:
-        """True when A on the B2W remote asks the policy loop to stop.
+    def _kill_requested(self) -> Optional[str]:
+        """Name of the remote button asking the policy loop to stop, else None.
 
-        The switch arms only after A has been observed released once, so a
-        button still held when the loop starts cannot kill it instantly.
+        A is the armed kill: it arms only after A has been observed released
+        once, so the A press that started the policy cannot kill it instantly.
+        SELECT is never used by the startup gates, so it kills immediately.
         """
         if self.b2w is None:
-            return False
+            return None
 
-        pressed = self.b2w.remote_controller.button[KeyMap.A] == 1
+        rc = self.b2w.remote_controller
+        if rc.button[KeyMap.select] == 1:
+            return "SELECT"
+
+        pressed = rc.button[KeyMap.A] == 1
         if not self._kill_armed:
             self._kill_armed = not pressed
-            return False
-        return pressed
+            return None
+        return "A" if pressed else None
 
     def _safe_hold_current(self, duration_s: float = 0.5):
         if self.b2w is None or self.z1 is None:
@@ -904,7 +909,7 @@ class WBCUANSim2Real:
             self.last_action[:] = 0.0
 
             self._kill_armed = False
-            print("[run] WBC active. Press A on the remote to kill the policy.")
+            print("[run] WBC active. Press SELECT (or A) on the remote to kill the policy.")
             t0 = time.perf_counter()
             tick = 0
             last_report = -1.0
@@ -917,8 +922,9 @@ class WBCUANSim2Real:
                     print("[run] max_duration_s reached.")
                     break
 
-                if self._kill_requested():
-                    print(f"[run] A pressed at t={t:.2f}s -- killing policy.")
+                kill_btn = self._kill_requested()
+                if kill_btn is not None:
+                    print(f"[run] {kill_btn} pressed at t={t:.2f}s -- killing policy.")
                     break
 
                 if tick % self.policy_decimation == 0:

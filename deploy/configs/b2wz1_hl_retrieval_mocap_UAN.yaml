@@ -37,8 +37,11 @@
 # - LL WBC: 50 Hz, 80-D/frame, 5-frame feature-major history => 400-D.
 # - HL:     10 Hz, 56-D/frame, 3-frame feature-major history => 168-D.
 # - no startup POLICY blend-in and no arm-target rate limiter.
-# - the validated mocap sensing, safety, startup motion, gripper DCMotor path,
-#   grasp proxy, visualizer and protection logic are inherited unchanged.
+# - validated mocap sensing, safety, startup motion, gripper DCMotor path,
+#   visualizer and protection logic are inherited unchanged.
+# - UAN wrapper fixes three observation-side gaps: calibrated mocap root is
+#   mandatory; grasp proxy restores the 0.10 m distance gate; object_center_pos_base
+#   freezes at the first grasp=True HL step instead of following the gripper.
 #
 # ======================================================================
 # Policies
@@ -222,9 +225,7 @@ vo_base_height_anchor_m: 0.6017
 #
 #   with a calibrated root offset : exceeding it ABORTS, because a mismatch
 #                                   then means the offset or ground_z is wrong
-#   uncalibrated (offset is null) : exceeding it only WARNS, because the height
-#                                   is expected to be off and aborting would
-#                                   block a deliberate uncalibrated bring-up
+#   uncalibrated                   : forbidden by the UAN deployment wrapper
 #   <= 0                          : check disabled entirely
 mocap_base_height_sanity_tolerance_m: 0.25
 
@@ -239,34 +240,23 @@ gripper_binary_threshold: 0.0
 
 stage2_force_gripper_close_enabled: true
 
-# Grasp proxy deployment mode:
+# Grasp proxy semantics are intentionally locked to the training/sim2sim rule:
 #
-#   "heuristic"
-#       Deployable Stage-2 proxy:
-#         CLOSE commanded
-#         AND gripper is not fully closed
-#         AND gripper angle is holding
-#       with enter/exit hysteresis.
+#   proxy_candidate =
+#       CLOSE commanded
+#       AND ||object_center_pos_base - gripper_center_pos_base|| < 0.10 m
+#       AND gripper is not fully closed
+#       AND gripper angle is holding
 #
-#       The object <-> gripper-center distance gate has been REMOVED, so this
-#       mode no longer depends on object perception. The distance is still
-#       computed and printed as grasp_err for diagnostics only.
-#
-#   "command_assumed"
-#       NEW testing mode:
-#       the FIRST executed CLOSE/grasp command immediately sets
-#           grasp_confidence_proxy = true
-#       and the proxy remains latched true until controller reset/restart.
-#       Object-distance and gripper-stall confirmation are not required.
-#
-# This generated YAML selects the new mode.
+# Three consecutive candidate=true steps enter the proxy; three consecutive
+# candidate=false steps exit it. The UAN wrapper audits these values at startup.
 grasp_proxy_mode: "heuristic"
 
 # Training-defined gripper center relative to gripperStator / policy EE frame.
 gripper_center_offset_local: [0.075, 0.0, 0.01]
 
-# grasp_proxy_error_threshold was removed together with the object-distance
-# gate; the heuristic proxy no longer reads it.
+# Restored distance gate: this MUST be 0.10 m to match training/sim2sim.
+grasp_proxy_error_threshold: 0.10
 
 # IMPORTANT: both angle thresholds below are in TRAINING gripper coordinates.
 gripper_not_fully_closed_angle_threshold: -0.08726646259971647
@@ -275,15 +265,16 @@ gripper_angle_hold_threshold: 0.05235987755982989
 grasp_proxy_enter_steps: 3
 grasp_proxy_exit_steps: 3
 
-# Deployment semantics:
-# once grasp proxy is true, object_center_pos_base = gripper_center_pos_base.
+# Object observation after grasp:
+# On the FIRST false->true grasp-proxy transition, capture the ACTUAL measured
+# object_center_pos_base from that same 10-Hz HL step. From the next arithmetic
+# operation onward, keep that exact 3-vector unchanged for the rest of the
+# policy run, even if object mocap later disappears or the proxy later exits.
 #
-# heuristic:
-#   object visual/VO is no longer required until the proxy exits.
-#
-# command_assumed:
-#   proxy stays latched after the first CLOSE/grasp command, therefore object
-#   visual/VO is no longer required for the rest of this controller run.
+# The wrapper rewrites the 3-frame feature-major object history immediately
+# before high-level ONNX inference; it does NOT replace the object with the
+# moving gripper center.
+freeze_object_center_pos_base_on_grasp: true
 
 # ======================================================================
 # Z1 SDK / FK
@@ -563,21 +554,15 @@ mocap_retrieval_max_age_s: 0.25
 #   p_root_world = p_mocap_world + R(q_mocap_world) @ mocap_root_offset_pos
 #   q_root_world = q_mocap_world (x) mocap_root_offset_quat_wxyz
 #
-# OPTIONAL. Leave it null to run uncalibrated: the Motive rigid body's own
-# frame is then used as the robot root, which is enough to bring the system up
-# and see everything move, but the base pose is wrong by wherever Motive put
-# that asset's pivot and axes.
+# REQUIRED for the UAN deployment. The Motive rigid-body pivot/axes are NOT
+# allowed to stand in for base_link. Run the calibration script first and keep
+# this path pointed at the YAML it produced. The UAN wrapper refuses to start
+# if the path is missing, the file does not exist, or the perception system
+# reports an uncalibrated root offset.
 #
-# It is the single most important number in this file once you do set it: it
-# defines the robot's own frame, so an error here corrupts the base height AND
-# both target positions at once. Uncalibrated, expect:
-#   - base_height to be the ASSET's height, not the robot's, which shifts the
-#     commanded end-effector target by the same amount;
-#   - object and retrieval positions to be rotated around the robot by the yaw
-#     between the asset frame and the real base.
-# Startup prints a banner saying which mode you are in.
-mocap_root_offset_path: null
-# mocap_root_offset_path: "deploy/configs/b2w_mocap_root_offset.yaml"
+# A wrong offset corrupts base height, object_center_pos_base,
+# retrieval_target_pos_base and all other world->base geometry together.
+mocap_root_offset_path: "deploy/configs/b2w_mocap_root_offset.yaml"
 
 # Alternative to the path: inline the same keys here instead.
 # mocap_root_offset:

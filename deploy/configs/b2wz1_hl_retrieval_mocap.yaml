@@ -30,10 +30,9 @@
 # 1. Motive: Streaming ON, Rigid Bodies checked, assets "B2", "octopus" and
 #    "retrieval" all created and TRACKING (green in Motive). An untracked
 #    asset blocks policy start by design.
-# 2. The mocap -> root offset must be calibrated:
-#       python3 deploy/b2w_mocap_root_calibration.py \
-#           deploy/configs/b2w_mocap_root_calibration.yaml
-#    and mocap_root_offset_path below must point at what it saved.
+# 2. The mocap root frame must be base_link. Here that is done in Motive:
+#    the "B2" asset's pivot and axes are aligned with base_link, so
+#    mocap_root_frame_is_base_link below is true and no offset file is used.
 # 3. ground_z must be the physical floor height in the MOCAP world frame.
 
 # ======================================================================
@@ -558,7 +557,10 @@ mocap_object_max_age_s: 0.30
 # ([0, 0, 1] in the AprilTag frame): the physical drop point relative to the
 # retrieval rigid body's own frame.
 mocap_retrieval_name: "retrieval"
-mocap_retrieval_id: 11
+# Renumbered in Motive: the asset streams as id 12, not 11. Name resolution
+# takes precedence over this anyway, so it now only matters if the server
+# stops answering the model-definition request.
+mocap_retrieval_id: 12
 mocap_retrieval_offset_local: [0.0, 0.0, 0.0]
 mocap_retrieval_max_age_s: 0.25
 
@@ -584,6 +586,12 @@ mocap_retrieval_max_age_s: 0.25
 #   - object and retrieval positions to be rotated around the robot by the yaw
 #     between the asset frame and the real base.
 # Startup prints a banner saying which mode you are in.
+# The "B2" asset frame was aligned with base_link inside Motive, so the
+# streamed pose already IS base_link and the correct offset is identity.
+mocap_root_frame_is_base_link: true
+
+# Only needed if that Motive-side alignment is NOT done: measure the offset
+# with deploy/b2w_mocap_root_calibration.py and point this at its output.
 mocap_root_offset_path: null
 # mocap_root_offset_path: "deploy/configs/b2w_mocap_root_offset.yaml"
 

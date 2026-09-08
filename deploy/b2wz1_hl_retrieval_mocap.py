@@ -25,16 +25,18 @@ What is replaced
 
 Three Motive rigid bodies are required (as currently named on this system):
 
-    "B2"          the robot. With the calibrated mocap->root offset this
-                  gives the exact base_link pose, hence the base height and
-                  the world->base transform used for the two targets.
+    "B2"          the robot. Its pose is the base_link pose, hence the base
+                  height and the world->base transform used for the two
+                  targets.
     "octopus"     the object to retrieve.
     "retrieval"   the retrieval target.
 
-The mocap->root offset comes from deploy/b2w_mocap_root_calibration.py; point
-`mocap_root_offset_path` at the YAML it writes. Without a correct offset the
-robot's own frame is wrong and every derived quantity is wrong with it, so
-the script refuses to start rather than guessing.
+The mocap root frame must be base_link, or the robot's own frame is wrong and
+every derived quantity is wrong with it. Establish it either by aligning the
+asset's pivot and axes with base_link inside Motive and setting
+`mocap_root_frame_is_base_link: true` (what this system does), or by measuring
+the offset with deploy/b2w_mocap_root_calibration.py and pointing
+`mocap_root_offset_path` at the YAML it writes.
 
 Run (from the repository root):
 
@@ -223,13 +225,18 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
         elif inline_offset:
             root_offset = inline_offset
         else:
-            # Optional. Without it the Motive rigid body's own frame is used
-            # as the robot root, which is enough to bring the system up but
-            # leaves the base pose wrong by whatever that asset's pivot and
-            # axes happen to be. See the warning printed in setup().
+            # Optional. With mocap_root_frame_is_base_link the identity offset
+            # is the CORRECT one, because Motive was told where base_link is.
+            # Without either, the Motive rigid body's own frame is used as the
+            # robot root: enough to bring the system up, but the base pose is
+            # wrong by whatever that asset's pivot and axes happen to be. See
+            # the warning printed in setup().
             root_offset = None
 
         return MocapPerceptionSystem(
+            root_frame_is_base_link=bool(
+                cfg.get("mocap_root_frame_is_base_link", False)
+            ),
             body=self._selector("body", "B2"),
             object_body=self._selector("object", "octopus"),
             retrieval_body=self._selector("retrieval", "retrieval"),
@@ -268,12 +275,13 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
         tolerance = float(self.cfg.get("mocap_base_height_sanity_tolerance_m", 0.25))
         expected = float(self.base_height_anchor_m)
 
-        # The check catches a bad offset or a wrong ground_z. How hard it bites
-        # depends on whether there is a calibration to be wrong in the first
-        # place: with one, a mismatch means something is broken and the run
-        # stops; without one, the height is EXPECTED to be off and stopping
-        # would just block a deliberately uncalibrated bring-up. A tolerance
-        # of zero or less disables the check outright.
+        # The check catches a bad root frame or a wrong ground_z. How hard it
+        # bites depends on whether the root frame is vouched for in the first
+        # place: when it is -- by the Motive-side alignment or by a measured
+        # offset -- a mismatch means something is broken and the run stops.
+        # When it is not, the height is EXPECTED to be off and stopping would
+        # just block a deliberately uncalibrated bring-up. A tolerance of zero
+        # or less disables the check outright.
         calibrated = self.perception.root_offset_calibrated
         enforce = tolerance > 0.0
         fatal = enforce and calibrated
@@ -1107,7 +1115,7 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
             "  root offset    : "
             f"pos={np.round(offset.pos, 4).tolist()} m | "
             f"rpy={np.round(np.degrees([roll, pitch, yaw]), 3).tolist()} deg | "
-            + ("CALIBRATED" if perception.root_offset_calibrated else "IDENTITY")
+            + perception.root_offset_source()
         )
         print(f"  ground_z       : {self.ground_z:.4f} m")
 
@@ -1139,10 +1147,16 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
             )
             print("           translates both targets relative to the robot.")
             print(
-                "       Fix with:  python3 deploy/b2w_mocap_root_calibration.py "
+                "       Fix by aligning the asset frame with base_link "
+                "inside Motive and setting"
+            )
+            print("         mocap_root_frame_is_base_link: true")
+            print(
+                "       or by measuring the offset here:  python3 "
+                "deploy/b2w_mocap_root_calibration.py "
                 "deploy/configs/b2w_mocap_root_calibration.yaml"
             )
-            print("       then set mocap_root_offset_path to the YAML it writes.")
+            print("       and pointing mocap_root_offset_path at the YAML it writes.")
             print("-" * 108)
 
         if self.z1_arm_runtime_mode == "dcmotor":

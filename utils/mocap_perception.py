@@ -123,6 +123,7 @@ class MocapPerceptionSystem:
         object_body: MocapBodySelector,
         retrieval_body: MocapBodySelector,
         root_offset: Any = None,
+        root_frame_is_base_link: bool = False,
         ground_z: float = 0.0,
         local_ip: str = "",
         server_ip: Optional[str] = None,
@@ -137,11 +138,23 @@ class MocapPerceptionSystem:
         self.body = body
         self.object_body = object_body
         self.retrieval_body = retrieval_body
-        # None -> identity: the Motive rigid body's own frame is taken as the
-        # robot root. Usable without calibrating, at the cost of the base pose
-        # being wrong by whatever the asset's pivot and axes happen to be.
+        # There are two ways the root frame can be trustworthy:
+        #
+        #   1. an external offset (file or inline) measured by
+        #      deploy/b2w_mocap_root_calibration.py, or
+        #   2. root_frame_is_base_link=True, which asserts the alignment was
+        #      already done inside Motive -- the asset's pivot and axes ARE
+        #      base_link, so the correct offset is exactly identity.
+        #
+        # Identity with neither is the remaining case: the Motive rigid body's
+        # own frame is taken as the root by default. That still brings the
+        # system up, but the base pose is wrong by whatever the asset's pivot
+        # and axes happen to be, so it is reported as uncalibrated.
         self.root_offset: RootOffset = load_root_offset(root_offset)
-        self.root_offset_calibrated = not self.root_offset.is_identity()
+        self.root_frame_is_base_link = bool(root_frame_is_base_link)
+        self.root_offset_calibrated = (
+            not self.root_offset.is_identity() or self.root_frame_is_base_link
+        )
         self.ground_z = float(ground_z)
         self.startup_timeout_s = float(startup_timeout_s)
         self.verbose = bool(verbose)
@@ -222,6 +235,14 @@ class MocapPerceptionSystem:
 
         self._initialized = True
 
+    def root_offset_source(self) -> str:
+        """One-word provenance of the root frame, for status lines."""
+        if self.root_frame_is_base_link and self.root_offset.is_identity():
+            return "MOTIVE-ALIGNED (asset frame is base_link)"
+        if self.root_offset_calibrated:
+            return "CALIBRATED"
+        return "IDENTITY (uncalibrated)"
+
     def start(self) -> None:
         if not self._initialized:
             raise RuntimeError("initialize() must be called before start()")
@@ -229,7 +250,7 @@ class MocapPerceptionSystem:
         rate = f"{self.client.frame_rate:g} Hz" if self.client.frame_rate else "unknown rate"
         self._log(
             f"running | up_axis={self.client.up_axis} | {rate} | root offset "
-            + ("CALIBRATED" if self.root_offset_calibrated else "IDENTITY (uncalibrated)")
+            + self.root_offset_source()
         )
 
     def stop(self) -> None:

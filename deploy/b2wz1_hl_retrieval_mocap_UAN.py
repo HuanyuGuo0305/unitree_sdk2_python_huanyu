@@ -40,8 +40,10 @@ external DCMotor-style actuator used by retrieval training.
 
 This wrapper also closes three observation-side sim2real gaps:
 
-1. A calibrated mocap->base_link offset is mandatory. Uncalibrated Motive
-   rigid-body coordinates are rejected before policy execution.
+1. The mocap root frame must BE base_link, established either by aligning
+   the asset frame inside Motive (mocap_root_frame_is_base_link: true) or by
+   an externally measured offset. Raw, unvouched-for Motive rigid-body
+   coordinates are rejected before policy execution.
 
 2. The deployable grasp-confidence proxy again matches training/sim2sim:
        CLOSE commanded
@@ -360,31 +362,50 @@ class B2WZ1MocapRetrievalUANTrainedController(
             )
 
         # -------------------------------------------------------------
-        # 6. Bug fix #1: calibrated mocap->base_link offset is mandatory.
+        # 6. Bug fix #1: the mocap root frame must BE base_link.
         # -------------------------------------------------------------
+        # Two ways to satisfy this, and the wrapper accepts either:
+        #
+        #   a. mocap_root_frame_is_base_link: true -- the asset's pivot and
+        #      axes were aligned with base_link inside Motive, so the correct
+        #      offset is identity and no offset file exists or is needed.
+        #   b. mocap_root_offset_path / mocap_root_offset -- the offset was
+        #      measured externally by deploy/b2w_mocap_root_calibration.py.
+        #
+        # What stays forbidden is neither: raw Motive asset coordinates
+        # standing in for base_link by default.
         offset_path = cfg.get("mocap_root_offset_path")
         inline_offset = cfg.get("mocap_root_offset")
-        if not offset_path and not inline_offset:
-            raise ValueError(
-                "UAN retrieval deployment requires a calibrated mocap->base_link "
-                "offset. Set mocap_root_offset_path to the YAML produced by "
-                "deploy/b2w_mocap_root_calibration.py (or provide mocap_root_offset inline)."
-            )
+        motive_aligned = bool(cfg.get("mocap_root_frame_is_base_link", False))
+
         if offset_path:
             resolved = self._resolve_path(str(offset_path))
             if not os.path.isfile(resolved):
                 raise FileNotFoundError(
                     "mocap_root_offset_path does not exist: "
                     f"configured={offset_path!r}, resolved={resolved!r}. "
-                    "Run deploy/b2w_mocap_root_calibration.py first."
+                    "Run deploy/b2w_mocap_root_calibration.py first, or set "
+                    "mocap_root_frame_is_base_link: true if the asset frame "
+                    "was already aligned with base_link in Motive."
                 )
             self._mocap_root_offset_resolved_path = resolved
-        else:
+        elif inline_offset:
             self._mocap_root_offset_resolved_path = "<inline>"
+        elif motive_aligned:
+            self._mocap_root_offset_resolved_path = (
+                "<identity: asset frame aligned with base_link in Motive>"
+            )
+        else:
+            raise ValueError(
+                "UAN retrieval deployment requires the mocap root frame to be "
+                "base_link. Either set mocap_root_frame_is_base_link: true (the "
+                "asset was aligned in Motive) or point mocap_root_offset_path at "
+                "the YAML produced by deploy/b2w_mocap_root_calibration.py."
+            )
 
         if not bool(getattr(self.perception, "root_offset_calibrated", False)):
             raise ValueError(
-                "MocapPerceptionSystem reports an uncalibrated root offset. "
+                "MocapPerceptionSystem reports an untrusted root offset. "
                 "Refusing to run the UAN-trained policy with the Motive asset "
                 "frame pretending to be base_link."
             )
@@ -808,7 +829,7 @@ class B2WZ1MocapRetrievalUANTrainedController(
             "(hardware communication detail; not a deployed UAN frequency)"
         )
         print(
-            "Mocap root offset : CALIBRATED | "
+            f"Mocap root offset : {self.perception.root_offset_source()} | "
             f"{self._mocap_root_offset_resolved_path}"
         )
         print(

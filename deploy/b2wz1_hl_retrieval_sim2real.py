@@ -1070,6 +1070,33 @@ class B2WZ1HierarchicalRetrievalController:
             2,
         )
 
+        # Optional per-step clip on the SCALED high-level deltas, applied
+        # after scaling and before integration onto the measured EE pose.
+        # Absent from a YAML => no per-step clip (legacy behaviour).
+        self.kp0_delta_clip = np.asarray(
+            self.cfg.get(
+                "kp0_delta_clip",
+                [np.inf, np.inf, np.inf],
+            ),
+            dtype=np.float32,
+        ).reshape(
+            3,
+        )
+
+        self.ee_yaw_delta_clip = float(
+            self.cfg.get(
+                "ee_yaw_delta_clip",
+                np.inf,
+            )
+        )
+
+        self.ee_pitch_delta_clip = float(
+            self.cfg.get(
+                "ee_pitch_delta_clip",
+                np.inf,
+            )
+        )
+
         self.neutral_kp0 = np.asarray(
             self.cfg[
                 "neutral_kp0"
@@ -3299,12 +3326,18 @@ class B2WZ1HierarchicalRetrievalController:
             self.compute_actual_ee_pose_plb()
         )
 
-        kp0_cmd = (
-            actual_ee_pos_plb
-            + action[
+        kp0_delta = np.clip(
+            action[
                 3:6
             ]
-            * self.kp0_delta_scale
+            * self.kp0_delta_scale,
+            -self.kp0_delta_clip,
+            self.kp0_delta_clip,
+        )
+
+        kp0_cmd = (
+            actual_ee_pos_plb
+            + kp0_delta
         )
 
         kp0_cmd[
@@ -3349,14 +3382,35 @@ class B2WZ1HierarchicalRetrievalController:
             ],
         )
 
+        yaw_delta = float(
+            np.clip(
+                float(
+                    action[
+                        6
+                    ]
+                )
+                * self.ee_yaw_delta_scale,
+                -self.ee_yaw_delta_clip,
+                self.ee_yaw_delta_clip,
+            )
+        )
+
+        pitch_delta = float(
+            np.clip(
+                float(
+                    action[
+                        7
+                    ]
+                )
+                * self.ee_pitch_delta_scale,
+                -self.ee_pitch_delta_clip,
+                self.ee_pitch_delta_clip,
+            )
+        )
+
         yaw_cmd = np.clip(
             actual_ee_yaw_plb
-            + float(
-                action[
-                    6
-                ]
-            )
-            * self.ee_yaw_delta_scale,
+            + yaw_delta,
             self.ee_yaw_range[
                 0
             ],
@@ -3367,12 +3421,7 @@ class B2WZ1HierarchicalRetrievalController:
 
         pitch_cmd = np.clip(
             actual_ee_pitch_plb
-            + float(
-                action[
-                    7
-                ]
-            )
-            * self.ee_pitch_delta_scale,
+            + pitch_delta,
             self.ee_pitch_range[
                 0
             ],

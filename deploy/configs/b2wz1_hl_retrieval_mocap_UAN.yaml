@@ -39,8 +39,8 @@
 # - no startup POLICY blend-in and no arm-target rate limiter.
 # - validated mocap sensing, safety, startup motion, gripper DCMotor path,
 #   visualizer and protection logic are inherited unchanged.
-# - UAN wrapper fixes three observation-side gaps: calibrated mocap root is
-#   mandatory; grasp proxy restores the 0.10 m distance gate; object_center_pos_base
+# - UAN wrapper fixes three observation-side gaps: a trusted mocap root frame
+#   is mandatory; grasp proxy restores the 0.10 m distance gate; object_center_pos_base
 #   freezes at the first grasp=True HL step instead of following the gripper.
 #
 # ======================================================================
@@ -189,6 +189,12 @@ kp0_z_range: [0.0, 1.15]
 ee_yaw_delta_scale: 0.174532925199433
 ee_pitch_delta_scale: 0.174532925199433
 
+# Per-step clip on the scaled HL deltas (applied after scaling, before
+# integration onto the measured EE pose). Must match sim2sim.
+kp0_delta_clip: [0.0, 0.0, 0.0]
+ee_yaw_delta_clip: 0.0
+ee_pitch_delta_clip: 0.0
+
 ee_yaw_range: [-1.0471975511965976, 1.0471975511965976]
 ee_pitch_range: [-1.2217304763960306, 0.0]
 
@@ -223,10 +229,10 @@ vo_base_height_anchor_m: 0.6017
 
 # How far the measured mocap height may differ from that expectation.
 #
-#   with a calibrated root offset : exceeding it ABORTS, because a mismatch
-#                                   then means the offset or ground_z is wrong
-#   uncalibrated                   : forbidden by the UAN deployment wrapper
-#   <= 0                          : check disabled entirely
+#   trusted root frame : exceeding it ABORTS, because a mismatch then means
+#                        the Motive alignment, the offset, or ground_z is wrong
+#   untrusted          : forbidden by the UAN deployment wrapper
+#   <= 0               : check disabled entirely
 mocap_base_height_sanity_tolerance_m: 0.25
 
 # ======================================================================
@@ -523,8 +529,8 @@ mocap_timeout_s: 10.0
 # Motive puts an asset's pivot at its marker centroid, not at the physically
 # meaningful point.
 
-# The robot. Its pose plus mocap_root_offset_path gives base_link exactly,
-# and therefore both the base height and the world->base transform.
+# The robot. Its pose IS base_link (see the root-frame section below), and
+# therefore gives both the base height and the world->base transform.
 mocap_body_name: "B2"
 mocap_body_id: 9
 mocap_body_offset_local: [0.0, 0.0, 0.0]
@@ -541,7 +547,10 @@ mocap_object_max_age_s: 0.30
 # ([0, 0, 1] in the AprilTag frame): the physical drop point relative to the
 # retrieval rigid body's own frame.
 mocap_retrieval_name: "retrieval"
-mocap_retrieval_id: 11
+# Renumbered in Motive: the asset streams as id 12, not 11. Name resolution
+# takes precedence over this anyway, so it now only matters if the server
+# stops answering the model-definition request.
+mocap_retrieval_id: 12
 mocap_retrieval_offset_local: [0.0, 0.0, 0.0]
 mocap_retrieval_max_age_s: 0.25
 
@@ -549,22 +558,29 @@ mocap_retrieval_max_age_s: 0.25
 # Mocap -> base_link offset
 # ----------------------------------------------------------------------
 #
-# Produced by deploy/b2w_mocap_root_calibration.py. Applied as
-#
-#   p_root_world = p_mocap_world + R(q_mocap_world) @ mocap_root_offset_pos
-#   q_root_world = q_mocap_world (x) mocap_root_offset_quat_wxyz
-#
-# REQUIRED for the UAN deployment. The Motive rigid-body pivot/axes are NOT
-# allowed to stand in for base_link. Run the calibration script first and keep
-# this path pointed at the YAML it produced. The UAN wrapper refuses to start
-# if the path is missing, the file does not exist, or the perception system
-# reports an uncalibrated root offset.
-#
-# A wrong offset corrupts base height, object_center_pos_base,
+# The UAN deployment REQUIRES the mocap root frame to be base_link. The
+# Motive rigid-body pivot/axes are not allowed to stand in for base_link by
+# accident -- a wrong root frame corrupts base height, object_center_pos_base,
 # retrieval_target_pos_base and all other world->base geometry together.
-mocap_root_offset_path: "deploy/configs/b2w_mocap_root_offset.yaml"
+#
+# There are two ways to satisfy that, and the wrapper accepts either.
+#
+# (a) IN USE HERE. The "B2" asset's pivot and axes were aligned with base_link
+#     inside Motive, so the streamed pose already IS the base_link pose and the
+#     correct offset is exactly identity. No offset file is involved.
+mocap_root_frame_is_base_link: true
 
-# Alternative to the path: inline the same keys here instead.
+# (b) Alternative: measure the offset externally with
+#     deploy/b2w_mocap_root_calibration.py and point this at the YAML it
+#     writes. Applied as
+#
+#       p_root_world = p_mocap_world + R(q_mocap_world) @ mocap_root_offset_pos
+#       q_root_world = q_mocap_world (x) mocap_root_offset_quat_wxyz
+#
+#     Leave null while the Motive-side alignment above is what is trusted.
+mocap_root_offset_path: null
+
+# Or inline the same keys instead of using a file:
 # mocap_root_offset:
 #   mocap_root_offset_pos: [0.0, 0.0, 0.0]
 #   mocap_root_offset_quat_wxyz: [1.0, 0.0, 0.0, 0.0]
@@ -721,7 +737,8 @@ visualizer_camera_follow_smoothing: 0.15
 # Raw Motive pivots for the three assets, as small spheres: white = B2,
 # green = object, magenta = retrieval target. The B2 pivot should sit a fixed
 # short distance off the rendered root -- if that gap changes while driving,
-# the mocap->root calibration has drifted.
+# the mocap->root alignment has drifted. With the asset aligned to base_link in
+# Motive the white pivot should sit ON the rendered root.
 visualizer_show_mocap_pivots: true
 visualizer_mocap_pivot_radius: 0.022
 

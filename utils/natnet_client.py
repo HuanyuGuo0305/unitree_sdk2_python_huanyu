@@ -401,19 +401,30 @@ def _parse_frame_payload(
     )
 
 
-def _parse_modeldef_rigid_body_names(
-    payload: bytes, natnet_major: int, natnet_minor: int
+def _plausible_rb_name(name: str) -> bool:
+    """
+    A real asset name from Motive, as opposed to bytes a wrong layout happened
+    to walk over. Misparsed names are the failure mode that matters here: they
+    would silently bind a selector to the wrong rigid body.
+    """
+    if not 1 <= len(name) <= 128:
+        return False
+    return all(0x20 <= ord(c) < 0x7F for c in name)
+
+
+def _parse_modeldef_names_with_layout(
+    payload: bytes, sized: bool, natnet_major: int = 4
 ) -> Dict[int, str]:
     """
-    Rigid-body id -> name map from a NAT_MODELDEF payload.
+    Rigid-body id -> name map from a NAT_MODELDEF payload, for ONE layout.
 
-    On NatNet 4.1+ every description is prefixed with its byte size, so only
-    the rigid-body entries need decoding and everything else is skipped
-    wholesale. On older servers there is no size to skip by, so parsing stops
-    at the first description type whose layout is not known here.
+    `sized=True` is the NatNet 4.1+ layout where every description is prefixed
+    with its byte size, so only the rigid-body entries need decoding and
+    everything else is skipped wholesale. `sized=False` is the older layout
+    with no size to skip by, where parsing stops at the first description type
+    whose layout is not known here.
     """
     names: Dict[int, str] = {}
-    sized = (natnet_major, natnet_minor) >= (4, 1)
 
     off = 0
     n_datasets, off = _read_i32(payload, off)
@@ -433,6 +444,8 @@ def _parse_modeldef_rigid_body_names(
                 body = payload[off:off + size]
                 name, inner = _read_cstring(body, 0)
                 rb_id, _ = _read_i32(body, inner)
+                if not _plausible_rb_name(name):
+                    raise _ParseError(f"implausible rigid-body name {name!r}")
                 names[int(rb_id)] = name
             off += size
             continue
@@ -448,6 +461,8 @@ def _parse_modeldef_rigid_body_names(
             rb_id, off = _read_i32(payload, off)
             _parent_id, off = _read_i32(payload, off)
             off += 12  # parent-relative offset xyz
+            if not _plausible_rb_name(name):
+                raise _ParseError(f"implausible rigid-body name {name!r}")
             names[int(rb_id)] = name
             if natnet_major >= 3:
                 n_markers, off = _read_i32(payload, off)
@@ -464,6 +479,41 @@ def _parse_modeldef_rigid_body_names(
             break
 
     return names
+
+
+def _parse_modeldef_rigid_body_names(
+    payload: bytes, natnet_major: int, natnet_minor: int
+) -> Dict[int, str]:
+    """
+    Rigid-body id -> name map from a NAT_MODELDEF payload.
+
+    The advertised NatNet version only chooses which layout to TRY FIRST, it
+    is not trusted to be right: this network has a Motive 3.3 server that
+    reports NatNet 4.2 and then streams the old unsized frame layout anyway,
+    which is why the frame decoder probes layouts instead of believing the
+    version. Model definitions are the same story, so both layouts are tried
+    and the first one that yields plausible names wins. Getting nothing back
+    is not fatal -- selectors fall back to configured ids -- but it costs the
+    name check that catches an asset renumbered in Motive.
+    """
+    prefer_sized = (natnet_major, natnet_minor) >= (4, 1)
+    order = (True, False) if prefer_sized else (False, True)
+
+    last_error: Optional[Exception] = None
+    for sized in order:
+        try:
+            names = _parse_modeldef_names_with_layout(
+                payload, sized, natnet_major
+            )
+        except (_ParseError, struct.error, ValueError) as exc:
+            last_error = exc
+            continue
+        if names:
+            return names
+
+    if last_error is not None:
+        raise last_error
+    return {}
 
 
 class NatNetClient:

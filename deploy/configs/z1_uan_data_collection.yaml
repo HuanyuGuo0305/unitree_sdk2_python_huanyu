@@ -36,7 +36,7 @@
 # Z1 SDK / Z1ArmAdapter construction
 #
 # Keys in this block are consumed by utils.z1_helper.Z1ArmAdapter and keep
-# the same names/values as deploy/configs/b2wz1_hl_retrieval_sim2real.yaml
+# the same names/values as deploy/configs/b2wz1_hl_retrieval_abs_uan_mocap.yaml
 # so the collected data describes the arm as you actually deploy it.
 # ---------------------------------------------------------------------
 z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"

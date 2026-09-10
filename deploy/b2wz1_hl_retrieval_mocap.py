@@ -28,7 +28,7 @@ Three Motive rigid bodies are required (as currently named on this system):
     "B2"          the robot. Its pose is the base_link pose, hence the base
                   height and the world->base transform used for the two
                   targets.
-    "object"      the object to retrieve.
+    "cube6"       the object to retrieve.
     "retrieval"   the retrieval target.
 
 The mocap root frame must be base_link, or the robot's own frame is wrong and
@@ -249,7 +249,7 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
                 cfg.get("mocap_root_frame_is_base_link", False)
             ),
             body=self._selector("body", "B2"),
-            object_body=self._selector("object", "object"),
+            object_body=self._selector("object", "cube6"),
             retrieval_body=self._selector("retrieval", "retrieval"),
             root_offset=root_offset,
             ground_z=self.ground_z,
@@ -412,6 +412,9 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
             ),
             root_frame_axis_radius=float(
                 self.cfg.get("visualizer_root_frame_axis_radius", 0.008)
+            ),
+            object_cube_size=float(
+                self.cfg.get("visualizer_object_cube_size", 0.0)
             ),
         )
 
@@ -1193,6 +1196,12 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
         if ret.get("valid"):
             state["retrieval_pos_base"] = np.asarray(
                 ret["retrieval_target_base"], dtype=np.float32
+            )
+
+        obj_channel = snap.get("object") or {}
+        if obj_channel.get("valid") and obj_channel.get("quat_wxyz") is not None:
+            state["object_quat_w"] = np.asarray(
+                obj_channel["quat_wxyz"], dtype=np.float32
             )
 
         state["mocap_points"] = self._mocap_pivot_markers(snap)

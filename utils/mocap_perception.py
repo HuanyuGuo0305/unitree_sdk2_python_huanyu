@@ -18,7 +18,7 @@ stack:
     body        the B2 itself. Combined with the calibrated mocap->root
                 offset it gives the exact base_link pose, and therefore both
                 the base height and the world->base transform.
-    object      the object to retrieve (the "object" asset).
+    object      the object to retrieve (the "cube6" asset).
     retrieval   the retrieval target.
 
 What the controller actually consumes is object and retrieval expressed in
@@ -417,6 +417,10 @@ class MocapPerceptionSystem:
             "reason": "OK",
             base_key: p_base.tolist(),
             "position_world": p_world.tolist(),
+            # World orientation of the asset's own frame. Not used by the
+            # control path -- the policy consumes position only -- but the
+            # visualizer needs it to draw an oriented object.
+            "quat_wxyz": rb.quat_wxyz.tolist(),
             "age_ms": age_ms,
             "source_age_ms": age_ms,
             "mean_marker_error_m": rb.mean_marker_error,

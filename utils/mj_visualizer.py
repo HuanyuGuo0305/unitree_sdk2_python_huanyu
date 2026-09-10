@@ -21,6 +21,7 @@ so the control loop's timing is never affected by rendering.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import threading
@@ -96,6 +97,27 @@ def _add_sphere(scene, pos, radius, rgba) -> None:
         np.array([radius, 0.0, 0.0], dtype=np.float64),
         np.asarray(pos, dtype=np.float64),
         np.eye(3, dtype=np.float64).reshape(-1),
+        np.asarray(rgba, dtype=np.float32),
+    )
+    scene.ngeom += 1
+
+
+def _add_box(scene, pos, half_extents, mat, rgba) -> None:
+    """Oriented box. `mat` is a 3x3 rotation; pass None for axis-aligned."""
+    if scene.ngeom >= scene.maxgeom:
+        return
+    rot = (
+        np.eye(3, dtype=np.float64)
+        if mat is None
+        else np.asarray(mat, dtype=np.float64).reshape(3, 3)
+    )
+    g = scene.geoms[scene.ngeom]
+    mujoco.mjv_initGeom(
+        g,
+        mujoco.mjtGeom.mjGEOM_BOX,
+        np.asarray(half_extents, dtype=np.float64).reshape(3),
+        np.asarray(pos, dtype=np.float64).reshape(3),
+        rot.reshape(-1),
         np.asarray(rgba, dtype=np.float32),
     )
     scene.ngeom += 1
@@ -299,6 +321,9 @@ class MujocoDebugVisualizer:
         self._update_hz = float(update_hz)
 
         self._object_marker_radius = float(object_marker_radius)
+        # Side length of the object cube in metres. 0 falls back to a sphere
+        # of _object_marker_radius.
+        self._object_cube_size = 0.0
         self._retrieval_marker_radius = float(retrieval_marker_radius)
         self._ee_target_sphere_radius = float(ee_target_sphere_radius)
         self._ee_target_axis_len = float(ee_target_axis_len)
@@ -373,6 +398,7 @@ class MujocoDebugVisualizer:
         show_root_frame: Optional[bool] = None,
         root_frame_axis_len: Optional[float] = None,
         root_frame_axis_radius: Optional[float] = None,
+        object_cube_size: Optional[float] = None,
     ) -> None:
         """
         Enable the absolute-world extras after construction.
@@ -400,6 +426,8 @@ class MujocoDebugVisualizer:
             self._root_frame_axis_len = float(root_frame_axis_len)
         if root_frame_axis_radius is not None:
             self._root_frame_axis_radius = float(root_frame_axis_radius)
+        if object_cube_size is not None:
+            self._object_cube_size = float(object_cube_size)
 
     def push_state(self, **kwargs: Any) -> None:
         """
@@ -487,6 +515,22 @@ class MujocoDebugVisualizer:
             d.qpos[adr] = q
 
         d.qpos[self._gripper_qpos_adr] = float(state["gripper_q_training"])
+
+    @staticmethod
+    def _rotmat_from_quat_wxyz(q) -> np.ndarray:
+        w, x, y, z = [float(v) for v in np.asarray(q, dtype=np.float64).reshape(4)]
+        n = math.sqrt(w * w + x * x + y * y + z * z)
+        if n < 1.0e-12:
+            return np.eye(3, dtype=np.float64)
+        w, x, y, z = w / n, x / n, y / n, z / n
+        return np.array(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ],
+            dtype=np.float64,
+        )
 
     def _draw_world_origin(self, scene, ground_z: float) -> None:
         """RGB triad at the mocap world origin, as a fixed spatial reference."""
@@ -610,12 +654,28 @@ class MujocoDebugVisualizer:
             object_pos_w = base_pos_w + quat_apply_wxyz(
                 base_quat_wxyz, np.asarray(object_pos_base, dtype=np.float32)
             )
-            _add_sphere(
-                viewer.user_scn,
-                object_pos_w,
-                self._object_marker_radius,
-                [0.1, 1.0, 0.1, 0.9],
-            )
+            if self._object_cube_size > 0.0:
+                # A real cube, drawn at its measured mocap orientation so the
+                # face the gripper has to approach is visible.
+                half = 0.5 * self._object_cube_size
+                mat = None
+                q_w = state.get("object_quat_w")
+                if q_w is not None:
+                    mat = self._rotmat_from_quat_wxyz(q_w)
+                _add_box(
+                    viewer.user_scn,
+                    object_pos_w,
+                    [half, half, half],
+                    mat,
+                    [0.1, 1.0, 0.1, 0.75],
+                )
+            else:
+                _add_sphere(
+                    viewer.user_scn,
+                    object_pos_w,
+                    self._object_marker_radius,
+                    [0.1, 1.0, 0.1, 0.9],
+                )
 
         retrieval_pos_base = state.get("retrieval_pos_base")
         if retrieval_pos_base is not None:

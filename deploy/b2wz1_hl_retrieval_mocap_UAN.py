@@ -34,8 +34,9 @@ which gives:
     arm_kps_runtime = [2.5, 4.5, 2.5, 2.5, 2.5, 2.5]
     arm_kds_runtime = [234.375, 312.5, 234.375, 234.375, 234.375, 234.375]
 
-No arm target rate limiter is allowed. The 50-Hz WBC target is held and
-re-sent by the existing arm command thread. The gripper remains the original
+No arm target rate limiter is allowed. The 50-Hz WBC targets are held and
+re-sent to the B2W and the Z1 every 2 ms (hardware_command_hz), exactly as
+deploy/b2wz1_wbc_uan.py -- the low-level WBC test -- does. The gripper remains the original
 external DCMotor-style actuator used by retrieval training.
 
 This wrapper also closes three observation-side sim2real gaps:
@@ -121,6 +122,22 @@ _EXPECTED_GRIPPER_HOLD_THRESHOLD = 0.05235987755982989  # 3 deg
 _EXPECTED_GRASP_PROXY_ENTER_STEPS = 3
 _EXPECTED_GRASP_PROXY_EXIT_STEPS = 3
 
+# object_freeze_mode -> what the actor's object_center_pos_base shows after a
+# grasp. The keys are the valid modes.
+_OBJECT_FREEZE_MODE_SUMMARY = {
+    "off": "live measured object_center_pos_base",
+    "while_proxy": "object value captured at the proxy rising edge, held while proxy=1",
+    "Stage2_object_freeze": (
+        "object value captured at the FIRST proxy rising edge, held until the "
+        "next policy run"
+    ),
+    "overwrite_proxy": (
+        "from the FIRST proxy rising edge: proxy held at 1 and "
+        "object_center_pos_base := live gripper_center_pos_base, until the next "
+        "policy run"
+    ),
+}
+
 
 def _feature_major_block_slice(
     feature_index: int,
@@ -197,6 +214,7 @@ class B2WZ1MocapRetrievalUANTrainedController(
         )
 
         self._audit_uan_trained_real_deployment()
+        self._configure_hardware_stream()
 
         self._hl_alignment_session: Optional[
             _HighPolicyObservationAlignmentSession
@@ -529,10 +547,36 @@ class B2WZ1MocapRetrievalUANTrainedController(
         # gripper_angle_holding term it configures is not evaluated by this
         # deployment's proxy, so pinning its value would assert an alignment
         # that no longer exists.
-        if int(cfg.get("grasp_proxy_enter_steps", -1)) != _EXPECTED_GRASP_PROXY_ENTER_STEPS:
-            raise ValueError("grasp_proxy_enter_steps must be 3.")
-        if int(cfg.get("grasp_proxy_exit_steps", -1)) != _EXPECTED_GRASP_PROXY_EXIT_STEPS:
-            raise ValueError("grasp_proxy_exit_steps must be 3.")
+        # The debounce lengths are editable. Training/sim2sim used 3 HL steps
+        # for both, so any other value is announced rather than refused. Zero
+        # is refused: the counters test `count >= steps`, so 0 would latch the
+        # proxy on a step with no candidate at all.
+        for key, expected_steps in (
+            ("grasp_proxy_enter_steps", _EXPECTED_GRASP_PROXY_ENTER_STEPS),
+            ("grasp_proxy_exit_steps", _EXPECTED_GRASP_PROXY_EXIT_STEPS),
+        ):
+            value = cfg.get(key)
+            try:
+                steps = int(value)
+                valid = (
+                    not isinstance(value, bool)
+                    and steps == value
+                    and steps >= 1
+                )
+            except (TypeError, ValueError):
+                valid = False
+            if not valid:
+                raise ValueError(
+                    f"{key} must be an integer >= 1 (HL steps); got {value!r}."
+                )
+            if steps != expected_steps:
+                print(
+                    f"[UAN-AUDIT] {key}={steps} deviates from the "
+                    f"training/sim2sim value of {expected_steps} HL steps "
+                    f"({expected_steps * self.hl_control_dt:.2f} s). The grasp "
+                    "proxy is an actor OBSERVATION, so the policy sees it latch "
+                    "or release on a different delay than it trained against."
+                )
 
         # -------------------------------------------------------------
         # 8. Bug fix #3: freeze object_center_pos_base at first grasp=True.
@@ -553,13 +597,15 @@ class B2WZ1MocapRetrievalUANTrainedController(
         #       rest of the run, regardless of what the proxy does afterwards.
         #       Cleared only by a full policy reset.
         #
+        #   "overwrite_proxy"
+        #       On the FIRST rising edge, latch grasp_confidence_proxy at 1 and
+        #       replace object_center_pos_base with the live
+        #       gripper_center_pos_base, both for the rest of the run. Cleared
+        #       only by a full policy reset.
+        #
         # Default is derived from the legacy boolean so existing YAMLs keep
         # their exact behaviour without naming the new key.
-        self.valid_object_freeze_modes = (
-            "off",
-            "while_proxy",
-            "Stage2_object_freeze",
-        )
+        self.valid_object_freeze_modes = tuple(_OBJECT_FREEZE_MODE_SUMMARY)
         _legacy_freeze = bool(
             cfg.get("freeze_object_center_pos_base_on_grasp", False)
         )
@@ -589,6 +635,20 @@ class B2WZ1MocapRetrievalUANTrainedController(
                 "actor holds the object base-frame vector captured on the "
                 "first grasp=True high-level step."
             )
+        if self.object_freeze_mode == "overwrite_proxy":
+            print(
+                "[UAN-AUDIT] overwrite_proxy holds grasp_confidence_proxy at 1 "
+                "after the first grasp, so grasp_proxy_exit_steps is unused and "
+                f"gripper_force_close_mode={self.gripper_force_close_mode!r} "
+                "sees a proxy that never falls for the rest of the run."
+            )
+            print(
+                "[UAN-AUDIT] overwrite_proxy never ends the run on object "
+                "tracking loss: after the first grasp the object is not needed; "
+                "before it, the safe hold waits for the object with no damping "
+                "timeout. Retrieval loss still times out after "
+                f"{self.perception_fault_timeout_s:.2f}s."
+            )
 
     # ------------------------------------------------------------------
     # High-level observation alignment
@@ -603,6 +663,8 @@ class B2WZ1MocapRetrievalUANTrainedController(
         self._aligned_proxy_history: Optional[np.ndarray] = None
         self._frozen_object_center_pos_base: Optional[np.ndarray] = None
         self._grasp_freeze_announced = False
+        self._object_only_invalid = False
+        self._perception_hold_exempt = False
 
     def _session_input_last_dim(self, session: Any) -> Optional[int]:
         try:
@@ -767,6 +829,10 @@ class B2WZ1MocapRetrievalUANTrainedController(
                 self._aligned_grasp_proxy = True
                 self._aligned_grasp_proxy_enter_count = 0
                 self._aligned_grasp_proxy_exit_count = 0
+        elif self._proxy_latched_for_run:
+            # overwrite_proxy: held at 1 for the rest of the run, so the exit
+            # hysteresis never runs.
+            self._aligned_grasp_proxy_exit_count = 0
         else:
             if not proxy_candidate:
                 self._aligned_grasp_proxy_exit_count += 1
@@ -837,6 +903,15 @@ class B2WZ1MocapRetrievalUANTrainedController(
         def mark(ok: bool) -> str:
             return "PASS" if ok else "fail"
 
+        exit_text = (
+            "exit=LATCHED"
+            if self._proxy_latched_for_run
+            else (
+                f"exit={self._aligned_grasp_proxy_exit_count}/"
+                f"{self._grasp_proxy_exit_steps}"
+            )
+        )
+
         print(
             "[GRASP] "
             f"proxy={int(proxy)} cand={int(candidate)} | "
@@ -849,8 +924,7 @@ class B2WZ1MocapRetrievalUANTrainedController(
             f"closed={mark(has_closed)} notshut={mark(not_fully_closed)} | "
             f"4.enter={self._aligned_grasp_proxy_enter_count}/"
             f"{self._grasp_proxy_enter_steps} "
-            f"exit={self._aligned_grasp_proxy_exit_count}/"
-            f"{self._grasp_proxy_exit_steps} | "
+            f"{exit_text} | "
             f"obj_valid={int(object_valid)}"
             + ("   *** PROXY RISING EDGE ***" if rising_edge else "")
         )
@@ -954,8 +1028,12 @@ class B2WZ1MocapRetrievalUANTrainedController(
 
         # Capture on a rising edge. "Stage2_object_freeze" keeps the FIRST
         # capture for the whole run; "while_proxy" re-captures on every rising
-        # edge and releases when the proxy drops.
-        if self.object_freeze_mode != "off" and rising_edge:
+        # edge and releases when the proxy drops. "overwrite_proxy" captures
+        # nothing; it switches to the gripper center below.
+        if (
+            self.object_freeze_mode in ("while_proxy", "Stage2_object_freeze")
+            and rising_edge
+        ):
             first_capture = self._frozen_object_center_pos_base is None
             if first_capture or self.object_freeze_mode == "while_proxy":
                 # The distance-gated proxy cannot rise without a valid object
@@ -975,8 +1053,32 @@ class B2WZ1MocapRetrievalUANTrainedController(
                 )
                 self._grasp_freeze_announced = True
 
+        if self.object_freeze_mode == "overwrite_proxy" and rising_edge:
+            # The latch makes this rising edge happen once per run.
+            print(
+                "[OBS-ALIGN] grasp proxy TRUE | mode=overwrite_proxy | "
+                f"grasp_err={grasp_error:.4f} m | proxy LATCHED to 1 and "
+                "object_center_pos_base := gripper_center_pos_base for the "
+                "rest of the run (now "
+                + np.array2string(
+                    gripper_center_current,
+                    precision=4,
+                    floatmode="fixed",
+                )
+                + ")"
+            )
+
         if self.object_freeze_mode == "off":
             object_for_actor = object_current.copy()
+        elif self.object_freeze_mode == "overwrite_proxy":
+            # Latched: the object term IS the gripper center, taken from this
+            # frame's gripper_center_pos_base feature so both actor inputs
+            # agree exactly. Before the first grasp it is the live measurement,
+            # as in "off".
+            if proxy:
+                object_for_actor = gripper_center_current.copy()
+            else:
+                object_for_actor = object_current.copy()
         elif self.object_freeze_mode == "while_proxy":
             # Released the moment the proxy drops: the actor goes back to the
             # live measurement rather than steering at a stale point.
@@ -1042,12 +1144,220 @@ class B2WZ1MocapRetrievalUANTrainedController(
 
         return work[0] if squeeze else work
 
+    @property
+    def _proxy_latched_for_run(self) -> bool:
+        """True once overwrite_proxy has latched the proxy for this run."""
+        return (
+            self.object_freeze_mode == "overwrite_proxy"
+            and bool(self._aligned_grasp_proxy)
+        )
+
+    def update_grasp_confidence_proxy(self, perception_snap: dict) -> None:
+        # The base heuristic runs at every HL boundary BEFORE the observation
+        # adapter and knows nothing about the overwrite_proxy latch, so it can
+        # clear the proxy for that step. resolve_effective_task_state() would
+        # then demand a live object fix again -- which an object held in the
+        # gripper tends to lose -- and a perception hold would also stop the
+        # adapter from ever restoring the latch.
+        super().update_grasp_confidence_proxy(perception_snap)
+        if self._proxy_latched_for_run:
+            self.grasp_confidence_proxy = True
+            self.grasp_proxy_exit_count = 0
+
+    def resolve_effective_task_state(self, perception_snap: dict) -> dict:
+        task = super().resolve_effective_task_state(perception_snap)
+        # Read by _begin_perception_hold(), which the step loop calls with
+        # this same task.
+        self._object_only_invalid = bool(
+            not task["object_valid"] and task["retrieval_valid"]
+        )
+        return task
+
+    def _begin_perception_hold(self, reason: str) -> None:
+        was_active = bool(self.perception_hold_active)
+        super()._begin_perception_hold(reason)
+
+        # overwrite_proxy: losing the object must never end the run. Once the
+        # proxy has latched, the base already treats the object as valid (it
+        # is the gripper center), so this only matters BEFORE the first grasp.
+        # There is no honest object value for the actor then, so the safe hold
+        # still applies -- but it waits for the object instead of running the
+        # damping timer. Any other invalid channel still times out.
+        exempt = (
+            self.object_freeze_mode == "overwrite_proxy"
+            and self._object_only_invalid
+        )
+        if exempt:
+            self.perception_invalid_since = None
+            if not was_active or not self._perception_hold_exempt:
+                print(
+                    "[PERCEPTION-HOLD] overwrite_proxy | object untracked before "
+                    "the first grasp: holding until it is tracked again; the "
+                    f"{self.perception_fault_timeout_s:.2f}s damping timeout is "
+                    "suspended."
+                )
+        elif was_active and self._perception_hold_exempt:
+            print(
+                "[PERCEPTION-HOLD] overwrite_proxy | not only the object is "
+                f"invalid now ({reason}): the "
+                f"{self.perception_fault_timeout_s:.2f}s damping timeout is running."
+            )
+        self._perception_hold_exempt = exempt
+
+    # ------------------------------------------------------------------
+    # Hardware command stream -- identical to b2wz1_wbc_uan.py
+    # ------------------------------------------------------------------
+    #
+    # b2wz1_wbc_uan.py, the low-level WBC test, runs ONE loop at control_hz
+    # (500 Hz). Every 10th tick it reads the robot and runs the WBC; EVERY tick
+    # it sends
+    #
+    #     b2w.send(leg_target, wheel_cmd)
+    #     z1.track_target_pd_once(arm_target, ..., use_startup_gains=False)
+    #
+    # so both robots get the 50 Hz WBC targets re-sent every 2 ms. The UAN the
+    # WBC was trained against was collected the same way (loop_hz 500,
+    # target_update_hz 50). The inherited hierarchical loop sent each target
+    # once per 20 ms instead. Here tick 0 is the inherited policy step (read ->
+    # HL -> WBC -> send) and ticks 1..N-1 re-send what it produced, on the same
+    # 2 ms grid.
+
+    def _configure_hardware_stream(self) -> None:
+        policy_hz = 1.0 / float(self.control_dt)
+        self._hw_rate_hz = float(self.cfg.get("hardware_command_hz", 500.0))
+        ratio = self._hw_rate_hz / policy_hz
+        if ratio < 1.0 - 1e-9 or abs(ratio - round(ratio)) > 1e-6:
+            raise ValueError(
+                f"hardware_command_hz={self._hw_rate_hz:g} must be an integer "
+                f"multiple of the {policy_hz:g} Hz WBC rate "
+                "(b2wz1_wbc_uan.py uses control_hz 500 / policy_hz 50)."
+            )
+        self._hw_ticks_per_step = int(round(ratio))
+        self._hw_dt = 1.0 / self._hw_rate_hz
+        self._hw_settle_s = float(self.cfg.get("z1_runtime_settle_s", 0.5))
+
+        if self._hw_ticks_per_step > 1 and self._arm_thread_enabled:
+            raise ValueError(
+                "arm_command_hz enables the separate Z1 arm thread, which cannot "
+                "run alongside hardware_command_hz: both would own Z1 comms. Set "
+                "arm_command_hz to the policy rate (50); hardware_command_hz "
+                f"already re-sends the arm target at {self._hw_rate_hz:g} Hz in "
+                "lockstep with the WBC, as b2wz1_wbc_uan.py does."
+            )
+
+        self._hw_last_arm_send = 0.0
+        self._hw_send_count = 0
+        self._hw_window_start = 0.0
+
+    def send_policy_targets(self) -> None:
+        super().send_policy_targets()
+        self._hw_note_arm_send(time.perf_counter())
+
+    def step_after_prime(self):
+        block_start = time.perf_counter()
+        ok, reason = super().step_after_prime()
+        if ok:
+            self._hw_hold_targets_for_block(block_start)
+        return ok, reason
+
+    def initialize_policy_state_and_history(self):
+        self._hw_runtime_gain_settle()
+        return super().initialize_policy_state_and_history()
+
+    def _hw_send_held_targets(self) -> None:
+        # The same two sends as tick 0 (sim2real send_policy_targets). low_cmd
+        # still holds the RL leg/wheel command it wrote, and arm_target /
+        # gripper_target still hold the WBC / HL outputs of this step.
+        self.send_b2w_cmd()
+        self.z1.track_target_pd_runtime_once(
+            q_target=self.arm_target.copy(),
+            gripper_q_target_training=float(self.gripper_target),
+            use_startup_gains=False,
+        )
+        self._hw_note_arm_send(time.perf_counter())
+
+    def _hw_hold_targets_for_block(self, block_start: float) -> None:
+        for tick in range(1, self._hw_ticks_per_step):
+            deadline = block_start + tick * self._hw_dt
+            now = time.perf_counter()
+            if now < deadline:
+                time.sleep(deadline - now)
+            elif now >= deadline + self._hw_dt:
+                # A whole tick late after a slow policy step: skip it rather
+                # than burst identical packets. run() still ends the block.
+                continue
+            self._hw_send_held_targets()
+
+    def _hw_note_arm_send(self, t: float) -> None:
+        # Fills the inherited [HEALTH]/[TRACE] arm-rate and send-gap fields,
+        # which otherwise only the (disabled) arm thread writes.
+        if self._hw_last_arm_send > 0.0:
+            gap = t - self._hw_last_arm_send
+            self._arm_max_stall_s = max(self._arm_max_stall_s, gap)
+            self._window_arm_stall = max(self._window_arm_stall, gap)
+        self._hw_last_arm_send = t
+
+        if self._hw_window_start == 0.0:
+            self._hw_window_start = t
+            self._hw_send_count = 0
+        self._hw_send_count += 1
+        elapsed = t - self._hw_window_start
+        if elapsed >= 1.0:
+            self._arm_achieved_hz = self._hw_send_count / elapsed
+            self._hw_window_start = t
+            self._hw_send_count = 0
+
+    def _hw_runtime_gain_settle(self) -> None:
+        """The last startup block of b2wz1_wbc_uan.py, before its policy starts.
+
+        Hold DEFAULT for z1_runtime_settle_s on the RUNTIME gains -- B2W RL
+        gains, Z1 runtime firmware gains -- at the hardware rate. The inherited
+        startup went straight from the stiff startup-gain hold to the first WBC
+        step, so the WBC's first observations saw the arm mid gain-switch.
+        """
+        n = int(round(self._hw_settle_s * self._hw_rate_hz))
+        if n <= 0:
+            return
+        print(
+            f"[HW-RATE] settling {self._hw_settle_s:.2f}s at DEFAULT on runtime "
+            f"gains ({n} ticks at {self._hw_rate_hz:g} Hz) before the first WBC step."
+        )
+        t0 = time.perf_counter()
+        for i in range(n):
+            self._write_b2w_pose_cmd_policy(
+                self.default_b2w_pos_policy,
+                use_pd_gains=False,
+            )
+            self.send_b2w_cmd()
+            self.z1.track_target_pd_runtime_once(
+                q_target=self.default_arm_pos.copy(),
+                gripper_q_target_training=float(self.gripper_open_pos),
+                use_startup_gains=False,
+            )
+            deadline = t0 + (i + 1) * self._hw_dt
+            now = time.perf_counter()
+            if now < deadline:
+                time.sleep(deadline - now)
+
     def prime_first_hl_and_ll(self):
         # A new policy run gets fresh proxy/history/freeze state. The common
         # mocap controller still owns the actual reset/startup sequence.
         self._reset_hl_alignment_state()
         self._ensure_high_policy_observation_adapter(required=True)
-        return super().prime_first_hl_and_ll()
+        block_start = time.perf_counter()
+        result = super().prime_first_hl_and_ll()
+        # The primed step is the first 20 ms block, so it gets its re-sends too.
+        self._hw_hold_targets_for_block(block_start)
+        # run() waits one control_dt before its first step. That one-off gap is
+        # startup, not a send stall, so start the rate/gap statistics after it.
+        self._hw_last_arm_send = 0.0
+        self._hw_window_start = 0.0
+        print(
+            f"[HW-RATE] main loop re-sends B2W + Z1 lowcmd every "
+            f"{self._hw_dt * 1e3:.0f} ms ({self._hw_ticks_per_step} sends per "
+            f"{self.control_dt * 1e3:.0f} ms WBC step), as b2wz1_wbc_uan.py does."
+        )
+        return result
 
     def setup(self) -> None:
         print("=" * 108)
@@ -1068,21 +1378,37 @@ class B2WZ1MocapRetrievalUANTrainedController(
             "(no startup policy blend, no arm target rate limiter)"
         )
         print(
-            f"Arm target resend : {self._arm_command_hz:g} Hz "
-            "(hardware communication detail; not a deployed UAN frequency)"
+            f"Hardware stream   : B2W + Z1 lowcmd at {self._hw_rate_hz:g} Hz, "
+            f"{self._hw_ticks_per_step} sends per "
+            f"{self.control_dt * 1e3:.0f} ms WBC step (as b2wz1_wbc_uan.py)"
+        )
+        print(
+            f"Policy hand-off   : {self._hw_settle_s:.2f}s DEFAULT settle on RL "
+            "leg gains + Z1 runtime gains before the first WBC step"
         )
         print(
             f"Mocap root offset : {self.perception.root_offset_source()} | "
             f"{self._mocap_root_offset_resolved_path}"
         )
-        print(
-            "Grasp proxy       : SIM2SIM-ALIGNED | close + dist<0.10m + "
-            "not-fully-closed + holding | 3/3 hysteresis"
+        exit_steps = (
+            "latched"
+            if self.object_freeze_mode == "overwrite_proxy"
+            else str(self._grasp_proxy_exit_steps)
         )
         print(
-            "Object HL obs     : freeze object_center_pos_base on FIRST "
-            "grasp=False->True transition; hold until next policy run"
+            "Grasp proxy       : close + "
+            f"dist<{self._grasp_proxy_error_threshold:.2f}m + partially closed | "
+            f"enter {self._grasp_proxy_enter_steps} / exit {exit_steps} HL steps"
         )
+        print(
+            f"Object HL obs     : {self.object_freeze_mode} -> "
+            f"{_OBJECT_FREEZE_MODE_SUMMARY[self.object_freeze_mode]}"
+        )
+        if self.object_freeze_mode == "overwrite_proxy":
+            print(
+                "Object tracking   : loss never ends the run (before first "
+                "grasp: safe hold until tracked again; after: not needed)"
+            )
         print("=" * 108)
 
         super().setup()

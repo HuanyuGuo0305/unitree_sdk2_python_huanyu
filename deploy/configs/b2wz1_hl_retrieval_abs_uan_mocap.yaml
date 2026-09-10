@@ -50,7 +50,7 @@
 # low_policy.onnx: frozen WBC trained with model_4000 UAN in Isaac Lab.
 # high_policy.onnx: ABS retrieval policy trained on top of that frozen WBC+UAN.
 low_policy_path: "exported_policies/b2wz1_hl_retrieval_abs_uan_mocap/low_policy.onnx"
-high_policy_path: "exported_policies/b2wz1_hl_retrieval_abs_uan_mocap/high_policy.onnx"
+high_policy_path: "exported_policies/b2wz1_hl_retrieval_abs_uan_mocap/high_policy_2.onnx"
 
 # ======================================================================
 # Control hierarchy
@@ -356,7 +356,7 @@ grasp_proxy_mode: "heuristic"
 gripper_center_offset_local: [0.075, 0.0, 0.01]
 
 # Restored distance gate: this MUST be 0.10 m to match training/sim2sim.
-grasp_proxy_error_threshold: 0.20
+grasp_proxy_error_threshold: 0.15
 
 # IMPORTANT: both angle thresholds below are in TRAINING gripper coordinates.
 gripper_not_fully_closed_angle_threshold: -0.08726646259971647
@@ -390,8 +390,12 @@ log_base_grasp_proxy: false
 grasp_proxy_log: true
 grasp_proxy_log_period_s: 1.0
 
-grasp_proxy_enter_steps: 3
-grasp_proxy_exit_steps: 3
+# Consecutive HL steps (10 Hz) the proxy candidate must hold to latch (enter),
+# or be absent to release (exit). Training/sim2sim used 3 for both. Any integer
+# >= 1 is accepted; a value other than 3 prints a [UAN-AUDIT] notice at startup.
+# exit is ignored once object_freeze_mode "overwrite_proxy" has latched.
+grasp_proxy_enter_steps: 2
+grasp_proxy_exit_steps: 2
 
 # Object observation after grasp:
 # On the FIRST false->true grasp-proxy transition, capture the ACTUAL measured
@@ -420,7 +424,17 @@ freeze_object_center_pos_base_on_grasp: true
 #       Freeze on the FIRST rising edge and hold that value for the rest of the
 #       run, whatever the proxy does afterwards. This is what training did.
 #       Cleared only by a full policy reset.
-object_freeze_mode: "Stage2_object_freeze"
+#
+#   "overwrite_proxy"
+#       On the FIRST rising edge, hold grasp_confidence_proxy at 1 AND replace
+#       object_center_pos_base with the live gripper_center_pos_base (the
+#       training-defined gripper center, moving with the gripper), both for the
+#       rest of the run. grasp_proxy_exit_steps is then unused. Losing object
+#       tracking never ends the run in this mode: once latched the object is not
+#       needed, and before that the safe hold waits for the object instead of
+#       timing out (see perception_fault_timeout_s). Cleared only by a full
+#       policy reset.
+object_freeze_mode: "overwrite_proxy"
 
 # ======================================================================
 # Z1 SDK / FK
@@ -453,7 +467,7 @@ arm_kds_runtime: [234.375, 312.5, 234.375, 234.375, 234.375, 234.375]
 # z1_ctrl firmware closes the gripper loop at its own rate instead of Python
 # integrating a torque law at the send rate.
 z1_gripper_kp: 20.0
-z1_gripper_kd: 5000.0
+z1_gripper_kd: 10000.0
 
 # Shrink the commanded gripper travel at both ends, TRAINING coordinates.
 # 0.0 allows the full [gripper_open_pos, gripper_close_pos] range. Raise it to
@@ -590,6 +604,29 @@ z1_debug_print: true
 arm_command_hz: 50.0
 arm_thread_enabled: true
 
+# ----------------------------------------------------------------------
+# Hardware command stream -- parity with deploy/b2wz1_wbc_uan.py
+# ----------------------------------------------------------------------
+#
+# The low-level WBC test runs ONE 500 Hz loop: the WBC runs every 10th tick,
+# and EVERY tick re-sends the held targets to the B2W (lowcmd) and the Z1
+# (track_target_pd_once, runtime gains). The UAN the WBC was trained against
+# was collected the same way (z1_uan_data_collection: loop_hz 500,
+# target_update_hz 50).
+#
+# hardware_command_hz makes this controller do exactly that: each 50 Hz WBC
+# step is followed by (hardware_command_hz / 50 - 1) re-sends of its B2W + Z1
+# targets on the same 2 ms grid. Must be an integer multiple of the WBC rate;
+# 50 restores one send per step. It owns Z1 comms, so arm_command_hz above must
+# stay at the policy rate (arm thread off).
+hardware_command_hz: 500.0
+
+# Also from b2wz1_wbc_uan.py: before the first WBC step, hold DEFAULT for this
+# long on the runtime gains (B2W RL gains, Z1 arm_kps/kds_runtime) at the
+# hardware rate, so the WBC starts on a settled arm instead of one mid-switch
+# from the stiff startup gains. 0 disables.
+z1_runtime_settle_s: 0.5
+
 # Warn once if the policy loop stops refreshing the target for this long. The
 # thread keeps holding the last target rather than going quiet: under
 # z1_arm_runtime_mode "dcmotor" the arm is held up ONLY by that torque
@@ -710,8 +747,8 @@ mocap_body_max_age_s: 0.25
 
 # The object to retrieve. Offset it from the marker centroid to the point the
 # policy should treat as the object centre (what the gripper closes on).
-mocap_object_name: "object"
-mocap_object_id: 11
+mocap_object_name: "cube6"
+mocap_object_id: 14
 mocap_object_offset_local: [0.0, 0.0, 0.0]
 mocap_object_max_age_s: 0.30
 
@@ -722,7 +759,7 @@ mocap_retrieval_name: "retrieval"
 # Renumbered in Motive: the asset streams as id 12, not 11. Name resolution
 # takes precedence over this anyway, so it now only matters if the server
 # stops answering the model-definition request.
-mocap_retrieval_id: 12
+mocap_retrieval_id: 13
 mocap_retrieval_offset_local: [0.0, 0.0, 0.0]
 mocap_retrieval_max_age_s: 0.25
 
@@ -760,6 +797,8 @@ mocap_root_offset_path: null
 # Runtime behavior:
 # invalid mocap -> safe hold (HL suspended, LL still 50 Hz)
 # continuous invalidity >= this duration -> damping protection.
+# Exception: with object_freeze_mode "overwrite_proxy" an invalid OBJECT alone
+# never times out (the hold waits for it); retrieval invalidity still does.
 perception_fault_timeout_s: 0.50
 perception_status_print_s: 1.0
 
@@ -866,6 +905,11 @@ visualizer_xml_path: "/home/huanyuguo/Workspace_huanyu/unitree_mujoco_huanyu/uni
 visualizer_update_hz: 30.0
 
 visualizer_object_marker_radius: 0.03
+
+# Draw the object as a CUBE of this side length (m) at its measured mocap
+# orientation, instead of a sphere. cube6 is a 6 cm cube, so 0.06.
+# Set to 0.0 to go back to a sphere of visualizer_object_marker_radius.
+visualizer_object_cube_size: 0.06
 visualizer_retrieval_marker_radius: 0.05
 visualizer_ee_target_sphere_radius: 0.03
 visualizer_ee_target_axis_len: 0.20

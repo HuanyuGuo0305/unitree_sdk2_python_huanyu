@@ -428,8 +428,22 @@ z1_debug_print: true
 #
 # Set equal to or below the policy rate (or arm_thread_enabled: false) to go
 # back to commanding the arm inline in the 50 Hz loop.
-arm_command_hz: 200.0
+#
+# SUPERSEDED for this UAN deployment: hardware_command_hz below re-sends the
+# B2W + Z1 targets at 500 Hz inside the main loop, exactly like
+# deploy/b2wz1_wbc_uan.py. The arm thread would fight it for Z1 comms, so it is
+# kept off by holding arm_command_hz at the policy rate.
+arm_command_hz: 50.0
 arm_thread_enabled: true
+
+# Hardware command stream -- parity with deploy/b2wz1_wbc_uan.py (500 Hz loop,
+# WBC every 10th tick, B2W + Z1 re-sent every tick). Must be an integer
+# multiple of the WBC rate; 50 restores one send per step.
+hardware_command_hz: 500.0
+
+# b2wz1_wbc_uan.py's hand-off: hold DEFAULT this long on runtime gains before
+# the first WBC step. 0 disables.
+z1_runtime_settle_s: 0.5
 
 # Warn once if the policy loop stops refreshing the target for this long. The
 # thread keeps holding the last target rather than going quiet: under

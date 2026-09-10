@@ -27,9 +27,11 @@ Important alignment rules
 8) No startup policy-action blend-in.
 9) No arm joint-target rate limiter.
 10) Z1 runtime actuators.
-    Gripper: ALWAYS "dcmotor" -- training-space IdealPD + exact IsaacLab
-      DCMotor torque-speed law, sent as external tau_f with no post-DCMotor
-      deployment torque cap. Not selectable.
+    Gripper: z1_gripper_runtime_mode selects "dcmotor" (training-space
+      IdealPD + exact IsaacLab DCMotor torque-speed law, sent as external
+      tau_f with no post-DCMotor deployment torque cap) or "position_pd"
+      (firmware gripper PD at the controller rate; not the trained actuator,
+      allowed because the HL gripper action is binary open/close).
     Arm: selected by z1_arm_runtime_mode.
        position_pd : Z1 firmware position loop with arm_kps_runtime /
                      arm_kds_runtime, tau_f = 0. Default.
@@ -1204,6 +1206,59 @@ class B2WZ1HierarchicalRetrievalController:
             )
         )
 
+        # Gripper force-close mode.
+        #
+        #   "off"
+        #       Never force. The policy's binary action[8] alone decides.
+        #
+        #   "while_proxy"
+        #       Force close WHILE grasp_confidence_proxy is true. This is the
+        #       legacy stage2_force_gripper_close_enabled behaviour: it tracks
+        #       the proxy, so in "heuristic" proxy mode -- where the proxy can
+        #       fall back to false after grasp_proxy_exit_steps -- the forced
+        #       close is released again.
+        #
+        #   "Stage2_gripper_close"
+        #       Latch on the FIRST time grasp_confidence_proxy becomes true,
+        #       then force close for the rest of the run no matter what the
+        #       proxy does afterwards. Once the object is believed to be in
+        #       hand, the gripper never reopens.
+        #
+        # Defaults are derived from the old boolean so existing YAMLs keep
+        # their exact behaviour without naming the new key.
+        # Print the BASE controller's own [GRASP-PROXY] transitions.
+        #
+        # In the UAN/mocap deployments this value is recomputed and overwritten
+        # by the wrapper's aligned proxy, and the base rule intentionally has
+        # no object<->gripper distance gate -- so its line can announce a
+        # transition that never takes effect (observed: "0 -> 1 | error=0.231 m"
+        # on a step the authoritative proxy scored as fail). Those wrappers turn
+        # this off and log [GRASP] instead; standalone deployments keep it.
+        self.log_base_grasp_proxy = bool(
+            self.cfg.get("log_base_grasp_proxy", True)
+        )
+
+        self.valid_gripper_force_close_modes = (
+            "off",
+            "while_proxy",
+            "Stage2_gripper_close",
+        )
+        self.gripper_force_close_mode = str(
+            self.cfg.get(
+                "gripper_force_close_mode",
+                "while_proxy" if self.stage2_force_gripper_close_enabled else "off",
+            )
+        ).strip()
+        if self.gripper_force_close_mode not in self.valid_gripper_force_close_modes:
+            raise ValueError(
+                "Invalid gripper_force_close_mode="
+                f"{self.gripper_force_close_mode!r}. Expected one of "
+                f"{list(self.valid_gripper_force_close_modes)}."
+            )
+
+        # Latch for "Stage2_gripper_close". Cleared on every policy reset.
+        self._stage2_close_latched = False
+
         # Grasp proxy deployment mode:
         #
         #   heuristic
@@ -1285,8 +1340,10 @@ class B2WZ1HierarchicalRetrievalController:
 
         # Z1 runtime actuator modes.
         #
-        # gripper: ALWAYS "dcmotor" (training-exact IdealPD + IsaacLab DCMotor
-        #          torque-speed law through tau_f). Not selectable.
+        # gripper: z1_gripper_runtime_mode selects
+        #            "dcmotor"     -> training-exact IdealPD + IsaacLab DCMotor
+        #                             torque-speed law through tau_f
+        #            "position_pd" -> firmware gripper PD at the controller rate
         #
         # arm    : z1_arm_runtime_mode selects
         #            "position_pd" -> firmware position loop (default)
@@ -2011,11 +2068,18 @@ class B2WZ1HierarchicalRetrievalController:
         Validate the selected Z1 runtime actuator modes before any hardware
         motion is allowed.
 
-        GRIPPER: always "dcmotor".  Internal gripper gains are zeroed and the
+        GRIPPER: z1_gripper_runtime_mode selects the path.
+
+        "dcmotor" (training-aligned): internal gripper gains are zeroed and the
         training-space IdealPD + exact IsaacLab DCMotor torque-speed law is
-        sent as tau_f, with no post-DCMotor deployment torque cap.  There is
-        no alternative: the legacy position servo does not reproduce the
-        trained grasp dynamics, and is used only by startup/hold paths.
+        sent as tau_f, with no post-DCMotor deployment torque cap.
+
+        "position_pd": the firmware gripper PD (z1_gripper_kp / z1_gripper_kd)
+        closes the loop at the controller rate and the command is a position in
+        RAW SDK coordinates, clamped to the configured travel. This does not
+        reproduce the trained grasp dynamics, and is permitted because the
+        high-level gripper action is binary open/close and grasp feedback
+        reaches the policy through the grasp proxy.
 
         ARM: selected by z1_arm_runtime_mode.
 
@@ -2042,10 +2106,10 @@ class B2WZ1HierarchicalRetrievalController:
 
         if (
             self.z1_gripper_runtime_mode
-            != "dcmotor"
+            not in ("dcmotor", "position_pd")
         ):
             raise ValueError(
-                "The runtime gripper only supports 'dcmotor', got "
+                "The runtime gripper supports 'dcmotor' or 'position_pd', got "
                 f"{self.z1.gripper_runtime_mode!r}."
             )
 
@@ -2069,7 +2133,17 @@ class B2WZ1HierarchicalRetrievalController:
                 "Invalid z1_gripper_q_offset."
             )
 
-        self._validate_gripper_dcmotor_alignment()
+        if self.z1_gripper_runtime_mode == "dcmotor":
+            self._validate_gripper_dcmotor_alignment()
+        else:
+            print(
+                "[Z1-GRIPPER] runtime mode 'position_pd': the firmware closes "
+                "the gripper loop at the controller rate. The IsaacLab DCMotor "
+                "envelope used in training is NOT reproduced, so the training "
+                "alignment audit is skipped. The high-level gripper action is "
+                "binary open/close, so this affects grasp dynamics only, not "
+                "the policy interface."
+            )
 
         if (
             self.z1_arm_runtime_mode
@@ -2795,6 +2869,32 @@ class B2WZ1HierarchicalRetrievalController:
             )
         )
 
+    def resolve_executed_gripper_close(self, binary_close: bool) -> bool:
+        """Decide the ACTUALLY executed gripper close for this HL step.
+
+        Shared by every decode_hl_action implementation so the three modes
+        cannot drift apart between the delta and ABS decoders.
+        """
+        binary_close = bool(binary_close)
+        mode = self.gripper_force_close_mode
+
+        if mode == "off":
+            return binary_close
+
+        if mode == "while_proxy":
+            return binary_close or bool(self.grasp_confidence_proxy)
+
+        # "Stage2_gripper_close": latch on the first rising edge of the proxy.
+        if bool(self.grasp_confidence_proxy) and not self._stage2_close_latched:
+            self._stage2_close_latched = True
+            print(
+                "[STAGE2-CLOSE] grasp_confidence_proxy became TRUE for the "
+                "first time -- gripper command is now LATCHED CLOSED for the "
+                "rest of the run (proxy may fall back to false; the latch "
+                "does not)."
+            )
+        return binary_close or self._stage2_close_latched
+
     def _latch_command_assumed_grasp_if_needed(
         self,
         executed_close: bool,
@@ -2835,12 +2935,13 @@ class B2WZ1HierarchicalRetrievalController:
         self.grasp_proxy_exit_count = 0
         self.last_grasp_error = 0.0
 
-        print(
-            "[GRASP-PROXY] "
-            f"{int(old_proxy)} -> 1 | "
-            "mode=COMMAND_ASSUMED | "
-            "reason=FIRST_EXECUTED_CLOSE_COMMAND"
-        )
+        if self.log_base_grasp_proxy:
+            print(
+                "[GRASP-PROXY] "
+                f"{int(old_proxy)} -> 1 | "
+                "mode=COMMAND_ASSUMED | "
+                "reason=FIRST_EXECUTED_CLOSE_COMMAND"
+            )
 
     def update_grasp_confidence_proxy(
         self,
@@ -2981,14 +3082,15 @@ class B2WZ1HierarchicalRetrievalController:
             old_proxy
             != self.grasp_confidence_proxy
         ):
-            print(
-                "[GRASP-PROXY] "
-                f"{int(old_proxy)} -> "
-                f"{int(self.grasp_confidence_proxy)} | "
-                "mode=HEURISTIC | "
-                f"error={grasp_error:.3f} m | "
-                f"gripper_q_train={gripper_q:+.3f}"
-            )
+            if self.log_base_grasp_proxy:
+                print(
+                    "[GRASP-PROXY] "
+                    f"{int(old_proxy)} -> "
+                    f"{int(self.grasp_confidence_proxy)} | "
+                    "mode=HEURISTIC | "
+                    f"error={grasp_error:.3f} m | "
+                    f"gripper_q_train={gripper_q:+.3f}"
+                )
 
     def resolve_effective_task_state(
         self,
@@ -3468,10 +3570,8 @@ class B2WZ1HierarchicalRetrievalController:
         )
 
         executed_close = (
-            binary_close
-            or (
-                self.stage2_force_gripper_close_enabled
-                and self.grasp_confidence_proxy
+            self.resolve_executed_gripper_close(
+                binary_close
             )
         )
 
@@ -5270,6 +5370,7 @@ class B2WZ1HierarchicalRetrievalController:
         self.grasp_confidence_proxy = False
         self.grasp_proxy_enter_count = 0
         self.grasp_proxy_exit_count = 0
+        self._stage2_close_latched = False
 
         self.prev_gripper_joint_pos = (
             self._get_gripper_q_training()
@@ -5679,6 +5780,16 @@ class B2WZ1HierarchicalRetrievalController:
 
         print(
             "Post-DCMotor cap : NONE"
+        )
+
+        print(
+            "Gripper force-close: "
+            f"{self.gripper_force_close_mode}"
+            + (
+                "  (latches CLOSED on the first grasp-proxy rising edge)"
+                if self.gripper_force_close_mode == "Stage2_gripper_close"
+                else ""
+            )
         )
 
         if (

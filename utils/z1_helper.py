@@ -450,11 +450,41 @@ class Z1ArmAdapter:
             cfg.get("z1_gripper_runtime_mode", "dcmotor")
         ).strip().lower()
 
-        if self.gripper_runtime_mode != "dcmotor":
+        # "dcmotor":     training-exact IdealPD + IsaacLab DCMotor torque-speed
+        #                envelope, computed HERE and sent through tau_f with the
+        #                firmware gripper gains zeroed. Reproduces training, but
+        #                Python is the loop: its fidelity is bounded by the send
+        #                rate, and the envelope's velocity-dependent braking
+        #                needs a fast rate to work (the gripper reaches ~3.8
+        #                rad/s, so at 50 Hz the brake is up to 20 ms stale).
+        # "position_pd": firmware gripper position PD at the controller's own
+        #                500 Hz, driven by z1_gripper_kp / z1_gripper_kd. Not
+        #                the trained actuator model, but the loop closes 10x
+        #                faster and does not depend on the Python send rate.
+        #                The gripper action is binary open/close, so actuator
+        #                fidelity matters far less here than on the arm joints.
+        self.valid_gripper_runtime_modes = ("dcmotor", "position_pd")
+        if self.gripper_runtime_mode not in self.valid_gripper_runtime_modes:
             raise ValueError(
                 "Invalid z1_gripper_runtime_mode="
-                f"{self.gripper_runtime_mode!r}; the runtime gripper only "
-                "supports 'dcmotor'."
+                f"{self.gripper_runtime_mode!r}; expected one of "
+                f"{sorted(self.valid_gripper_runtime_modes)}."
+            )
+
+        # Commanded gripper travel, TRAINING coordinates (close=0, open=-pi/2).
+        # Used to clamp a position command so the firmware PD is never asked to
+        # drive past a mechanical stop. z1_gripper_travel_margin_rad shrinks the
+        # range at both ends if you want to stay clear of the hard stops.
+        _grip_open = float(cfg.get("gripper_open_pos", -0.5 * np.pi))
+        _grip_close = float(cfg.get("gripper_close_pos", 0.0))
+        _grip_margin = float(cfg.get("z1_gripper_travel_margin_rad", 0.0))
+        self.gripper_travel_min_training = min(_grip_open, _grip_close) + _grip_margin
+        self.gripper_travel_max_training = max(_grip_open, _grip_close) - _grip_margin
+        if not self.gripper_travel_max_training > self.gripper_travel_min_training:
+            raise ValueError(
+                "z1_gripper_travel_margin_rad collapses the gripper travel: "
+                f"[{self.gripper_travel_min_training}, "
+                f"{self.gripper_travel_max_training}]"
             )
 
         # Runtime ARM actuator mode.
@@ -827,6 +857,18 @@ class Z1ArmAdapter:
             "[Z1ArmAdapter] Gripper runtime mode:",
             self.gripper_runtime_mode,
         )
+        if self.gripper_runtime_mode == "position_pd":
+            print(
+                "[Z1ArmAdapter] Gripper FIRMWARE position PD: "
+                f"kp={self.gripper_kp:g}, kd={self.gripper_kd:g} (raw firmware "
+                "units), loop closed by z1_ctrl at its own rate. "
+                "Training's DCMotor envelope is NOT reproduced."
+            )
+            print(
+                "[Z1ArmAdapter] Gripper command clamped to training range "
+                f"[{self.gripper_travel_min_training:+.4f}, "
+                f"{self.gripper_travel_max_training:+.4f}] rad"
+            )
         if self.gripper_runtime_mode == "dcmotor":
             print(
                 "[Z1ArmAdapter] Gripper DCMotor: "
@@ -837,6 +879,92 @@ class Z1ArmAdapter:
                 f"vel={self.gripper_dcmotor_velocity_limit:.1f} rad/s, "
                 "post_cap=NONE"
             )
+
+    # ------------------------------------------------------------------
+    # Raw low-level telemetry
+    # ------------------------------------------------------------------
+
+    #: Bit meanings of LowlevelState::errorstate (see LowlevelState.h).
+    MOTOR_ERROR_BITS = (
+        (0x01, "phase_current_too_large"),
+        (0x02, "phase_leakage"),
+        (0x04, "winding_overheat"),
+        (0x20, "parameters_jump"),
+        (0x40, "ignore"),
+    )
+
+    #: Meanings of LowlevelState::isMotorConnected.
+    MOTOR_CONN_MEANING = {
+        0: "OK",
+        1: "motor comms disconnected once",
+        2: "motor comms CRC error once",
+    }
+
+    def lowlevel_diagnostics_available(self) -> bool:
+        """True when the pybind binding exposes the diagnostic vectors.
+
+        The stock z1_sdk binding only wrapped q/qd/tau. temperature,
+        errorstate and isMotorConnected exist in LowlevelState.h but were not
+        bound, so an un-rebuilt SDK returns False here and the logger simply
+        writes empty columns for them.
+        """
+        ls = getattr(self.arm, "lowstate", None)
+        return ls is not None and hasattr(ls, "isMotorConnected")
+
+    def snapshot_lowlevel(self) -> dict:
+        """One raw sample of everything the SDK exposes, arm AND gripper.
+
+        Safe to call from the arm thread right after a send: it only reads.
+        The per-motor vectors carry the gripper as their LAST element when the
+        arm was constructed with a gripper.
+        """
+        ls = self.arm.lowstate
+
+        def _vec(name):
+            try:
+                return [x for x in getattr(ls, name)]
+            except Exception:  # noqa: BLE001 - diagnostics must never raise
+                return []
+
+        with self._state_lock:
+            snap = {
+                "q": np.asarray(self.q, dtype=np.float64).reshape(6).tolist(),
+                "qd": np.asarray(self.qd, dtype=np.float64).reshape(6).tolist(),
+                "tau": np.asarray(self.tau, dtype=np.float64).reshape(6).tolist(),
+                "gripper_q": float(self.gripper_q),
+                "gripper_qd": float(self.gripper_qd),
+                "fsm": self._fsm_state,
+            }
+
+        try:
+            snap["gripper_tau"] = float(ls.getGripperTau())
+        except Exception:  # noqa: BLE001
+            snap["gripper_tau"] = float("nan")
+
+        # Raw per-motor vectors (arm joints + gripper last).
+        snap["q_all"] = _vec("q_all")
+        snap["dq_all"] = _vec("dq_all")
+        snap["ddq_all"] = _vec("ddq_all")
+        snap["tau_all"] = _vec("tau_all")
+        snap["temperature"] = _vec("temperature")
+        snap["errorstate"] = _vec("errorstate")
+        snap["motor_connected"] = _vec("isMotorConnected")
+        return snap
+
+    @classmethod
+    def decode_motor_errorstate(cls, value: int) -> str:
+        """Human-readable decode of one errorstate byte."""
+        try:
+            value = int(value)
+        except Exception:  # noqa: BLE001
+            return "?"
+        if value == 0:
+            return "OK"
+        names = [name for bit, name in cls.MOTOR_ERROR_BITS if value & bit]
+        unknown = value & ~sum(bit for bit, _ in cls.MOTOR_ERROR_BITS)
+        if unknown:
+            names.append(f"unknown_0x{unknown:02x}")
+        return "|".join(names) if names else f"0x{value:02x}"
 
     def get_arm_dt(self) -> float:
         return self.arm_control_dt
@@ -1130,6 +1258,18 @@ class Z1ArmAdapter:
 
         qd_traj = ((target_q - q0) / max(duration_s, 1e-6)).astype(np.float32)
 
+        # Frozen-lowstate diagnostic for this startup ramp.
+        #
+        # The 200 Hz runtime watchdog does not exist yet at this point (the arm
+        # thread only starts once the policy loop is primed), so without this a
+        # dead arm link makes move_to_pose_official ramp a command into nothing
+        # for the whole duration and then return as if it had succeeded. This is
+        # REPORT-ONLY: it never raises and never changes what is commanded.
+        frozen_run = 0
+        max_frozen_run = 0
+        last_state_sig = None
+        frozen_warned = False
+
         for step in range(num_steps):
             alpha = float(step + 1) / float(num_steps)
             q_cmd = ((1.0 - alpha) * q0 + alpha * target_q).astype(np.float32)
@@ -1165,6 +1305,31 @@ class Z1ArmAdapter:
 
             self._read_state_from_sdk_once()
 
+            # A live encoder read is never bit-identical twice running. All six
+            # joints plus velocity, torque and the gripper repeating exactly
+            # means lowstate is a cache that stopped updating.
+            state_sig = (
+                self.q.tobytes(),
+                self.qd.tobytes(),
+                self.tau.tobytes(),
+                float(self.gripper_q),
+            )
+            if last_state_sig is not None and state_sig == last_state_sig:
+                frozen_run += 1
+                max_frozen_run = max(max_frozen_run, frozen_run)
+                if not frozen_warned and frozen_run * dt >= 0.10:
+                    frozen_warned = True
+                    print(
+                        f"\n[Z1-OFFICIAL][FREEZE][WARN] lowstate has not changed "
+                        f"for {frozen_run * dt * 1e3:.0f} ms at step {step + 1} "
+                        f"(fsm still {self.arm.getCurrentState()}). The arm link "
+                        "is very likely down: commands are going nowhere and the "
+                        "state below is a stale cache."
+                    )
+            else:
+                frozen_run = 0
+                last_state_sig = state_sig
+
             if step_callback is not None:
                 step_callback()
 
@@ -1192,6 +1357,26 @@ class Z1ArmAdapter:
                 break
 
             time.sleep(dt)
+
+        # Did the arm actually get there? A silent no-op here is what makes a
+        # dead link look like "I pressed the button and nothing happened".
+        self._read_state_from_sdk_once()
+        final_err = np.abs(self.q - target_q)
+        moved = float(np.max(np.abs(self.q - q0)))
+        if max_frozen_run * dt >= 0.10 or float(np.max(final_err)) > 0.15:
+            print(
+                "\n[Z1-OFFICIAL][ERROR] the arm did NOT reach the requested pose.\n"
+                f"  q0            = {np.round(q0, 4).tolist()}\n"
+                f"  target_q      = {np.round(target_q, 4).tolist()}\n"
+                f"  q_meas_final  = {np.round(self.q, 4).tolist()}\n"
+                f"  |err| final   = {np.round(final_err, 4).tolist()}\n"
+                f"  max |q moved| = {moved:.4f} rad\n"
+                f"  longest frozen lowstate run = {max_frozen_run * dt * 1e3:.0f} ms\n"
+                "  A long frozen run means the Z1 link/z1_controller stopped "
+                "serving fresh state, so nothing was actuated. Check that "
+                "z1_controller is running and the arm is powered/enabled.\n"
+                "  This is a REPORT ONLY: startup continues."
+            )
 
         self.hold_pose_lowcmd(
             q_cmd=target_q,
@@ -1294,24 +1479,47 @@ class Z1ArmAdapter:
 
             self._arm_external_torque_active = bool(arm_external_torque)
 
-            # set_control_gain() writes arm gains and the legacy gripper gains.
-            # Therefore zero ONLY the gripper gains immediately afterwards.
+            gripper_external_torque = self.gripper_runtime_mode == "dcmotor"
+
+            # set_control_gain() writes arm gains AND the firmware gripper
+            # gains (z1_gripper_kp / z1_gripper_kd). In "dcmotor" the gripper
+            # gains are zeroed straight afterwards so tau_f owns the joint; in
+            # "position_pd" they are left in place and the firmware closes the
+            # gripper loop at its own rate.
+            if not gripper_external_torque and self._gripper_external_dcmotor_active:
+                # Coming back from the zero-gain path: force a gain refresh so
+                # the firmware gripper gains are actually re-applied.
+                self._last_applied_kp = None
+                self._last_applied_kd = None
+
             self.set_control_gain(kp, kd)
 
-            if not hasattr(self.lowcmd, "setGripperZeroGain"):
-                raise RuntimeError(
-                    "Z1 lowcmd binding does not expose setGripperZeroGain()."
-                )
-            self.lowcmd.setGripperZeroGain()
-            self._gripper_external_dcmotor_active = True
+            if gripper_external_torque:
+                if not hasattr(self.lowcmd, "setGripperZeroGain"):
+                    raise RuntimeError(
+                        "Z1 lowcmd binding does not expose setGripperZeroGain()."
+                    )
+                self.lowcmd.setGripperZeroGain()
 
-            (
-                gripper_tau_send,
-                gripper_tau_pd,
-                gripper_tau_dcmotor,
-                gripper_q_sim,
-                gripper_qd_sim,
-            ) = self._compute_gripper_dcmotor_tau(gripper_q_target_sim)
+            self._gripper_external_dcmotor_active = bool(gripper_external_torque)
+
+            if gripper_external_torque:
+                (
+                    gripper_tau_send,
+                    gripper_tau_pd,
+                    gripper_tau_dcmotor,
+                    gripper_q_sim,
+                    gripper_qd_sim,
+                ) = self._compute_gripper_dcmotor_tau(gripper_q_target_sim)
+            else:
+                # Firmware position PD. Nothing is integrated here, so there is
+                # no torque to report; the diagnostics stay defined so the
+                # telemetry columns keep their meaning.
+                gripper_tau_send = 0.0
+                gripper_tau_pd = 0.0
+                gripper_tau_dcmotor = 0.0
+                gripper_q_sim = float(self.get_gripper_q_training())
+                gripper_qd_sim = float(self.gripper_qd)
 
             # Arm: firmware position PD, or zero-gain external tau_f depending
             # on arm_runtime_mode (resolved above).
@@ -1320,10 +1528,30 @@ class Z1ArmAdapter:
             self.arm.tau = tau_cmd
             self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
 
-            # Gripper: zero internal PD, direct external torque through tau_f.
-            # q field is dynamically irrelevant with zero gripper gains, so use
-            # the latest measured raw q as the safest benign command value.
-            self.arm.gripperQ = float(self.gripper_q)
+            if gripper_external_torque:
+                # Gripper: zero internal PD, direct external torque through
+                # tau_f. The q field is dynamically irrelevant with zero
+                # gripper gains, so use the latest measured raw q as the safest
+                # benign command value.
+                gripper_q_cmd_sdk = float(self.gripper_q)
+            else:
+                # Firmware position PD: q IS the command, so it must be in RAW
+                # SDK coordinates, not the training space the policy uses.
+                #   q_sdk = q_training + gripper_q_offset
+                #
+                # Clamp to the configured travel first. The DCMotor path was
+                # observed driving 0.04 rad past the open stop at 36.8 Nm; a
+                # position command must never ask for beyond-stop travel.
+                q_train_cmd = float(
+                    np.clip(
+                        float(gripper_q_target_sim),
+                        self.gripper_travel_min_training,
+                        self.gripper_travel_max_training,
+                    )
+                )
+                gripper_q_cmd_sdk = self.gripper_training_to_sdk(q_train_cmd)
+
+            self.arm.gripperQ = float(gripper_q_cmd_sdk)
             self.arm.gripperQd = 0.0
             self.arm.gripperTau = float(gripper_tau_send)
             self.arm.setGripperCmd(
@@ -1379,8 +1607,16 @@ class Z1ArmAdapter:
                 closed = 0
                 open   = -pi/2
 
-        The GRIPPER is always driven by the exact external IdealPD + IsaacLab
-        DCMotor tau_f law (internal gripper gains zeroed).
+        The GRIPPER follows z1_gripper_runtime_mode:
+
+            "dcmotor":
+                exact external IdealPD + IsaacLab DCMotor tau_f law
+                (internal gripper gains zeroed).
+
+            "position_pd":
+                firmware gripper PD at the controller rate, commanded with a
+                position in RAW SDK coordinates clamped to the configured
+                travel; tau_f is zero.
 
         The ARM follows z1_arm_runtime_mode:
 

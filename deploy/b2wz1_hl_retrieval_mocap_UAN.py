@@ -72,6 +72,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from typing import Any, Optional
 
 import numpy as np
@@ -211,8 +212,65 @@ class B2WZ1MocapRetrievalUANTrainedController(
         self._gripper_angle_hold_threshold = float(
             self.cfg["gripper_angle_hold_threshold"]
         )
+
+        # Lower bound on gripper closure, TRAINING coordinates
+        # (open = gripper_open_pos ~ -pi/2, closed = 0).
+        #
+        # gripper_not_fully_closed is only an UPPER bound: it rejects "slammed
+        # fully shut", but a WIDE-OPEN gripper passes it trivially. Without a
+        # lower bound the proxy can therefore declare a grasp before the
+        # fingers have moved at all -- observed latching at q=-1.5522 with the
+        # gripper still on its open stop, which permanently froze the object
+        # observation and latched Stage2_gripper_close onto nothing.
+        #
+        # Requiring q_train > this makes the term "PARTIALLY closed": the
+        # fingers have travelled off the open stop, but have not shut on air.
+        # Defaults to gripper_open_pos, i.e. no-op, so existing configs keep
+        # their exact behaviour.
+        self._gripper_open_pos_training = float(
+            self.cfg.get("gripper_open_pos", -0.5 * np.pi)
+        )
+        self._gripper_min_closed_threshold = float(
+            self.cfg.get(
+                "gripper_min_closed_angle_threshold",
+                self._gripper_open_pos_training,
+            )
+        )
+        if not (
+            self._gripper_open_pos_training - 1e-9
+            <= self._gripper_min_closed_threshold
+            < self._gripper_not_fully_closed_threshold
+        ):
+            raise ValueError(
+                "gripper_min_closed_angle_threshold must satisfy "
+                f"gripper_open_pos ({self._gripper_open_pos_training:.4f}) <= "
+                f"value ({self._gripper_min_closed_threshold:.4f}) < "
+                "gripper_not_fully_closed_angle_threshold "
+                f"({self._gripper_not_fully_closed_threshold:.4f})."
+            )
         self._grasp_proxy_enter_steps = int(self.cfg["grasp_proxy_enter_steps"])
         self._grasp_proxy_exit_steps = int(self.cfg["grasp_proxy_exit_steps"])
+
+        # Terminal logging of the grasp proxy and every term feeding it.
+        #   grasp_proxy_log          : master on/off
+        #   grasp_proxy_log_period_s : heartbeat interval when nothing changes.
+        #                              0 logs EVERY high-level step (10 Hz).
+        # A line is always printed the moment any term, the candidate, the
+        # proxy or a counter changes, so a transition is never missed between
+        # heartbeats.
+        self._grasp_log = bool(self.cfg.get("grasp_proxy_log", True))
+        self._grasp_log_period_s = float(
+            self.cfg.get("grasp_proxy_log_period_s", 1.0)
+        )
+        self._grasp_log_last_t = 0.0
+        self._grasp_log_last_key = None
+
+        # The wrapper's [GRASP] line is the authoritative one: it logs the
+        # proxy that actually drives behaviour. Silence the base controller's
+        # [GRASP-PROXY] transitions unless the YAML explicitly asks for them.
+        self.log_base_grasp_proxy = bool(
+            self.cfg.get("log_base_grasp_proxy", False)
+        )
 
         self._reset_hl_alignment_state()
 
@@ -355,10 +413,32 @@ class B2WZ1MocapRetrievalUANTrainedController(
         if sum(_HL_FEATURE_DIMS) * int(self.hl_history_length) != int(self.hl_obs_dim):
             raise ValueError("Internal HL feature-major layout audit failed.")
 
-        if str(cfg.get("z1_gripper_runtime_mode", "")).lower() != "dcmotor":
+        # jointGripper runtime path.
+        #
+        # "dcmotor" reproduces the IsaacLab actuator used in retrieval training.
+        # "position_pd" hands the gripper loop to the z1_ctrl firmware instead:
+        # not the trained actuator model, but the loop closes at the controller
+        # rate rather than at the Python send rate. That matters because the
+        # DCMotor envelope's braking term is velocity-dependent and the gripper
+        # reaches ~3.8 rad/s, so a slow send rate cannot sample it.
+        #
+        # This is permitted because the high-level gripper action is BINARY
+        # open/close and grasp feedback reaches the policy through the grasp
+        # proxy, not through gripper dynamics. The arm joints, which the policy
+        # does control continuously, are unaffected by this setting.
+        _grip_mode = str(cfg.get("z1_gripper_runtime_mode", "")).lower()
+        if _grip_mode not in ("dcmotor", "position_pd"):
             raise ValueError(
-                "jointGripper must remain in the validated DCMotor-style "
-                "runtime path used by retrieval training."
+                "z1_gripper_runtime_mode must be 'dcmotor' (the validated "
+                "retrieval-training path) or 'position_pd' (firmware gripper "
+                f"loop); got {_grip_mode!r}."
+            )
+        if _grip_mode != "dcmotor":
+            print(
+                "[UAN-AUDIT] jointGripper is NOT on the DCMotor path used in "
+                f"retrieval training (z1_gripper_runtime_mode={_grip_mode!r}). "
+                "Grasp dynamics will differ from training; the arm joints and "
+                "the policy interface are unchanged."
             )
 
         # -------------------------------------------------------------
@@ -420,18 +500,24 @@ class B2WZ1MocapRetrievalUANTrainedController(
             )
 
         proxy_threshold = float(cfg.get("grasp_proxy_error_threshold", np.nan))
-        if not np.isfinite(proxy_threshold) or abs(
-            proxy_threshold - _EXPECTED_GRASP_PROXY_ERROR_THRESHOLD
-        ) > 1e-12:
+        if not np.isfinite(proxy_threshold) or proxy_threshold <= 0.0:
             raise ValueError(
-                "grasp_proxy_error_threshold must be 0.10 m to match "
-                f"training/sim2sim; got {proxy_threshold}."
+                "grasp_proxy_error_threshold must be a positive distance in m; "
+                f"got {proxy_threshold}."
+            )
+        if abs(proxy_threshold - _EXPECTED_GRASP_PROXY_ERROR_THRESHOLD) > 1e-12:
+            print(
+                "[UAN-AUDIT] grasp_proxy_error_threshold="
+                f"{proxy_threshold:.4f} m deviates from the training/sim2sim "
+                f"value of {_EXPECTED_GRASP_PROXY_ERROR_THRESHOLD:.4f} m. The "
+                "grasp proxy is an actor OBSERVATION, so the policy sees a "
+                "signal calibrated differently from the one it trained "
+                "against; a looser gate also latches on near-misses."
             )
 
         not_closed_threshold = float(
             cfg.get("gripper_not_fully_closed_angle_threshold", np.nan)
         )
-        hold_threshold = float(cfg.get("gripper_angle_hold_threshold", np.nan))
         if abs(
             not_closed_threshold - _EXPECTED_GRIPPER_NOT_FULLY_CLOSED_THRESHOLD
         ) > 1e-12:
@@ -439,11 +525,10 @@ class B2WZ1MocapRetrievalUANTrainedController(
                 "gripper_not_fully_closed_angle_threshold must remain -5 deg "
                 "to match training/sim2sim."
             )
-        if abs(hold_threshold - _EXPECTED_GRIPPER_HOLD_THRESHOLD) > 1e-12:
-            raise ValueError(
-                "gripper_angle_hold_threshold must remain 3 deg to match "
-                "training/sim2sim."
-            )
+        # gripper_angle_hold_threshold is intentionally NOT audited: the
+        # gripper_angle_holding term it configures is not evaluated by this
+        # deployment's proxy, so pinning its value would assert an alignment
+        # that no longer exists.
         if int(cfg.get("grasp_proxy_enter_steps", -1)) != _EXPECTED_GRASP_PROXY_ENTER_STEPS:
             raise ValueError("grasp_proxy_enter_steps must be 3.")
         if int(cfg.get("grasp_proxy_exit_steps", -1)) != _EXPECTED_GRASP_PROXY_EXIT_STEPS:
@@ -452,11 +537,57 @@ class B2WZ1MocapRetrievalUANTrainedController(
         # -------------------------------------------------------------
         # 8. Bug fix #3: freeze object_center_pos_base at first grasp=True.
         # -------------------------------------------------------------
-        if not bool(cfg.get("freeze_object_center_pos_base_on_grasp", False)):
+        # Object-position freeze mode. Mirrors gripper_force_close_mode.
+        #
+        #   "off"
+        #       The actor always sees the live measured object_center_pos_base.
+        #
+        #   "while_proxy"
+        #       Hold the value captured at the proxy's rising edge WHILE the
+        #       proxy stays true, and revert to the live measurement if the
+        #       proxy falls back to false. The capture is refreshed on each new
+        #       rising edge.
+        #
+        #   "Stage2_object_freeze"
+        #       Freeze on the FIRST rising edge and hold that value for the
+        #       rest of the run, regardless of what the proxy does afterwards.
+        #       Cleared only by a full policy reset.
+        #
+        # Default is derived from the legacy boolean so existing YAMLs keep
+        # their exact behaviour without naming the new key.
+        self.valid_object_freeze_modes = (
+            "off",
+            "while_proxy",
+            "Stage2_object_freeze",
+        )
+        _legacy_freeze = bool(
+            cfg.get("freeze_object_center_pos_base_on_grasp", False)
+        )
+        self.object_freeze_mode = str(
+            cfg.get(
+                "object_freeze_mode",
+                "Stage2_object_freeze" if _legacy_freeze else "off",
+            )
+        ).strip()
+        if self.object_freeze_mode not in self.valid_object_freeze_modes:
             raise ValueError(
-                "freeze_object_center_pos_base_on_grasp must be true for this "
-                "deployment: the actor must hold the object base-frame vector "
-                "measured on the first grasp=True HL step."
+                "Invalid object_freeze_mode="
+                f"{self.object_freeze_mode!r}. Expected one of "
+                f"{list(self.valid_object_freeze_modes)}."
+            )
+        print(f"[OBS-ALIGN] object_freeze_mode = {self.object_freeze_mode}")
+
+        if self.object_freeze_mode != "Stage2_object_freeze":
+            # Previously this deployment hard-required the latched freeze. It
+            # is now an explicit mode, so a different choice is allowed but
+            # never silent: training froze the object vector at the first
+            # grasp=True step, and the actor observes that vector directly.
+            print(
+                "[UAN-AUDIT] object_freeze_mode="
+                f"{self.object_freeze_mode!r} differs from the "
+                "'Stage2_object_freeze' behaviour used in training, where the "
+                "actor holds the object base-frame vector captured on the "
+                "first grasp=True high-level step."
             )
 
     # ------------------------------------------------------------------
@@ -579,13 +710,6 @@ class B2WZ1MocapRetrievalUANTrainedController(
         gripper_joint_pos_train: float,
         close_commanded: bool,
     ) -> tuple[bool, bool, float]:
-        if self._aligned_prev_gripper_q is None:
-            gripper_angle_delta = 0.0
-        else:
-            gripper_angle_delta = abs(
-                float(gripper_joint_pos_train) - float(self._aligned_prev_gripper_q)
-            )
-
         grasp_error = float(
             np.linalg.norm(
                 np.asarray(object_pos_base, dtype=np.float64)
@@ -593,20 +717,43 @@ class B2WZ1MocapRetrievalUANTrainedController(
             )
         )
 
+        # DEPLOYMENT CONDITION (three terms + validity, over N consecutive
+        # high-level steps):
+        #
+        #   1. close_commanded          previous HL action[8] > 0
+        #   2. grasp_error              < grasp_proxy_error_threshold
+        #   3. gripper_not_fully_closed q_train < gripper_not_fully_closed_angle_threshold
+        #                               i.e. the fingers did NOT close all the
+        #                               way, so something is between them
+        #   4. held for grasp_proxy_enter_steps consecutive HL steps
+        #                               (the hysteresis below)
+        #
+        # object_measurement_valid is a data-validity guard rather than a
+        # condition: grasp_error is meaningless without a live object fix.
+        #
+        # NOTE vs training: sim2sim additionally requires
+        #   gripper_angle_holding : |dq_train| < gripper_angle_hold_threshold
+        # ("the fingers have stopped moving"). That term is deliberately NOT
+        # evaluated here, so this proxy is easier to satisfy than the one the
+        # policy trained against. gripper_angle_hold_threshold is consequently
+        # unused by this deployment.
         gripper_not_fully_closed = (
             float(gripper_joint_pos_train)
             < self._gripper_not_fully_closed_threshold
         )
-        gripper_angle_holding = (
-            gripper_angle_delta < self._gripper_angle_hold_threshold
+        gripper_has_closed = (
+            float(gripper_joint_pos_train)
+            > self._gripper_min_closed_threshold
+        )
+        gripper_partially_closed = bool(
+            gripper_not_fully_closed and gripper_has_closed
         )
 
         proxy_candidate = bool(
             close_commanded
             and object_measurement_valid
             and grasp_error < self._grasp_proxy_error_threshold
-            and gripper_not_fully_closed
-            and gripper_angle_holding
+            and gripper_partially_closed
         )
 
         was_proxy = bool(self._aligned_grasp_proxy)
@@ -631,9 +778,82 @@ class B2WZ1MocapRetrievalUANTrainedController(
                 self._aligned_grasp_proxy_exit_count = 0
                 self._aligned_grasp_proxy_enter_count = 0
 
-        self._aligned_prev_gripper_q = float(gripper_joint_pos_train)
         rising_edge = (not was_proxy) and bool(self._aligned_grasp_proxy)
+
+        self._log_grasp_proxy(
+            proxy=bool(self._aligned_grasp_proxy),
+            candidate=bool(proxy_candidate),
+            close_commanded=bool(close_commanded),
+            object_valid=bool(object_measurement_valid),
+            grasp_error=grasp_error,
+            gripper_q=float(gripper_joint_pos_train),
+            not_fully_closed=bool(gripper_not_fully_closed),
+            has_closed=bool(gripper_has_closed),
+            rising_edge=rising_edge,
+        )
+
         return bool(self._aligned_grasp_proxy), rising_edge, grasp_error
+
+    def _log_grasp_proxy(
+        self,
+        *,
+        proxy: bool,
+        candidate: bool,
+        close_commanded: bool,
+        object_valid: bool,
+        grasp_error: float,
+        gripper_q: float,
+        not_fully_closed: bool,
+        has_closed: bool,
+        rising_edge: bool,
+    ) -> None:
+        """One terminal line with the proxy and every term that produced it.
+
+        Printed whenever anything changes, and otherwise at a heartbeat, so a
+        transition is never lost between heartbeats and a static state still
+        shows its current values.
+        """
+        if not self._grasp_log:
+            return
+
+        err_ok = grasp_error < self._grasp_proxy_error_threshold
+
+        # Only the booleans and the counters gate "did something change";
+        # the floats move every step and would defeat the throttle.
+        key = (
+            proxy, candidate, close_commanded, object_valid,
+            err_ok, not_fully_closed, has_closed,
+            self._aligned_grasp_proxy_enter_count,
+            self._aligned_grasp_proxy_exit_count,
+        )
+        now = time.monotonic()
+        changed = key != self._grasp_log_last_key
+        due = (now - self._grasp_log_last_t) >= self._grasp_log_period_s
+        if not (changed or due or rising_edge):
+            return
+        self._grasp_log_last_key = key
+        self._grasp_log_last_t = now
+
+        def mark(ok: bool) -> str:
+            return "PASS" if ok else "fail"
+
+        print(
+            "[GRASP] "
+            f"proxy={int(proxy)} cand={int(candidate)} | "
+            f"1.close={int(close_commanded)} {mark(close_commanded)} | "
+            f"2.err={grasp_error:6.3f}<{self._grasp_proxy_error_threshold:.3f} "
+            f"{mark(err_ok)} | "
+            f"3.grip_q={gripper_q:+7.4f} in "
+            f"({self._gripper_min_closed_threshold:+.3f},"
+            f"{self._gripper_not_fully_closed_threshold:+.3f}) "
+            f"closed={mark(has_closed)} notshut={mark(not_fully_closed)} | "
+            f"4.enter={self._aligned_grasp_proxy_enter_count}/"
+            f"{self._grasp_proxy_enter_steps} "
+            f"exit={self._aligned_grasp_proxy_exit_count}/"
+            f"{self._grasp_proxy_exit_steps} | "
+            f"obj_valid={int(object_valid)}"
+            + ("   *** PROXY RISING EDGE ***" if rising_edge else "")
+        )
 
     @staticmethod
     def _append_history(history: np.ndarray, current: np.ndarray) -> np.ndarray:
@@ -732,27 +952,50 @@ class B2WZ1MocapRetrievalUANTrainedController(
             close_commanded=close_commanded,
         )
 
-        if rising_edge and self._frozen_object_center_pos_base is None:
-            # The distance-gated proxy cannot rise without a valid object
-            # measurement, so object_current here is the actual measured object
-            # base-frame vector from this same grasp=True HL step.
-            self._frozen_object_center_pos_base = object_current.copy()
-            print(
-                "[OBS-ALIGN] grasp proxy TRUE | "
-                f"grasp_err={grasp_error:.4f} m | "
-                "freezing object_center_pos_base="
-                + np.array2string(
-                    self._frozen_object_center_pos_base,
-                    precision=4,
-                    floatmode="fixed",
+        # Capture on a rising edge. "Stage2_object_freeze" keeps the FIRST
+        # capture for the whole run; "while_proxy" re-captures on every rising
+        # edge and releases when the proxy drops.
+        if self.object_freeze_mode != "off" and rising_edge:
+            first_capture = self._frozen_object_center_pos_base is None
+            if first_capture or self.object_freeze_mode == "while_proxy":
+                # The distance-gated proxy cannot rise without a valid object
+                # measurement, so object_current here is the actual measured
+                # object base-frame vector from this same grasp=True HL step.
+                self._frozen_object_center_pos_base = object_current.copy()
+                print(
+                    "[OBS-ALIGN] grasp proxy TRUE | "
+                    f"mode={self.object_freeze_mode} | "
+                    f"grasp_err={grasp_error:.4f} m | "
+                    "freezing object_center_pos_base="
+                    + np.array2string(
+                        self._frozen_object_center_pos_base,
+                        precision=4,
+                        floatmode="fixed",
+                    )
                 )
-            )
-            self._grasp_freeze_announced = True
+                self._grasp_freeze_announced = True
 
-        if self._frozen_object_center_pos_base is not None:
-            object_for_actor = self._frozen_object_center_pos_base.copy()
-        else:
+        if self.object_freeze_mode == "off":
             object_for_actor = object_current.copy()
+        elif self.object_freeze_mode == "while_proxy":
+            # Released the moment the proxy drops: the actor goes back to the
+            # live measurement rather than steering at a stale point.
+            if proxy and self._frozen_object_center_pos_base is not None:
+                object_for_actor = self._frozen_object_center_pos_base.copy()
+            else:
+                if not proxy and self._frozen_object_center_pos_base is not None:
+                    print(
+                        "[OBS-ALIGN] proxy FALSE | mode=while_proxy | "
+                        "releasing object_center_pos_base back to live mocap."
+                    )
+                    self._frozen_object_center_pos_base = None
+                    self._grasp_freeze_announced = False
+                object_for_actor = object_current.copy()
+        else:  # "Stage2_object_freeze"
+            if self._frozen_object_center_pos_base is not None:
+                object_for_actor = self._frozen_object_center_pos_base.copy()
+            else:
+                object_for_actor = object_current.copy()
 
         if self._aligned_object_history is None:
             self._aligned_object_history = incoming_object_history.copy()

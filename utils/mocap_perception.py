@@ -18,7 +18,7 @@ stack:
     body        the B2 itself. Combined with the calibrated mocap->root
                 offset it gives the exact base_link pose, and therefore both
                 the base height and the world->base transform.
-    object      the object to retrieve (the "octopus" asset).
+    object      the object to retrieve (the "object" asset).
     retrieval   the retrieval target.
 
 What the controller actually consumes is object and retrieval expressed in
@@ -423,6 +423,39 @@ class MocapPerceptionSystem:
         }
 
     @staticmethod
+    def _marker_cloud(frame: Any) -> Dict[str, Any]:
+        """Every marker position in the frame, as world-frame Nx3 lists.
+
+        Best-effort: a NatNet stream that omits marker sets, or a client build
+        without them, simply yields empty groups rather than failing a control
+        step.
+        """
+        labeled: Dict[str, Any] = {}
+        unlabeled: list = []
+        if frame is None:
+            return {"labeled": labeled, "unlabeled": unlabeled, "count": 0}
+
+        try:
+            for name, pts in (getattr(frame, "marker_sets", None) or {}).items():
+                arr = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+                if arr.size:
+                    labeled[str(name)] = arr.tolist()
+        except Exception:  # noqa: BLE001 - visualisation must never break control
+            labeled = {}
+
+        try:
+            arr = np.asarray(
+                getattr(frame, "unlabeled_markers", None), dtype=np.float64
+            ).reshape(-1, 3)
+            if arr.size:
+                unlabeled = arr.tolist()
+        except Exception:  # noqa: BLE001
+            unlabeled = []
+
+        count = sum(len(v) for v in labeled.values()) + len(unlabeled)
+        return {"labeled": labeled, "unlabeled": unlabeled, "count": int(count)}
+
+    @staticmethod
     def _invalid_channel(reason: str, age_ms: Optional[float]) -> Dict[str, Any]:
         return {
             "valid": False,
@@ -470,6 +503,11 @@ class MocapPerceptionSystem:
             "retrieval": retrieval_state,
             "base_height": base_height_state,
             "body": body_state,
+            # Raw marker cloud for this frame, purely for visualisation and
+            # debugging. Labeled markers are grouped by their Motive marker-set
+            # name; "unlabeled" holds the unnamed ("other") reflections. Nothing
+            # in the control path reads this.
+            "markers": self._marker_cloud(frame),
             "mocap": {
                 "frame_number": int(frame.frame_number) if frame is not None else None,
                 "frames_received": self.client.frame_count,

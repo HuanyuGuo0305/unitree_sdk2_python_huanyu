@@ -28,7 +28,7 @@ Three Motive rigid bodies are required (as currently named on this system):
     "B2"          the robot. Its pose is the base_link pose, hence the base
                   height and the world->base transform used for the two
                   targets.
-    "octopus"     the object to retrieve.
+    "object"      the object to retrieve.
     "retrieval"   the retrieval target.
 
 The mocap root frame must be base_link, or the robot's own frame is wrong and
@@ -122,8 +122,19 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
         # on this robot. The policy spends that whole time driving on dead
         # feedback, and the gripper DCMotor law saturates against a stale angle.
         # Detecting the freeze directly trips protection immediately instead.
+        # arm_reading_freeze_trip_s <= 0 DISABLES the trip. The warning below
+        # still prints, so a freeze is still visible in the log; the run simply
+        # continues on stale feedback instead of entering protection.
         self._freeze_trip_s = float(self.cfg.get("arm_reading_freeze_trip_s", 0.30))
         self._freeze_warn_s = float(self.cfg.get("arm_reading_freeze_warn_s", 0.12))
+        self._freeze_trip_enabled = self._freeze_trip_s > 0.0
+        if not self._freeze_trip_enabled:
+            print(
+                "[FREEZE][DISABLED] arm_reading_freeze_trip_s <= 0: the frozen-"
+                "reading watchdog will NOT trip protection. A dropped arm link "
+                "will go unnoticed until the Z1 FSM falls out of LOWCMD "
+                "(~2.4 s), and the policy drives on dead feedback until then."
+            )
         self._last_q_seen = None
         self._freeze_started = 0.0
         self._freeze_warned = False
@@ -238,7 +249,7 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
                 cfg.get("mocap_root_frame_is_base_link", False)
             ),
             body=self._selector("body", "B2"),
-            object_body=self._selector("object", "octopus"),
+            object_body=self._selector("object", "object"),
             retrieval_body=self._selector("retrieval", "retrieval"),
             root_offset=root_offset,
             ground_z=self.ground_z,
@@ -387,6 +398,21 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
             camera_follow_smoothing=float(
                 self.cfg.get("visualizer_camera_follow_smoothing", 0.15)
             ),
+            show_all_markers=bool(
+                self.cfg.get("visualizer_show_all_markers", True)
+            ),
+            marker_radius=float(
+                self.cfg.get("visualizer_marker_radius", 0.012)
+            ),
+            show_root_frame=bool(
+                self.cfg.get("visualizer_show_root_frame", True)
+            ),
+            root_frame_axis_len=float(
+                self.cfg.get("visualizer_root_frame_axis_len", 0.25)
+            ),
+            root_frame_axis_radius=float(
+                self.cfg.get("visualizer_root_frame_axis_radius", 0.008)
+            ),
         )
 
         self._viz_show_mocap_pivots = bool(
@@ -395,6 +421,69 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
         self._viz_pivot_radius = float(
             self.cfg.get("visualizer_mocap_pivot_radius", 0.022)
         )
+
+    def _mocap_marker_cloud(
+        self, snap: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Every raw marker in the latest mocap frame, for the visualizer."""
+        if snap is None:
+            snap = self.last_perception_snapshot
+        if not snap:
+            return None
+        markers = snap.get("markers")
+        if not markers or not markers.get("count"):
+            # Say so once. Drawing nothing looks identical to a broken
+            # visualizer, and the usual cause is a Motive setting rather than
+            # anything in this process: rigid bodies stream on their own
+            # toggle, so poses can arrive perfectly while the marker sections
+            # are empty.
+            if not getattr(self, "_viz_no_marker_warned", False):
+                self._viz_no_marker_warned = True
+                print(
+                    "[VIZ][WARN] visualizer_show_all_markers is on, but this "
+                    "NatNet stream carries NO markers (0 labeled, 0 "
+                    "unlabeled). Rigid-body poses are unaffected. To draw "
+                    "them, enable marker streaming in Motive: View > Data "
+                    "Streaming Pane > check 'Labeled Markers' and 'Unlabeled "
+                    "Markers'. Verify with:\n"
+                    "  python3 -m utils.natnet_client --local-ip "
+                    f"{self.cfg.get('mocap_local_ip', '<ip>')} --server-ip "
+                    f"{self.cfg.get('mocap_server_ip', '<ip>')} --seconds 5"
+                )
+            return None
+
+        if not getattr(self, "_viz_marker_count_announced", False):
+            self._viz_marker_count_announced = True
+            labeled = markers.get("labeled") or {}
+            print(
+                f"[VIZ] drawing {markers['count']} mocap markers "
+                f"({len(labeled)} labeled set(s): "
+                + ", ".join(f"{k}={len(v)}" for k, v in sorted(labeled.items()))
+                + f"; unlabeled={len(markers.get('unlabeled') or [])})"
+            )
+        return markers
+
+    def _mocap_root_frame(
+        self, snap: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Measured mocap ROOT pose (base_link), for the visualizer triad.
+
+        This is the calibrated root, not the raw Motive pivot: drawing both
+        makes the applied offset visible as the gap between the triad and the
+        white body pivot sphere.
+        """
+        if snap is None:
+            snap = self.last_perception_snapshot
+        if not snap:
+            return None
+        body = snap.get("body") or {}
+        if not body.get("valid"):
+            return None
+        pos = body.get("root_position_world")
+        quat = body.get("root_quat_wxyz")
+        if pos is None or quat is None:
+            return None
+        return {"pos": pos, "quat_wxyz": quat}
 
     def _mocap_pivot_markers(
         self, snap: Optional[Dict[str, Any]] = None
@@ -468,6 +557,8 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
             base_pos_w=np.asarray(root_pos_w, dtype=np.float64),
             base_quat_wxyz=np.asarray(root_quat_w, dtype=np.float32),
             mocap_points=self._mocap_pivot_markers(),
+            mocap_markers=self._mocap_marker_cloud(),
+            root_frame=self._mocap_root_frame(),
         )
 
     # ------------------------------------------------------------------
@@ -601,6 +692,48 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
             self._arm_target_gripper = float(self.gripper_target)
             self._arm_target_stamp = time.monotonic()
 
+    def _check_arm_reading_freeze(self, now: float, *, allow_trip: bool) -> None:
+        """Frozen-lowstate watchdog, shared by the threaded and inline paths.
+
+        A live encoder read is never bit-identical twice running: sensor noise
+        always moves the last digits. All six joints AND the gripper repeating
+        exactly means the value is a cache.
+        """
+        q_now = np.asarray(self.z1.q, dtype=np.float64).reshape(6)
+        grip_now = float(self.z1.gripper_q)
+        same = (
+            self._last_q_seen is not None
+            and np.array_equal(q_now, self._last_q_seen[0])
+            and grip_now == self._last_q_seen[1]
+        )
+        if not same:
+            self._freeze_started = 0.0
+            self._freeze_warned = False
+            self._last_q_seen = (q_now.copy(), grip_now)
+            return
+
+        if self._freeze_started == 0.0:
+            self._freeze_started = now
+        frozen_for = now - self._freeze_started
+        if frozen_for >= self._freeze_warn_s and not self._freeze_warned:
+            self._freeze_warned = True
+            print(
+                f"\n[FREEZE][WARN] Z1 reading has not changed for "
+                f"{frozen_for*1e3:.0f} ms (fsm still {self.z1.get_fsm_state()}). "
+                "The arm link may be dropping."
+            )
+        if allow_trip and self._freeze_trip_enabled and frozen_for >= self._freeze_trip_s:
+            print(
+                f"\n[FREEZE] Z1 reading frozen at {np.round(q_now, 4).tolist()} "
+                f"for {frozen_for*1e3:.0f} ms while the FSM still reports "
+                f"{self.z1.get_fsm_state()}."
+            )
+            raise RuntimeError(
+                f"Z1 joint reading frozen for {frozen_for*1e3:.0f} ms "
+                "(stale cache; the arm link is down even though the FSM "
+                "has not caught up yet)"
+            )
+
     def _arm_loop(self) -> None:
         # ONE guard around the entire loop. Anything that raises in here --
         # the command, the FSM read, the bookkeeping -- must surface as a
@@ -658,44 +791,8 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
 
             now = time.perf_counter()
 
-            # A live encoder read is never bit-identical twice running: sensor
-            # noise always moves the last digits. All six joints AND the
-            # gripper repeating exactly means the value is a cache. A held arm
-            # measured a 99 ms worst-case quiet window, so the trip threshold
-            # sits well clear of that.
-            q_now = np.asarray(self.z1.q, dtype=np.float64).reshape(6)
-            grip_now = float(self.z1.gripper_q)
-            same = (
-                self._last_q_seen is not None
-                and np.array_equal(q_now, self._last_q_seen[0])
-                and grip_now == self._last_q_seen[1]
-            )
-            if same:
-                if self._freeze_started == 0.0:
-                    self._freeze_started = now
-                frozen_for = now - self._freeze_started
-                if frozen_for >= self._freeze_warn_s and not self._freeze_warned:
-                    self._freeze_warned = True
-                    print(
-                        f"\n[FREEZE][WARN] Z1 reading has not changed for "
-                        f"{frozen_for*1e3:.0f} ms (fsm still {self.z1.get_fsm_state()}). "
-                        "The arm link may be dropping."
-                    )
-                if frozen_for >= self._freeze_trip_s:
-                    print(
-                        f"\n[FREEZE] Z1 reading frozen at {np.round(q_now, 4).tolist()} "
-                        f"for {frozen_for*1e3:.0f} ms while the FSM still reports "
-                        f"{self.z1.get_fsm_state()}."
-                    )
-                    raise RuntimeError(
-                        f"Z1 joint reading frozen for {frozen_for*1e3:.0f} ms "
-                        "(stale cache; the arm link is down even though the FSM "
-                        "has not caught up yet)"
-                    )
-            else:
-                self._freeze_started = 0.0
-                self._freeze_warned = False
-                self._last_q_seen = (q_now.copy(), grip_now)
+            # Frozen-lowstate watchdog (shared with the inline 50 Hz path).
+            self._check_arm_reading_freeze(now, allow_trip=True)
 
             count += 1
             if now - window_start >= 1.0:
@@ -742,7 +839,17 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
         self._clamp_arm_target()
 
         if not self._arm_thread_running:
+            # Inline 50 Hz path (arm_command_hz <= policy rate, or the thread
+            # is disabled/dead). It must carry the SAME instrumentation as the
+            # thread, otherwise lowering arm_command_hz silently switches off
+            # the telemetry CSV and the frozen-reading watchdog.
             super().send_policy_targets()
+            # allow_trip=False: a raise here would propagate into the policy
+            # loop rather than the thread's error path. The outer loop already
+            # trips on FSM leaving LOWCMD; this only reports.
+            self._check_arm_reading_freeze(
+                time.perf_counter(), allow_trip=False
+            )
             return
 
         self._write_b2w_rl_cmd()
@@ -767,6 +874,14 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
         # once the policy loop is about to begin.
         result = super().prime_first_hl_and_ll()
         self._start_arm_thread()
+        if not self._arm_thread_enabled:
+            print(
+                f"[Z1-RATE] arm thread DISABLED (arm_command_hz="
+                f"{self._arm_command_hz:g} Hz <= policy rate "
+                f"{1.0 / self.control_dt:g} Hz). The arm is commanded inline "
+                "in the 50 Hz loop; telemetry and the frozen-reading watchdog "
+                "run on that path."
+            )
         return result
 
     def step_after_prime(self):
@@ -1081,6 +1196,8 @@ class B2WZ1MocapRetrievalController(B2WZ1HierarchicalRetrievalController):
             )
 
         state["mocap_points"] = self._mocap_pivot_markers(snap)
+        state["mocap_markers"] = self._mocap_marker_cloud(snap)
+        state["root_frame"] = self._mocap_root_frame(snap)
         return state
 
     # ------------------------------------------------------------------

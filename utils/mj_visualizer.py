@@ -312,6 +312,15 @@ class MujocoDebugVisualizer:
         # nothing to follow or to reference.
         self._show_world_origin = bool(show_world_origin)
         self._world_origin_axis_len = float(world_origin_axis_len)
+
+        # Raw mocap marker cloud and the measured root frame. Both default OFF
+        # so existing callers render exactly as before; configure_world_view()
+        # turns them on.
+        self._show_all_markers = False
+        self._marker_radius = 0.012
+        self._show_root_frame = False
+        self._root_frame_axis_len = 0.25
+        self._root_frame_axis_radius = 0.008
         self._camera_follow = bool(camera_follow)
         self._camera_follow_smoothing = float(
             np.clip(camera_follow_smoothing, 0.0, 1.0)
@@ -359,6 +368,11 @@ class MujocoDebugVisualizer:
         camera_follow: Optional[bool] = None,
         world_origin_axis_len: Optional[float] = None,
         camera_follow_smoothing: Optional[float] = None,
+        show_all_markers: Optional[bool] = None,
+        marker_radius: Optional[float] = None,
+        show_root_frame: Optional[bool] = None,
+        root_frame_axis_len: Optional[float] = None,
+        root_frame_axis_radius: Optional[float] = None,
     ) -> None:
         """
         Enable the absolute-world extras after construction.
@@ -376,6 +390,16 @@ class MujocoDebugVisualizer:
             self._camera_follow_smoothing = float(
                 np.clip(camera_follow_smoothing, 0.0, 1.0)
             )
+        if show_all_markers is not None:
+            self._show_all_markers = bool(show_all_markers)
+        if marker_radius is not None:
+            self._marker_radius = float(marker_radius)
+        if show_root_frame is not None:
+            self._show_root_frame = bool(show_root_frame)
+        if root_frame_axis_len is not None:
+            self._root_frame_axis_len = float(root_frame_axis_len)
+        if root_frame_axis_radius is not None:
+            self._root_frame_axis_radius = float(root_frame_axis_radius)
 
     def push_state(self, **kwargs: Any) -> None:
         """
@@ -475,6 +499,76 @@ class MujocoDebugVisualizer:
             end[axis] += length
             _add_capsule(scene, origin, end, 0.006, rgba)
 
+    @staticmethod
+    def _draw_frame_triad(scene, pos, quat_wxyz, length: float, radius: float,
+                          alpha: float = 0.95) -> None:
+        """RGB = XYZ triad for an arbitrary pose.
+
+        Same convention as the world origin (red X, green Y, blue Z) so the two
+        can be compared by eye: if the root triad is not parallel to the world
+        triad when the robot is squared up to the capture volume, the mocap
+        offset calibration is off.
+        """
+        origin = np.asarray(pos, dtype=np.float32).reshape(3)
+        q = np.asarray(quat_wxyz, dtype=np.float32).reshape(4)
+        for axis, rgba in enumerate((
+            [1.0, 0.2, 0.2, alpha],
+            [0.2, 1.0, 0.2, alpha],
+            [0.35, 0.45, 1.0, alpha],
+        )):
+            unit = np.zeros(3, dtype=np.float32)
+            unit[axis] = float(length)
+            _add_capsule(scene, origin, origin + quat_apply_wxyz(q, unit),
+                         radius, rgba)
+
+    def _draw_root_frame(self, scene, state: Dict[str, Any]) -> None:
+        """The measured mocap ROOT pose, drawn as a triad."""
+        root = state.get("root_frame")
+        if not root:
+            return
+        pos = root.get("pos")
+        quat = root.get("quat_wxyz")
+        if pos is None or quat is None:
+            return
+        self._draw_frame_triad(
+            scene, pos, quat,
+            self._root_frame_axis_len,
+            self._root_frame_axis_radius,
+        )
+        _add_sphere(scene, np.asarray(pos, dtype=np.float32),
+                    self._root_frame_axis_radius * 2.0,
+                    [1.0, 1.0, 1.0, 0.95])
+
+    def _draw_marker_cloud(self, scene, state: Dict[str, Any]) -> None:
+        """Every raw mocap marker in the frame.
+
+        Labeled marker sets each get their own colour so an asset that loses
+        markers is obvious; unlabeled reflections are drawn dimmer and smaller
+        so they read as background rather than as tracked geometry.
+        """
+        markers = state.get("mocap_markers")
+        if not markers:
+            return
+
+        palette = (
+            [1.0, 0.85, 0.1, 0.95],
+            [0.1, 0.9, 1.0, 0.95],
+            [1.0, 0.45, 0.85, 0.95],
+            [0.6, 1.0, 0.35, 0.95],
+            [1.0, 0.55, 0.2, 0.95],
+        )
+        r = self._marker_radius
+        for i, (_name, pts) in enumerate(
+            sorted((markers.get("labeled") or {}).items())
+        ):
+            rgba = palette[i % len(palette)]
+            for pt in pts:
+                _add_sphere(scene, np.asarray(pt, dtype=np.float32), r, rgba)
+
+        for pt in markers.get("unlabeled") or ():
+            _add_sphere(scene, np.asarray(pt, dtype=np.float32),
+                        r * 0.7, [0.75, 0.75, 0.8, 0.55])
+
     def _update_camera(self, viewer, state: Dict[str, Any]) -> None:
         """
         Keep the robot in frame as it drives around the capture volume.
@@ -571,6 +665,15 @@ class MujocoDebugVisualizer:
 
         if self._show_world_origin:
             self._draw_world_origin(viewer.user_scn, ground_z)
+
+        # Root frame first, then the marker cloud: the triad is the thing you
+        # look at, and if the scene runs out of geoms it should be the marker
+        # dots that get dropped, not the frame.
+        if self._show_root_frame:
+            self._draw_root_frame(viewer.user_scn, state)
+
+        if self._show_all_markers:
+            self._draw_marker_cloud(viewer.user_scn, state)
 
         # Raw mocap rigid-body pivots, when a mocap feed supplies them. Seeing
         # the B2 pivot sitting a fixed distance off the rendered root is the

@@ -196,6 +196,11 @@ base_cmd_scale: [0.5, 0.5, 0.5]
 kp0_x_range: [0.40, 0.90]
 kp0_y_range: [-0.30, 0.30]
 kp0_z_range: [0.0, 1.15]
+# Safety floor applied AFTER decoding action[5] to kp0_z.  The trained range
+# still bottoms out at ground level, but commanding the wrist that low makes
+# the arm hit the ground, so clamp the decoded command from below.  The action
+# mapping itself is unchanged, so ABS action semantics still match training.
+kp0_z_cmd_min: 0.10
 ee_yaw_range: [-1.0471975511965976, 1.0471975511965976]
 
 # IMPORTANT: this is the POLICY pitch range used to decode action[7].
@@ -220,35 +225,45 @@ neutral_ee_yaw: 0.0
 hl_abs_neutral_ee_pitch: -0.06
 
 # ----------------------------------------------------------------------
-# Inherited delta-decoder compatibility bridge -- INTERNAL ONLY
+# High-level ABS action decoding
 # ----------------------------------------------------------------------
-# b2wz1_hl_retrieval_mocap_UAN.py inherits the validated common controller,
-# whose internal high-level decoder still expects a measured-EE-relative delta.
-# The new wrapper algebraically converts the RAW ABS policy output into:
+# The 9-D ABS action is decoded DIRECTLY by
+# b2wz1_hl_retrieval_abs_uan_mocap.py::decode_hl_action, with exactly the same
+# arithmetic as the sim2sim reference
+# (unitree_mujoco/simulate_python/deploy_mujoco/b2wz1_hl_retrieval_abs_uan.py):
 #
-#   bridge_delta = (desired_abs - measured_ee) / scale
+#   kp0_cmd      = map(action[3:6] -> kp0_{x,y,z}_range)
+#   yaw_cmd      = map(action[6]   -> ee_yaw_range)
+#   pitch_policy = map(action[7]   -> hl_abs_ee_pitch_range)
+#   pitch_geom   = ee_pitch_to_euler_sign * pitch_policy
+#   ee_cmd_plb_current = build_keypoints(kp0_cmd, yaw_cmd, pitch_geom, ...)
 #
-# so the inherited decoder reconstructs exactly:
+# No measured-EE re-anchoring, no delta scale, no delta clip, no re-clipping.
 #
-#   measured_ee + scale * bridge_delta = desired_abs
+# ----------------------------------------------------------------------
+# INERT KEYS BELOW -- required by the inherited base-class constructor only
+# ----------------------------------------------------------------------
+# The inherited measured-EE-relative delta decoder is fully bypassed by the
+# override, but b2wz1_hl_retrieval_sim2real.py still reads these keys in
+# __init__ (plain cfg[...] lookups), so they must remain present. NOTHING in
+# this deployment consumes them.
 #
-# These *_delta_* values are NOT policy action semantics. They are deliberately
-# large enough that every configured ABS command is representable inside
-# [-1,1]. The wrapper aborts rather than silently allowing bridge clipping.
+# Do NOT reintroduce the optional kp0_delta_clip / ee_yaw_delta_clip /
+# ee_pitch_delta_clip keys: they belong to the same dead code path, and a stale
+# kp0_delta_clip: [0,0,0] previously zeroed the entire arm command (the
+# inherited "no clipping" sentinel is +inf, not 0), which left the EE target
+# holding the measured arm pose up in the air instead of descending.
 kp0_delta_scale: [3.0, 3.0, 3.0]
 ee_yaw_delta_scale: 6.283185307179586
 ee_pitch_delta_scale: 3.141592653589793
 
-# Extra per-step clips in the inherited decoder MUST remain disabled.
-kp0_delta_clip: [0.0, 0.0, 0.0]
-ee_yaw_delta_clip: 0.0
-ee_pitch_delta_clip: 0.0
-
-# The inherited decoder consumes GEOMETRIC pitch, not policy pitch.
-# Since pitch_geom = -pitch_policy and policy pitch is [-70,0] deg:
+# Inert as well: only the bypassed delta decoder clipped against this range.
+# Kept because the base-class constructor requires the key. It is the GEOMETRIC
+# counterpart of hl_abs_ee_pitch_range (pitch_geom = -pitch_policy).
 ee_pitch_range: [0.0, 1.2217304763960306]
 
-# Likewise the inherited neutral EE keypoint builder needs geometric pitch:
+# STILL LIVE: the inherited neutral EE keypoint builder (used on reset) consumes
+# GEOMETRIC pitch, so this must stay equal to -hl_abs_neutral_ee_pitch.
 neutral_ee_pitch: 0.06
 fixed_ee_roll: 1.5707963267948966
 
@@ -256,8 +271,8 @@ ee_kp_dx: 0.30
 ee_kp_dz: 0.30
 ground_z: 0.0
 
-# Print the first raw-ABS -> internal-bridge conversion at policy start.
-abs_bridge_debug: true
+# Print the first decoded ABS EE command at policy start.
+abs_decode_debug: true
 
 # ======================================================================
 # Base height
@@ -297,27 +312,83 @@ gripper_binary_threshold: 0.0
 
 stage2_force_gripper_close_enabled: true
 
-# Grasp proxy semantics are intentionally locked to the training/sim2sim rule:
+# Gripper force-close mode. Supersedes stage2_force_gripper_close_enabled above
+# (that key is only the fallback default when this one is absent).
+#
+#   "off"
+#       Never force. The policy's binary action[8] alone decides.
+#
+#   "while_proxy"
+#       Force close WHILE grasp_confidence_proxy is true. Because the proxy is
+#       in "heuristic" mode it can fall back to false after
+#       grasp_proxy_exit_steps, which RELEASES the forced close and can drop
+#       the object.
+#
+#   "Stage2_gripper_close"
+#       Latch on the FIRST time grasp_confidence_proxy becomes true, then hold
+#       the gripper closed for the rest of the run regardless of what the proxy
+#       does afterwards. Cleared only by a full policy reset.
+gripper_force_close_mode: "Stage2_gripper_close"
+
+# Grasp proxy rule as deployed:
 #
 #   proxy_candidate =
-#       CLOSE commanded
-#       AND ||object_center_pos_base - gripper_center_pos_base|| < 0.10 m
-#       AND gripper is not fully closed
-#       AND gripper angle is holding
+#       CLOSE commanded                                     (prev HL action[8] > 0)
+#       AND ||object_center_pos_base - gripper_center_pos_base||
+#             < grasp_proxy_error_threshold
+#       AND gripper is NOT fully closed                     (something between the fingers)
 #
-# Three consecutive candidate=true steps enter the proxy; three consecutive
-# candidate=false steps exit it. The UAN wrapper audits these values at startup.
+#   ...held for grasp_proxy_enter_steps consecutive HL steps.
+#
+# A live object measurement is additionally required, since grasp_error is
+# meaningless without one.
+#
+# DEVIATIONS from the training/sim2sim rule, both deliberate:
+#   - the "gripper angle is holding" term (|dq| < gripper_angle_hold_threshold)
+#     is NOT evaluated here, so gripper_angle_hold_threshold below is unused;
+#   - grasp_proxy_error_threshold is 0.20 m rather than the training 0.10 m.
+# The proxy is an actor OBSERVATION, so the policy sees a signal calibrated
+# differently from the one it trained against. The wrapper prints a
+# [UAN-AUDIT] notice at startup restating this.
 grasp_proxy_mode: "heuristic"
 
 # Training-defined gripper center relative to gripperStator / policy EE frame.
 gripper_center_offset_local: [0.075, 0.0, 0.01]
 
 # Restored distance gate: this MUST be 0.10 m to match training/sim2sim.
-grasp_proxy_error_threshold: 0.10
+grasp_proxy_error_threshold: 0.20
 
 # IMPORTANT: both angle thresholds below are in TRAINING gripper coordinates.
 gripper_not_fully_closed_angle_threshold: -0.08726646259971647
+
+# Lower bound on gripper closure, TRAINING coordinates (open = -1.5708,
+# closed = 0). The proxy requires  min < q_train < not_fully_closed, i.e. the
+# fingers have travelled off the open stop but have NOT shut on air.
+#
+# Without this, "not fully closed" is only an upper bound and a WIDE-OPEN
+# gripper passes it: a run was observed latching the proxy at q_train=-1.5522
+# (0.018 rad off the open stop, fingers never moved), which permanently froze
+# object_center_pos_base and latched Stage2_gripper_close onto nothing.
+#
+# -1.3708 = 0.20 rad of closure. Lower the required closure toward
+# gripper_open_pos if the object is wide enough that the fingers stop early;
+# raise it if empty grasps still latch. Set equal to gripper_open_pos to
+# disable the bound entirely.
+gripper_min_closed_angle_threshold: -1.3708
 gripper_angle_hold_threshold: 0.05235987755982989
+
+# Terminal logging of the grasp proxy and every condition feeding it.
+# A [GRASP] line is printed the moment any term, the candidate, the proxy or a
+# counter changes, and otherwise every grasp_proxy_log_period_s as a heartbeat.
+# Set the period to 0.0 to log EVERY high-level step (10 Hz).
+# The wrapper's [GRASP] line is authoritative. The BASE controller also prints
+# [GRASP-PROXY] transitions from its own rule, which has NO distance gate and
+# is overwritten by the wrapper -- it announced "0 -> 1 | error=0.231 m" on a
+# step the real proxy scored as fail. Set true only to debug the base rule.
+log_base_grasp_proxy: false
+
+grasp_proxy_log: true
+grasp_proxy_log_period_s: 1.0
 
 grasp_proxy_enter_steps: 3
 grasp_proxy_exit_steps: 3
@@ -332,6 +403,24 @@ grasp_proxy_exit_steps: 3
 # before high-level ONNX inference; it does NOT replace the object with the
 # moving gripper center.
 freeze_object_center_pos_base_on_grasp: true
+
+# Object-position freeze mode. Mirrors gripper_force_close_mode, and supersedes
+# freeze_object_center_pos_base_on_grasp above (that key is only the fallback
+# default when this one is absent).
+#
+#   "off"
+#       The actor always sees the live measured object_center_pos_base.
+#
+#   "while_proxy"
+#       Hold the value captured at the proxy's rising edge WHILE the proxy is
+#       true; revert to the live measurement if the proxy falls back to false,
+#       and re-capture on the next rising edge.
+#
+#   "Stage2_object_freeze"
+#       Freeze on the FIRST rising edge and hold that value for the rest of the
+#       run, whatever the proxy does afterwards. This is what training did.
+#       Cleared only by a full policy reset.
+object_freeze_mode: "Stage2_object_freeze"
 
 # ======================================================================
 # Z1 SDK / FK
@@ -358,12 +447,20 @@ arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
 arm_kps_runtime: [2.5, 4.5, 2.5, 2.5, 2.5, 2.5]
 arm_kds_runtime: [234.375, 312.5, 234.375, 234.375, 234.375, 234.375]
 
-# Legacy internal gripper position-PD gains.
-# These are used only during startup/hold paths. During hierarchical runtime,
-# track_target_pd_gripper_dcmotor_once() immediately calls setGripperZeroGain()
-# and drives the gripper with external tau_f instead.
+# Firmware gripper position-PD gains (raw firmware units, NOT Nm/rad).
+# Used by the startup/hold paths, and -- with z1_gripper_runtime_mode:
+# "position_pd" -- by the hierarchical runtime as well, in which case the
+# z1_ctrl firmware closes the gripper loop at its own rate instead of Python
+# integrating a torque law at the send rate.
 z1_gripper_kp: 20.0
-z1_gripper_kd: 2000.0
+z1_gripper_kd: 5000.0
+
+# Shrink the commanded gripper travel at both ends, TRAINING coordinates.
+# 0.0 allows the full [gripper_open_pos, gripper_close_pos] range. Raise it to
+# keep the firmware PD clear of the mechanical stops: the DCMotor path was
+# logged driving 0.04 rad past the open stop at 36.8 Nm, immediately before
+# joint 6 and the gripper dropped off the motor bus.
+z1_gripper_travel_margin_rad: 0.0
 
 # ----------------------------------------------------------------------
 # Real-robot Z1 runtime actuator modes
@@ -372,7 +469,18 @@ z1_gripper_kd: 2000.0
 # GRIPPER:
 #   Remains the validated external DCMotor-style path used by retrieval
 #   training. This is independent of the arm UAN.
-z1_gripper_runtime_mode: "dcmotor"
+# "position_pd": firmware gripper PD at the z1_ctrl loop rate, using
+#                z1_gripper_kp / z1_gripper_kd above. The loop no longer
+#                depends on the Python send rate. Training's IsaacLab DCMotor
+#                torque-speed envelope is NOT reproduced -- acceptable here
+#                because the high-level gripper action is binary open/close.
+#                Chosen after the 50 Hz dcmotor path proved too slow to sample
+#                the envelope's velocity-dependent braking: the gripper reaches
+#                ~3.8 rad/s, so the brake term ran up to 20 ms stale.
+# "dcmotor":     training-exact IdealPD + DCMotor envelope computed in Python
+#                and sent through tau_f with firmware gripper gains zeroed.
+#                Only faithful if the send rate is high (sim uses 250 Hz).
+z1_gripper_runtime_mode: "position_pd"
 
 # ARM:
 #   MUST be "position_pd" for the UAN-trained sim2real deployment.
@@ -479,7 +587,7 @@ z1_debug_print: true
 #
 # Set equal to or below the policy rate (or arm_thread_enabled: false) to go
 # back to commanding the arm inline in the 50 Hz loop.
-arm_command_hz: 200.0
+arm_command_hz: 50.0
 arm_thread_enabled: true
 
 # Warn once if the policy loop stops refreshing the target for this long. The
@@ -536,7 +644,20 @@ arm_limit_margin_rad: 0.02
 # with the corrected gains because loss of tracking can precede a hardware fault.
 arm_tracking_warn_rad: 0.35
 
-arm_reading_freeze_trip_s: 0.30
+# Frozen-reading watchdog.
+#
+# TEMPORARILY DISABLED (trip_s <= 0). Set this back to 0.30 to restore it.
+#
+# What it detects: the arm thread does sendRecv() + re-reads lowstate every
+# iteration (200 Hz), so all 6 joints AND the gripper coming back bit-identical
+# for 300 ms means ~60 consecutive FRESH reads returned an unchanged value --
+# the z1_controller is republishing a cached lowstate because the arm link is
+# down. Its FSM only falls out of LOWCMD after ~2.4 s, so nothing else notices
+# during that window and the policy keeps driving on dead feedback.
+#
+# Disabling this does NOT fix that condition; it only stops the run from
+# entering protection when it happens. The [FREEZE][WARN] line still prints.
+arm_reading_freeze_trip_s: 0.0
 arm_reading_freeze_warn_s: 0.12
 
 health_print_s: 1.0
@@ -589,8 +710,8 @@ mocap_body_max_age_s: 0.25
 
 # The object to retrieve. Offset it from the marker centroid to the point the
 # policy should treat as the object centre (what the gripper closes on).
-mocap_object_name: "octopus"
-mocap_object_id: 10
+mocap_object_name: "object"
+mocap_object_id: 11
 mocap_object_offset_local: [0.0, 0.0, 0.0]
 mocap_object_max_age_s: 0.30
 
@@ -792,6 +913,21 @@ visualizer_camera_follow_smoothing: 0.15
 # Motive the white pivot should sit ON the rendered root.
 visualizer_show_mocap_pivots: true
 visualizer_mocap_pivot_radius: 0.022
+
+# Draw EVERY raw mocap marker in the frame, not just the three rigid-body
+# pivots. Labeled marker sets get one colour each; unlabeled ("other")
+# reflections are drawn smaller and dimmer. Purely visual -- the control path
+# never reads the marker cloud.
+visualizer_show_all_markers: true
+visualizer_marker_radius: 0.012
+
+# Draw the measured ROOT frame (base_link) as an RGB=XYZ triad. Compare it to
+# the world-origin triad: with the robot squared up to the capture volume the
+# two should be parallel, and the gap between the triad and the white body
+# pivot sphere is the applied mocap->root offset.
+visualizer_show_root_frame: true
+visualizer_root_frame_axis_len: 0.25
+visualizer_root_frame_axis_radius: 0.008
 
 # ----------------------------------------------------------------------
 # Scene monitor

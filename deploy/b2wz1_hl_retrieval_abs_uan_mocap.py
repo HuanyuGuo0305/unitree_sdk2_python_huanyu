@@ -67,10 +67,17 @@ conversion happens only inside build_ee_keypoints_plb().
 
 Grasp confidence proxy
 ----------------------
-The proxy is an actor OBSERVATION. It is never latched and it never forces the
-gripper closed: the executed gripper command is action[8] alone. Once the
-proxy is true the actor's object vector becomes the gripper centre, which is
-the training semantics for "the object is in hand".
+The proxy is NOT an actor observation. The policy was retrained without it, so
+the high-level frame is 55-D (165-D over 3 frames) and ends at
+previous_hl_action -- matching the sim2sim reference and its
+hl_obs_dim_per_step: 55.
+
+It is still computed, for two reasons. It is the [GRASP] diagnostic, and it
+decides whether the actor's object vector is the measured object or the
+gripper centre. That substitution is a REAL-ROBOT addition with no sim2sim
+counterpart -- MuJoCo always knows where the cube is, whereas mocap loses it
+once it is inside the gripper. The proxy never latches and never forces the
+gripper closed: the executed gripper command is action[8] alone.
 
 Sensing
 -------
@@ -161,12 +168,15 @@ Z1_KD_TRAINING = np.array([3.0, 4.0, 3.0, 3.0, 3.0, 3.0], dtype=np.float64)
 #   last_action(22)
 LL_FEATURE_DIMS = (3, 3, 3, 9, 12, 6, 12, 6, 4, 22)
 
-# High-level observation, 56 per frame:
+# High-level observation, 55 per frame:
 #   base_ang_vel(3) projected_gravity(3) leg_pos_rel(12) arm_pos_rel(6)
 #   gripper_pos_rel(1) arm_vel(6) object_center_base(3)
 #   gripper_orientation_base(6) gripper_center_base(3) retrieval_target_base(3)
-#   previous_hl_action(9) grasp_confidence_proxy(1)
-HL_FEATURE_DIMS = (3, 3, 12, 6, 1, 6, 3, 6, 3, 3, 9, 1)
+#   previous_hl_action(9)
+#
+# grasp_confidence_proxy is deliberately NOT here: the actor was retrained
+# without it. Every other term and its order are unchanged.
+HL_FEATURE_DIMS = (3, 3, 12, 6, 1, 6, 3, 6, 3, 3, 9)
 
 
 # ======================================================================
@@ -560,7 +570,7 @@ class B2WZ1AbsRetrievalMocapController:
         self.debug_obs_print_max = int(cfg.get("debug_obs_print_max", 5))
 
     def _configure_grasp_proxy(self) -> None:
-        """Grasp-confidence proxy: an actor observation, nothing more.
+        """Grasp-confidence proxy: a diagnostic and an object-source switch.
 
         Condition, held for grasp_proxy_enter_steps consecutive HL steps:
 
@@ -1106,15 +1116,16 @@ class B2WZ1AbsRetrievalMocapController:
         )
 
     # ------------------------------------------------------------------
-    # Grasp confidence proxy (actor observation only)
+    # Grasp confidence proxy (NOT an actor observation)
     # ------------------------------------------------------------------
 
     def update_grasp_proxy(self, snap: Dict[str, Any]) -> None:
         """Re-evaluate the proxy at the 10 Hz high-level boundary.
 
-        Never latched and never used to force the gripper: this only feeds the
-        actor's grasp_confidence_proxy observation and, through it, whether the
-        actor's object vector is the measured object or the gripper centre.
+        The retrained actor does not observe this. It survives as the [GRASP]
+        diagnostic and as the switch deciding whether the actor's object vector
+        is the measured object or the gripper centre. Never latched, and never
+        used to force the gripper.
         """
         _, gripper_center_b = self.get_gripper_geometry()
         gripper_q = self.gripper_q_training()
@@ -1317,7 +1328,6 @@ class B2WZ1AbsRetrievalMocapController:
                 task["gripper_center_pos_base"],      # 3
                 task["retrieval_target_base"],        # 3
                 self.build_previous_hl_action(),      # 9
-                np.array([float(self.grasp_confidence_proxy)], dtype=np.float32),  # 1
             ],
             dtype=np.float32,
         )
@@ -2316,7 +2326,7 @@ class B2WZ1AbsRetrievalMocapController:
             "Grasp proxy      : close + "
             f"dist<{self.grasp_proxy_error_threshold:.2f}m + partially closed | "
             f"enter {self.grasp_proxy_enter_steps} / exit {self.grasp_proxy_exit_steps} "
-            "HL steps | OBSERVATION ONLY, never latched, never forces the gripper"
+            "HL steps | NOT observed by the actor; selects the object source only"
         )
         print("Sensing          : OPTITRACK MOCAP (no camera, no AprilTag, no VO)")
         for selector in (

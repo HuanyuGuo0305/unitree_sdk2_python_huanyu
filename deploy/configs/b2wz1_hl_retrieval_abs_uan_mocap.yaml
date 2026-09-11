@@ -19,7 +19,9 @@
 # ONNX policies
 # ----------------------------------------------------------------------
 low_policy_path: "exported_policies/b2wz1_hl_retrieval_abs_uan_mocap/low_policy.onnx"
-high_policy_path: "exported_policies/b2wz1_hl_retrieval_abs_uan_mocap/high_policy_2.onnx"
+# The 165-D no-proxy actor, copied from the sim2sim export this deployment
+# mirrors (unitree_mujoco/exported_policy/b2wz1_hl_retrieval_abs_uan).
+high_policy_path: "exported_policies/b2wz1_hl_retrieval_abs_uan_mocap/high_policy_4.onnx"
 
 # ----------------------------------------------------------------------
 # Timing / policy layout
@@ -40,10 +42,12 @@ ll_obs_dim_per_step: 80
 ll_obs_dim: 400
 ll_action_dim: 22
 
-# High level (ABS retrieval policy)
+# High level (ABS retrieval policy).
+# 55 per frame, not 56: the actor was retrained WITHOUT grasp_confidence_proxy,
+# so the frame ends at previous_hl_action. Matches the sim2sim config.
 hl_history_length: 3
-hl_obs_dim_per_step: 56
-hl_obs_dim: 168
+hl_obs_dim_per_step: 55
+hl_obs_dim: 165
 hl_action_dim: 9
 
 # ----------------------------------------------------------------------

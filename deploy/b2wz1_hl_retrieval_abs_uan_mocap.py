@@ -65,19 +65,15 @@ pitch point +X UP, which is the wrong way round. So everywhere in this file:
 Ranges, the neutral pose and every debug print use POLICY pitch; the
 conversion happens only inside build_ee_keypoints_plb().
 
-Grasp confidence proxy
+High-level observation
 ----------------------
-The proxy is NOT an actor observation. The policy was retrained without it, so
-the high-level frame is 55-D (165-D over 3 frames) and ends at
-previous_hl_action -- matching the sim2sim reference and its
-hl_obs_dim_per_step: 55.
-
-It is still computed, for two reasons. It is the [GRASP] diagnostic, and it
-decides whether the actor's object vector is the measured object or the
-gripper centre. That substitution is a REAL-ROBOT addition with no sim2sim
-counterpart -- MuJoCo always knows where the cube is, whereas mocap loses it
-once it is inside the gripper. The proxy never latches and never forces the
-gripper closed: the executed gripper command is action[8] alone.
+The policy was retrained without grasp_confidence_proxy, so the high-level
+frame is 55-D (165-D over 3 frames) and ends at previous_hl_action -- matching
+the sim2sim reference and its hl_obs_dim_per_step: 55. No grasp proxy is
+computed here: the actor's object vector is always the measured mocap object,
+as in sim2sim, so a mocap dropout of the object (e.g. occluded inside the
+gripper) invalidates the task state and enters damping protection. The
+executed gripper command is action[8] alone.
 
 Sensing
 -------
@@ -332,7 +328,6 @@ class B2WZ1AbsRetrievalMocapController:
         self._configure_robot_layout()
         self._configure_wbc()
         self._configure_high_level()
-        self._configure_grasp_proxy()
         self._configure_protection()
         self._load_policies()
 
@@ -532,6 +527,11 @@ class B2WZ1AbsRetrievalMocapController:
         self.ee_kp_dz = float(cfg["ee_kp_dz"])
         self.ground_z = float(cfg.get("ground_z", 0.0))
         self.gripper_binary_threshold = float(cfg["gripper_binary_threshold"])
+        # Gripper-center offset in the Z1 policy EE (gripperStator) frame; feeds
+        # the gripper_center_base actor observation.
+        self.gripper_center_offset_local = np.asarray(
+            cfg["gripper_center_offset_local"], dtype=np.float32
+        ).reshape(3)
 
         # Neutral EE command, used at reset.
         self.neutral_kp0 = np.asarray(cfg["neutral_kp0"], dtype=np.float32).reshape(3)
@@ -568,69 +568,6 @@ class B2WZ1AbsRetrievalMocapController:
         self.debug_hl_obs_enabled = bool(cfg.get("debug_hl_obs_enabled", False))
         self.debug_ll_obs_enabled = bool(cfg.get("debug_ll_obs_enabled", False))
         self.debug_obs_print_max = int(cfg.get("debug_obs_print_max", 5))
-
-    def _configure_grasp_proxy(self) -> None:
-        """Grasp-confidence proxy: a diagnostic and an object-source switch.
-
-        Condition, held for grasp_proxy_enter_steps consecutive HL steps:
-
-            1. CLOSE was commanded on the previous HL step
-            2. ||object_center - gripper_center|| < grasp_proxy_error_threshold
-               (needs a live object fix; without one the term cannot pass)
-            3. the gripper is PARTIALLY closed -- the fingers left the open
-               stop but did not shut all the way on air
-
-        Training additionally required the fingers to have stopped moving.
-        That term is deliberately not evaluated here, as in the validated
-        deployment, which makes this proxy slightly easier to satisfy than the
-        one the policy trained against.
-        """
-        cfg = self.cfg
-
-        self.gripper_center_offset_local = np.asarray(
-            cfg["gripper_center_offset_local"], dtype=np.float32
-        ).reshape(3)
-
-        self.grasp_proxy_error_threshold = float(cfg["grasp_proxy_error_threshold"])
-        if not np.isfinite(self.grasp_proxy_error_threshold) or (
-            self.grasp_proxy_error_threshold <= 0.0
-        ):
-            raise ValueError(
-                "grasp_proxy_error_threshold must be a positive distance in m; "
-                f"got {self.grasp_proxy_error_threshold}."
-            )
-
-        self.gripper_not_fully_closed_threshold = float(
-            cfg["gripper_not_fully_closed_angle_threshold"]
-        )
-        # Lower bound on closure. Without it a WIDE-OPEN gripper satisfies
-        # "not fully closed" trivially and the proxy can declare a grasp before
-        # the fingers have moved at all.
-        self.gripper_min_closed_threshold = float(
-            cfg.get("gripper_min_closed_angle_threshold", self.gripper_open_pos)
-        )
-        if not (
-            self.gripper_open_pos - 1e-9
-            <= self.gripper_min_closed_threshold
-            < self.gripper_not_fully_closed_threshold
-        ):
-            raise ValueError(
-                "Expected gripper_open_pos <= gripper_min_closed_angle_threshold "
-                "< gripper_not_fully_closed_angle_threshold, got "
-                f"{self.gripper_open_pos:.4f} / "
-                f"{self.gripper_min_closed_threshold:.4f} / "
-                f"{self.gripper_not_fully_closed_threshold:.4f}."
-            )
-
-        for key in ("grasp_proxy_enter_steps", "grasp_proxy_exit_steps"):
-            value = cfg[key]
-            if isinstance(value, bool) or int(value) != value or int(value) < 1:
-                raise ValueError(f"{key} must be an integer >= 1 (HL steps); got {value!r}.")
-        self.grasp_proxy_enter_steps = int(cfg["grasp_proxy_enter_steps"])
-        self.grasp_proxy_exit_steps = int(cfg["grasp_proxy_exit_steps"])
-
-        self.grasp_proxy_log = bool(cfg.get("grasp_proxy_log", True))
-        self.grasp_proxy_log_period_s = float(cfg.get("grasp_proxy_log_period_s", 1.0))
 
     def _configure_protection(self) -> None:
         cfg = self.cfg
@@ -939,14 +876,6 @@ class B2WZ1AbsRetrievalMocapController:
         self.arm_target = self.default_arm_pos.copy()
         self.wheel_cmd = np.zeros(4, dtype=np.float32)
 
-        # Grasp proxy.
-        self.grasp_confidence_proxy = False
-        self.grasp_proxy_enter_count = 0
-        self.grasp_proxy_exit_count = 0
-        self.last_grasp_error = float("inf")
-        self._grasp_log_last_key: Optional[tuple] = None
-        self._grasp_log_last_t = 0.0
-
         # Scheduling / diagnostics.
         self.ll_tick = 0
         self.hl_tick = 0
@@ -1115,142 +1044,15 @@ class B2WZ1AbsRetrievalMocapController:
             pitch_to_euler_sign=self.ee_pitch_to_euler_sign,
         )
 
-    # ------------------------------------------------------------------
-    # Grasp confidence proxy (NOT an actor observation)
-    # ------------------------------------------------------------------
-
-    def update_grasp_proxy(self, snap: Dict[str, Any]) -> None:
-        """Re-evaluate the proxy at the 10 Hz high-level boundary.
-
-        The retrained actor does not observe this. It survives as the [GRASP]
-        diagnostic and as the switch deciding whether the actor's object vector
-        is the measured object or the gripper centre. Never latched, and never
-        used to force the gripper.
-        """
-        _, gripper_center_b = self.get_gripper_geometry()
-        gripper_q = self.gripper_q_training()
-
-        object_b = self._channel_point(snap, "object", "position_base")
-        object_valid = object_b is not None
-        grasp_error = (
-            float(np.linalg.norm(object_b - gripper_center_b))
-            if object_valid
-            else float("inf")
-        )
-        self.last_grasp_error = grasp_error
-
-        close_commanded = self.executed_gripper_cmd_norm > 0.0
-        not_fully_closed = gripper_q < self.gripper_not_fully_closed_threshold
-        has_closed = gripper_q > self.gripper_min_closed_threshold
-        candidate = bool(
-            close_commanded
-            and object_valid
-            and grasp_error < self.grasp_proxy_error_threshold
-            and not_fully_closed
-            and has_closed
-        )
-
-        was_proxy = self.grasp_confidence_proxy
-        if not self.grasp_confidence_proxy:
-            self.grasp_proxy_enter_count = (
-                self.grasp_proxy_enter_count + 1 if candidate else 0
-            )
-            if self.grasp_proxy_enter_count >= self.grasp_proxy_enter_steps:
-                self.grasp_confidence_proxy = True
-                self.grasp_proxy_enter_count = 0
-                self.grasp_proxy_exit_count = 0
-        else:
-            self.grasp_proxy_exit_count = (
-                0 if candidate else self.grasp_proxy_exit_count + 1
-            )
-            if self.grasp_proxy_exit_count >= self.grasp_proxy_exit_steps:
-                self.grasp_confidence_proxy = False
-                self.grasp_proxy_enter_count = 0
-                self.grasp_proxy_exit_count = 0
-
-        self._log_grasp_proxy(
-            candidate=candidate,
-            close_commanded=close_commanded,
-            object_valid=object_valid,
-            grasp_error=grasp_error,
-            gripper_q=gripper_q,
-            not_fully_closed=not_fully_closed,
-            has_closed=has_closed,
-            changed=was_proxy != self.grasp_confidence_proxy,
-        )
-
-    def _log_grasp_proxy(
-        self,
-        *,
-        candidate: bool,
-        close_commanded: bool,
-        object_valid: bool,
-        grasp_error: float,
-        gripper_q: float,
-        not_fully_closed: bool,
-        has_closed: bool,
-        changed: bool,
-    ) -> None:
-        """One line carrying the proxy and every term that produced it.
-
-        Printed whenever anything discrete changes, and otherwise at a
-        heartbeat -- so a transition is never lost between heartbeats, and a
-        static state still shows its current values.
-        """
-        if not self.grasp_proxy_log:
-            return
-
-        error_ok = grasp_error < self.grasp_proxy_error_threshold
-        # Only discrete terms gate "did something change"; the floats move
-        # every step and would defeat the throttle.
-        key = (
-            self.grasp_confidence_proxy, candidate, close_commanded, object_valid,
-            error_ok, not_fully_closed, has_closed,
-            self.grasp_proxy_enter_count, self.grasp_proxy_exit_count,
-        )
-        now = time.monotonic()
-        if not (
-            changed
-            or key != self._grasp_log_last_key
-            or now - self._grasp_log_last_t >= self.grasp_proxy_log_period_s
-        ):
-            return
-        self._grasp_log_last_key = key
-        self._grasp_log_last_t = now
-
-        def mark(ok: bool) -> str:
-            return "PASS" if ok else "fail"
-
-        print(
-            f"[GRASP] proxy={int(self.grasp_confidence_proxy)} "
-            f"cand={int(candidate)} | "
-            f"1.close={int(close_commanded)} {mark(close_commanded)} | "
-            f"2.err={grasp_error:6.3f}<{self.grasp_proxy_error_threshold:.3f} "
-            f"{mark(error_ok)} obj_valid={int(object_valid)} | "
-            f"3.grip_q={gripper_q:+7.4f} in "
-            f"({self.gripper_min_closed_threshold:+.3f},"
-            f"{self.gripper_not_fully_closed_threshold:+.3f}) "
-            f"closed={mark(has_closed)} notshut={mark(not_fully_closed)} | "
-            f"4.enter={self.grasp_proxy_enter_count}/{self.grasp_proxy_enter_steps} "
-            f"exit={self.grasp_proxy_exit_count}/{self.grasp_proxy_exit_steps}"
-            + ("   *** PROXY CHANGED ***" if changed else "")
-        )
-
     def resolve_task_state(self, snap: Dict[str, Any]) -> Dict[str, Any]:
         """What the actor is allowed to see this step. Never a stale stand-in.
 
-        Once the proxy says the object is in hand, the object vector becomes
-        the gripper centre -- training semantics, and what stops the policy
-        depending on seeing an object it is holding.
+        The object vector is always the measured mocap object, as in sim2sim.
         """
         gripper_orientation_b, gripper_center_b = self.get_gripper_geometry()
 
-        if self.grasp_confidence_proxy:
-            object_pos_b: Optional[np.ndarray] = gripper_center_b.copy()
-            object_source = "GRIPPER_CENTER"
-        else:
-            object_pos_b = self._channel_point(snap, "object", "position_base")
-            object_source = (snap.get("object") or {}).get("source") if object_pos_b is not None else None
+        object_pos_b = self._channel_point(snap, "object", "position_base")
+        object_source = (snap.get("object") or {}).get("source") if object_pos_b is not None else None
 
         retrieval_pos_b = self._channel_point(snap, "retrieval", "retrieval_target_base")
         retrieval_source = (
@@ -1898,7 +1700,6 @@ class B2WZ1AbsRetrievalMocapController:
             EE command     = neutral
             WBC last action= 0
             previous HL    = neutral ABS arm action, executed gripper OPEN
-            grasp proxy    = false
             histories      = the first valid frame, repeated
         """
         self.read_robot_state()
@@ -1923,11 +1724,6 @@ class B2WZ1AbsRetrievalMocapController:
         self.arm_target[:] = self.default_arm_pos
         self.wheel_cmd[:] = 0.0
         self.gripper_target = float(self.gripper_open_pos)
-
-        self.grasp_confidence_proxy = False
-        self.grasp_proxy_enter_count = 0
-        self.grasp_proxy_exit_count = 0
-        self.last_grasp_error = float("inf")
 
         task = self.resolve_task_state(snap)
         if not task["valid"]:
@@ -1967,12 +1763,6 @@ class B2WZ1AbsRetrievalMocapController:
 
         snap = self.read_perception()
         is_hl_boundary = self.ll_tick % self.ll_steps_per_hl_step == 0
-
-        # The proxy summarizes the high-level interval that just ended, so
-        # there is nothing to summarize on the very first step -- where the
-        # history was seeded a moment ago and no gripper command has run yet.
-        if is_hl_boundary and self.hl_tick > 0:
-            self.update_grasp_proxy(snap)
 
         task = self.resolve_task_state(snap)
         if not task["valid"]:
@@ -2035,11 +1825,16 @@ class B2WZ1AbsRetrievalMocapController:
             tick += 1
 
     def print_runtime_debug(self, task: Dict[str, Any]) -> None:
+        object_b = task.get("object_position_base")
+        grasp_err = (
+            float(np.linalg.norm(object_b - task["gripper_center_pos_base"]))
+            if object_b is not None
+            else float("nan")
+        )
         print(
             f"[ABS] ll={self.ll_tick:06d} hl={self.hl_tick:06d} | "
             f"OBJ={task.get('object_source')} RET={task.get('retrieval_source')} | "
-            f"proxy={int(self.grasp_confidence_proxy)} "
-            f"grasp_err={self.last_grasp_error:.3f} | "
+            f"grasp_err={grasp_err:.3f} | "
             f"grip_q_train={self.gripper_q_training():+.3f} "
             f"grip_tgt={self.gripper_target:+.3f} | "
             f"base_h={self._require_base_height():.4f}m | "
@@ -2158,7 +1953,6 @@ class B2WZ1AbsRetrievalMocapController:
             "z1_q": np.asarray(self.z1.q, dtype=np.float32).copy(),
             "gripper_q_training": self.gripper_q_training(),
             "ee_cmd_plb": self.ee_cmd_plb_current.copy(),
-            "grasp_confidence_proxy": bool(self.grasp_confidence_proxy),
             "object_pos_base": task.get("object_position_base"),
             "retrieval_pos_base": task.get("retrieval_target_base"),
             "gripper_center_pos_base": task.get("gripper_center_pos_base"),
@@ -2253,7 +2047,6 @@ class B2WZ1AbsRetrievalMocapController:
             "b2w_joint_pos_policy": joints,
             "z1_q": np.asarray(self.z1.q, dtype=np.float32).copy(),
             "gripper_q_training": self.gripper_q_training(),
-            "grasp_confidence_proxy": bool(self.grasp_confidence_proxy),
         }
 
         snap = self.perception.get_latest_snapshot()
@@ -2307,6 +2100,13 @@ class B2WZ1AbsRetrievalMocapController:
         )
         print(f"Gripper runtime  : {self.z1.gripper_runtime_mode} | "
               f"q_train = q_sdk - {self.z1.gripper_q_offset:.5f}")
+        gripper_gains = (
+            f"firmware kp={self.z1.gripper_kp:g} kd={self.z1.gripper_kd:g}"
+            if self.z1.gripper_runtime_mode == "position_pd"
+            else "firmware gains zeroed, DCMotor tau_f"
+        )
+        print(f"Gripper targets  : close {self.gripper_close_pos:+.4f} / "
+              f"open {self.gripper_open_pos:+.4f} rad (training) | {gripper_gains}")
         print("Arm filtering    : NONE (no startup blend, no target rate limiter)")
         print("HL arm semantics : ABS normalized action -> PLB xyz / yaw / policy-pitch")
         print(
@@ -2321,12 +2121,6 @@ class B2WZ1AbsRetrievalMocapController:
         print(
             "Neutral ABS act  : "
             + np.array2string(self.neutral_arm_action, precision=6, floatmode="fixed")
-        )
-        print(
-            "Grasp proxy      : close + "
-            f"dist<{self.grasp_proxy_error_threshold:.2f}m + partially closed | "
-            f"enter {self.grasp_proxy_enter_steps} / exit {self.grasp_proxy_exit_steps} "
-            "HL steps | NOT observed by the actor; selects the object source only"
         )
         print("Sensing          : OPTITRACK MOCAP (no camera, no AprilTag, no VO)")
         for selector in (

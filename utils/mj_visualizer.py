@@ -10,8 +10,7 @@ renders:
     - the detected object position                  (perception, Base frame)
     - the detected retrieval-target position         (perception, Base frame)
     - the decoded high-level end-effector command    (PLB frame)
-    - (optional) the training-defined gripper center, colored by the
-      grasp-confidence proxy, to help interpret grasp behavior
+    - (optional) the training-defined gripper center
 
 The real-time 50-Hz control thread only ever calls push_state(), which
 stores plain data under a short lock and returns immediately. All MuJoCo
@@ -756,11 +755,9 @@ class MujocoDebugVisualizer:
                     base_quat_wxyz,
                     np.asarray(gripper_center_pos_base, dtype=np.float32),
                 )
-                grasp_active = bool(state.get("grasp_confidence_proxy", False))
-                rgba = [0.0, 1.0, 0.0, 0.95] if grasp_active else [1.0, 1.0, 0.0, 0.95]
                 _add_sphere(
                     viewer.user_scn,
                     gripper_center_pos_w,
                     self._gripper_center_marker_radius,
-                    rgba,
+                    [1.0, 1.0, 0.0, 0.95],
                 )

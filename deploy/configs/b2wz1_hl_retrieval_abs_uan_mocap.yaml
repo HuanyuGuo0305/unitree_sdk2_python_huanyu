@@ -21,7 +21,7 @@
 low_policy_path: "exported_policies/b2wz1_hl_retrieval_abs_uan_mocap/low_policy.onnx"
 # The 165-D no-proxy actor, copied from the sim2sim export this deployment
 # mirrors (unitree_mujoco/exported_policy/b2wz1_hl_retrieval_abs_uan).
-high_policy_path: "exported_policies/b2wz1_hl_retrieval_abs_uan_mocap/high_policy_4.onnx"
+high_policy_path: "exported_policies/b2wz1_hl_retrieval_abs_uan_mocap/high_policy_5.onnx"
 
 # ----------------------------------------------------------------------
 # Timing / policy layout
@@ -91,11 +91,15 @@ default_joint_pos_policy: [
 
 default_arm_pos: [0.0, 1.48, -1.0, -0.54, 0.0, 1.57]
 
-# Gripper positions are TRAINING coordinates (closed = 0, open = -pi/2).
+# Gripper positions are TRAINING coordinates (fully closed = 0, fully open = -pi/2).
 # default_gripper_pos is the observation reference, not a command.
+# gripper_open_pos / gripper_close_pos are the targets of the binary HL gripper
+# action (action[8] > gripper_binary_threshold closes). gripper_close_pos stops
+# short of fully closed, matching the sim2sim config
+# (unitree_mujoco/simulate_python/configs/b2wz1_hl_retrieval_abs_uan.yaml).
 default_gripper_pos: 0.0
 gripper_open_pos: -1.5707963267948966
-gripper_close_pos: 0.0
+gripper_close_pos: -0.53
 
 # ----------------------------------------------------------------------
 # B2W gains, policy order (12 legs + 4 wheels).
@@ -171,7 +175,7 @@ kp0_z_range: [0.0, 1.15]
 # action -> range mapping the policy trained with is untouched. The trained
 # range bottoms out at ground level, so a saturated-low action[5] would
 # otherwise drive the wrist into the floor.
-kp0_z_cmd_min: 0.10
+kp0_z_cmd_min: 0.15
 
 ee_yaw_range: [-1.0471975511965976, 1.0471975511965976]     # +/- 60 deg
 
@@ -205,36 +209,14 @@ ee_kp_dz: 0.30
 ground_z: 0.0
 
 # ----------------------------------------------------------------------
-# Gripper command and grasp-confidence proxy.
-#
-# The proxy is an actor OBSERVATION. It is never latched and never forces the
-# gripper: the executed gripper command is action[8] alone.
-#
-# Proxy condition, held for grasp_proxy_enter_steps consecutive HL steps:
-#   1. CLOSE was commanded on the previous HL step
-#   2. ||object_center - gripper_center|| < grasp_proxy_error_threshold
-#   3. the gripper is PARTIALLY closed:
-#        gripper_min_closed_angle_threshold < q_train
-#                                           < gripper_not_fully_closed_angle_threshold
-#      i.e. the fingers left the open stop but did not shut on air
-# and released after grasp_proxy_exit_steps consecutive failing steps.
+# Gripper command: the executed command is action[8] alone
+# (action[8] > gripper_binary_threshold closes).
 # ----------------------------------------------------------------------
 gripper_binary_threshold: 0.0
 
-# Gripper-center offset in the Z1 policy EE (gripperStator) frame.
+# Gripper-center offset in the Z1 policy EE (gripperStator) frame; feeds the
+# gripper_center_base actor observation.
 gripper_center_offset_local: [0.075, 0.0, 0.01]
-
-grasp_proxy_error_threshold: 0.15
-gripper_not_fully_closed_angle_threshold: -0.08726646259971647   # -5 deg
-gripper_min_closed_angle_threshold: -1.3708
-grasp_proxy_enter_steps: 2
-grasp_proxy_exit_steps: 2
-
-# Terminal logging of the proxy and every term feeding it. A line is printed
-# whenever any term changes, and otherwise at this heartbeat interval.
-# 0 logs every high-level step.
-grasp_proxy_log: true
-grasp_proxy_log_period_s: 1.0
 
 # ----------------------------------------------------------------------
 # Z1 SDK / adapter
@@ -284,13 +266,15 @@ z1_arm_runtime_mode: "position_pd"
 #   "position_pd" : firmware gripper PD at the controller rate. Not the
 #                   trained actuator, but the loop closes far faster than the
 #                   Python send rate. Allowed because the HL gripper action is
-#                   binary open/close and grasp feedback reaches the policy
-#                   through the proxy, not through gripper dynamics.
+#                   binary open/close.
 #   "dcmotor"     : training-exact IdealPD + IsaacLab DCMotor envelope, sent
 #                   as external tau_f. Uses the z1_gripper_dcmotor_* values.
 z1_gripper_runtime_mode: "position_pd"
-z1_gripper_kp: 20.0
-z1_gripper_kd: 10000.0
+# Raw firmware gripper gains, written into the gripper slot of the LOWCMD
+# packet with setGripperGain(); they replace the SDK default kp=20 / kd=2000,
+# and Z1ArmAdapter reads them back and raises if they did not stick.
+z1_gripper_kp: 2.5
+z1_gripper_kd: 1500
 z1_gripper_travel_margin_rad: 0.0
 
 # q_training = q_sdk - z1_gripper_q_offset
@@ -322,8 +306,8 @@ mocap_body_id: 9
 mocap_body_offset_local: [0.0, 0.0, 0.0]
 mocap_body_max_age_s: 0.25
 
-mocap_object_name: "cube6"
-mocap_object_id: 14
+mocap_object_name: "cube4"
+mocap_object_id: 16
 mocap_object_offset_local: [0.0, 0.0, 0.0]
 mocap_object_max_age_s: 0.30
 

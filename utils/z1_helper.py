@@ -471,21 +471,32 @@ class Z1ArmAdapter:
                 f"{sorted(self.valid_gripper_runtime_modes)}."
             )
 
-        # Commanded gripper travel, TRAINING coordinates (close=0, open=-pi/2).
-        # Used to clamp a position command so the firmware PD is never asked to
-        # drive past a mechanical stop. z1_gripper_travel_margin_rad shrinks the
-        # range at both ends if you want to stay clear of the hard stops.
-        _grip_open = float(cfg.get("gripper_open_pos", -0.5 * np.pi))
-        _grip_close = float(cfg.get("gripper_close_pos", 0.0))
+        # Mechanical gripper travel, TRAINING coordinates (closed stop = 0, open
+        # stop = -pi/2). Used to clamp a position command so the firmware PD is
+        # never asked to drive past a stop. z1_gripper_travel_margin_rad shrinks
+        # the range at both ends if you want to stay clear of the hard stops.
+        #
+        # Deliberately NOT gripper_open_pos / gripper_close_pos: those are the
+        # policy's command targets and may stop short of the stops (sim2sim
+        # closes to -0.53), and a clamp there would move a gripper resting closer
+        # to a stop whenever it is told to hold its measured position.
+        _grip_open = -0.5 * np.pi
+        _grip_close = 0.0
         _grip_margin = float(cfg.get("z1_gripper_travel_margin_rad", 0.0))
-        self.gripper_travel_min_training = min(_grip_open, _grip_close) + _grip_margin
-        self.gripper_travel_max_training = max(_grip_open, _grip_close) - _grip_margin
+        self.gripper_travel_min_training = _grip_open + _grip_margin
+        self.gripper_travel_max_training = _grip_close - _grip_margin
         if not self.gripper_travel_max_training > self.gripper_travel_min_training:
             raise ValueError(
                 "z1_gripper_travel_margin_rad collapses the gripper travel: "
                 f"[{self.gripper_travel_min_training}, "
                 f"{self.gripper_travel_max_training}]"
             )
+        for key in ("gripper_open_pos", "gripper_close_pos"):
+            if key in cfg and not _grip_open - 1e-6 <= float(cfg[key]) <= _grip_close + 1e-6:
+                raise ValueError(
+                    f"{key}={float(cfg[key]):+.4f} lies outside the gripper travel "
+                    f"[{_grip_open:+.4f}, {_grip_close:+.4f}] rad (training coordinates)."
+                )
 
         # Runtime ARM actuator mode.
         #
@@ -606,10 +617,11 @@ class Z1ArmAdapter:
             raise RuntimeError("Z1 armModel is not accessible from Python binding.")
         if self.lowcmd is None:
             raise RuntimeError("Z1 lowcmd is not accessible from Python binding.")
-        if not hasattr(self.lowcmd, "setControlGain"):
-            raise RuntimeError(
-                "Z1 lowcmd binding does not expose setControlGain()."
-            )
+        for method in ("setControlGain", "setGripperGain"):
+            if not hasattr(self.lowcmd, method):
+                raise RuntimeError(
+                    f"Z1 lowcmd binding does not expose {method}()."
+                )
 
         # ============================================================
         # 1. Start communication in PASSIVE.
@@ -717,6 +729,9 @@ class Z1ArmAdapter:
         print("[Z1ArmAdapter] Entering LOWCMD with current-pose hold...")
 
         self.arm.setFsmLowcmd()
+        # setFsmLowcmd() reloads the SDK default gains (gripper kp=20 / kd=2000);
+        # put the configured gripper gains back before the first LOWCMD packet.
+        self.lowcmd.setGripperGain(float(self.gripper_kp), float(self.gripper_kd))
         time.sleep(0.02)
 
         # ============================================================
@@ -1139,9 +1154,24 @@ class Z1ArmAdapter:
         kp_full = [float(x) for x in kp] + [self.gripper_kp]
         kd_full = [float(x) for x in kd] + [self.gripper_kd]
         self.lowcmd.setControlGain(kp_full, kd_full)
+        # setControlGain() copies only the 6 arm entries. The gripper slot is
+        # written by setGripperGain() alone; without it the gripper keeps the
+        # SDK default kp=20 / kd=2000 that ArmInterface.setFsm() installs.
+        self.lowcmd.setGripperGain(float(self.gripper_kp), float(self.gripper_kd))
+        self._require_gripper_gains_in_cmd()
 
         self._last_applied_kp = kp.copy()
         self._last_applied_kd = kd.copy()
+
+    def _require_gripper_gains_in_cmd(self):
+        """Read the gripper gain slot back from the SDK command z1_ctrl receives."""
+        kp_cmd = float(self.lowcmd.kp[-1])
+        kd_cmd = float(self.lowcmd.kd[-1])
+        if not (np.isclose(kp_cmd, self.gripper_kp) and np.isclose(kd_cmd, self.gripper_kd)):
+            raise RuntimeError(
+                f"Z1 SDK command carries gripper kp={kp_cmd:g} kd={kd_cmd:g}, not "
+                f"z1_gripper_kp={self.gripper_kp:g} z1_gripper_kd={self.gripper_kd:g}."
+            )
 
     def _protect_joint_cmd(self, q_cmd: np.ndarray, qd_cmd: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         try:
@@ -1250,6 +1280,12 @@ class Z1ArmAdapter:
         print("[Z1ArmAdapter] steps    =", num_steps)
 
         self.arm.setFsmLowcmd()
+        # setFsmLowcmd() -> setFsm() reloads the SDK default gains into all 7
+        # slots, so the gain cache no longer describes what is being sent. The
+        # ramp below keeps the SDK arm defaults but uses the configured gripper gains.
+        self._last_applied_kp = None
+        self._last_applied_kd = None
+        self.lowcmd.setGripperGain(float(self.gripper_kp), float(self.gripper_kd))
         time.sleep(0.02)
 
         for _ in range(10):

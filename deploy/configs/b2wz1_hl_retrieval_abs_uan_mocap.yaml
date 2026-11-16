@@ -21,7 +21,7 @@
 low_policy_path: "exported_policies/b2wz1_hl_retrieval_abs_uan_mocap/low_policy.onnx"
 # The 165-D no-proxy actor, copied from the sim2sim export this deployment
 # mirrors (unitree_mujoco/exported_policy/b2wz1_hl_retrieval_abs_uan).
-high_policy_path: "exported_policies/b2wz1_hl_retrieval_abs_uan_mocap/high_policy_5.onnx"
+high_policy_path: "exported_policies/b2wz1_hl_retrieval_abs_uan_mocap/high_policy_8.onnx"
 
 # ----------------------------------------------------------------------
 # Timing / policy layout
@@ -167,7 +167,7 @@ arm_q_upper: [ 2.6180, 2.8798, 0.0,  1.5184,  1.3439,  2.7925]
 # ----------------------------------------------------------------------
 base_cmd_scale: [0.5, 0.5, 0.5]
 
-kp0_x_range: [0.40, 0.90]
+kp0_x_range: [0.50, 0.90]
 kp0_y_range: [-0.30, 0.30]
 kp0_z_range: [0.0, 1.15]
 

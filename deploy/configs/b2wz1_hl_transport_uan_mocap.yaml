@@ -1,0 +1,345 @@
+# ======================================================================
+# B2WZ1 dynamic nonprehensile TRANSPORT -> frozen WBC -> real robot, mocap.
+#
+#   python3 deploy/b2wz1_hl_transport_uan_mocap.py \
+#       enxa0cec819e15f \
+#       deploy/configs/b2wz1_hl_transport_uan_mocap.yaml
+#
+# Control stack (same loop shape as deploy/b2wz1_wbc_uan.py and the
+# retrieval sim2real):
+#
+#   HL transport policy 10 Hz -> 6-D EE pose residual on an operator reference
+#   frozen WBC          50 Hz -> leg / arm / wheel targets
+#   hardware           500 Hz -> zero-order hold of the WBC targets
+#
+# Source of truth for every HL quantity below:
+#   unitree_mujoco/simulate_python/configs/b2wz1_hl_transport_uan.yaml
+#   unitree_mujoco/simulate_python/deploy_mujoco/b2wz1_hl_transport_uan.py
+#
+# UAN is SIMULATION-ONLY and is never loaded here (see the retrieval YAML).
+# For provenance only: the transport HL + WBC were trained over the frozen UAN
+#   model_4000_inference.pt  sha256 db53ac18f9834d8a70f0fb37d068ce4f84607da2628d57181f0dcb299ca4c4eb
+# and the real Z1 runs the firmware PD that UAN was fitted against.
+#
+# Every key marked [REQUIRED SETUP] is a hardware fact this repository does
+# not know. The script REFUSES TO START until each one is filled in. See
+# deploy/TRANSPORT_SIM2REAL_SETUP.md.
+# ======================================================================
+
+# ----------------------------------------------------------------------
+# ONNX policies, pinned by SHA-256 (the script verifies both on load).
+#
+# high: exported_policies/b2wz1_hl_transport_uan/high_policy.onnx
+#       == unitree_mujoco/exported_policy/b2wz1_hl_transport_uan/high_policy_2.onnx
+#       == Isaac run 2026-10-27_14-31-10_single_beta_6d_four_pose_pos_rate_0p1
+#       192 -> 6, observation normalizer and Beta-mean inside the graph.
+#
+# low:  the frozen WBC THAT RUN WAS TRAINED ON (ll_load_run
+#       2026-10-27_12-47-31_uan_model_4000_multipose20260907), copied
+#       byte-identically from unitree_mujoco/exported_policy/b2wz1_wbc_plb_uan/.
+#
+#   DO NOT use exported_policies/b2wz1_hl_transport_uan/low_policy.onnx
+#   (47f19872...): that is the 2026-09-26 WBC of the superseded
+#   high_policy_1 run. Nor policy_wbc_uan_3.onnx (3b7874b7...), which is the
+#   2026-09-07 WBC validated by deploy/b2wz1_wbc_uan.py and retrieval.
+# ----------------------------------------------------------------------
+high_policy_path: "exported_policies/b2wz1_hl_transport_uan/high_policy.onnx"
+high_policy_sha256: "db78304602566538ea099c3f3a0679bcb9b731067d4e036374ad03cc537b70c1"
+low_policy_path: "exported_policies/b2wz1_wbc_uan_plb/policy_wbc_uan_transport.onnx"
+low_policy_sha256: "6b5aa5de8a438c07062ab5d9acd8e9d562ccb7a72f32aad72912f7707139a517"
+
+# ----------------------------------------------------------------------
+# Timing / policy layout (sim2sim: 250 Hz phys -> 50 Hz WBC -> 10 Hz HL)
+# ----------------------------------------------------------------------
+control_dt: 0.02
+ll_steps_per_hl_step: 5
+hardware_command_hz: 500.0
+
+ll_history_length: 5
+ll_obs_dim_per_step: 80
+ll_obs_dim: 400
+ll_action_dim: 22
+
+# 64-D/frame, 3 frames FEATURE-MAJOR = 192-D; 6-D residual action.
+hl_history_length: 3
+hl_obs_dim_per_step: 64
+hl_obs_dim: 192
+hl_action_dim: 6
+
+# ----------------------------------------------------------------------
+# Startup sequence (values from the retrieval sim2real)
+# ----------------------------------------------------------------------
+arm_default_transition_s: 4.0
+squat_transition_s: 2.0
+default_transition_s: 2.0
+z1_runtime_settle_s: 0.5
+
+# ----------------------------------------------------------------------
+# Robot defaults, POLICY order (identical to retrieval and to the sim2sim
+# default_joint_pos re-ordered).
+# ----------------------------------------------------------------------
+squat_b2w_pos_policy: [
+   0.1,  -0.1,   0.1,  -0.1,
+   1.57,  1.57,  1.57,  1.57,
+  -2.65, -2.65, -2.65, -2.65,
+   0.0,   0.0,   0.0,   0.0
+]
+default_b2w_pos_policy: [
+   0.1, -0.1,  0.1, -0.1,
+   0.8,  0.8,  1.0,  1.0,
+  -1.5, -1.5, -1.5, -1.5,
+   0.0,  0.0,  0.0,  0.0
+]
+default_joint_pos_policy: [
+   0.1, -0.1,  0.1, -0.1,
+   0.8,  0.8,  1.0,  1.0,
+  -1.5, -1.5, -1.5, -1.5,
+   0.0,  1.48, -1.0, -0.54, 0.0, 1.57
+]
+default_arm_pos: [0.0, 1.48, -1.0, -0.54, 0.0, 1.57]
+
+# Transport has NO gripper action: the gripper is held at the training
+# position for the whole run, startup included (sim2sim gripper_hold_pos).
+# TRAINING coordinates: closed = 0, open = -pi/2.
+default_gripper_pos: 0.0
+gripper_hold_pos: 0.0
+
+# B2W gains, policy order (retrieval / WBC sim2real values).
+kps_rl: [
+  200.0, 200.0, 200.0, 200.0,
+  200.0, 200.0, 200.0, 200.0,
+  300.0, 300.0, 300.0, 300.0,
+    0.0,   0.0,   0.0,   0.0
+]
+kds_rl: [
+   8.0,  8.0,  8.0,  8.0,
+   8.0,  8.0,  8.0,  8.0,
+  12.0, 12.0, 12.0, 12.0,
+  10.0, 10.0, 10.0, 10.0
+]
+kps_pd: [
+  500.0, 500.0, 500.0, 500.0,
+  500.0, 500.0, 500.0, 500.0,
+  500.0, 500.0, 500.0, 500.0,
+    0.0,   0.0,   0.0,   0.0
+]
+kds_pd: [
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0,
+  10.0, 10.0, 10.0, 10.0
+]
+
+# WBC JointPositionAction decoding (no blend, no rate limiter).
+leg_action_scale: 0.25
+arm_action_scale: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
+wheel_action_scale: 4.0
+
+# Live Z1 SDK hard range: a WBC target outside it is a FAULT, not a clamp.
+arm_q_lower: [-2.6180, 0.0, -2.8856, -1.5184, -1.3439, -2.7925]
+arm_q_upper: [ 2.6180, 2.8798, 0.0,  1.5184,  1.3439,  2.7925]
+
+# ----------------------------------------------------------------------
+# Transport HL semantics -- copied verbatim from the sim2sim YAML.
+#
+#   kp0_cmd = clip(kp0_ref + a[0:3] * ee_pos_action_residual_scale, kp0 ranges)
+#   rot_cmd = clip(rot_ref + a[3:6] * ee_rot_action_residual_scale, rot ranges)
+#   rot = [yaw, pitch, roll], fed to the training keypoint adapter.
+#   base_command = base reference (NO learned base residual).
+# ----------------------------------------------------------------------
+ground_z: 0.0
+ee_kp_dx: 0.30
+ee_kp_dz: 0.30
+
+base_cmd_scale: [0.6, 0.6, 0.6]
+kp0_x_range: [0.40, 0.90]
+kp0_y_range: [-0.40, 0.40]
+kp0_z_range: [0.10, 1.20]
+ee_yaw_range: [-1.0471975511965976, 1.0471975511965976]
+ee_pitch_range: [-0.7853981633974483, 0.7853981633974483]
+ee_roll_range: [0.7853981633974483, 2.356194490192345]
+
+ee_pos_action_residual_scale: [0.10, 0.10, 0.10]
+ee_rot_action_residual_scale: [0.7853981633974483, 0.7853981633974483, 0.7853981633974483]
+
+# Task references. Training samples HIGH/LOW/LEFT/RIGHT; on the robot the
+# OPERATOR selects them (D-pad: up=HIGH, down=LOW, left=LEFT, right=RIGHT).
+# HIGH is the EE kp0 MEASURED after the 0.5-s settle, exactly as training.
+reset_settle_time_s: 0.5
+# Training resamples the EE target every U(4,5) s. The lower bound is enforced
+# as the minimum time between operator target switches, so no transition is
+# ever requested more often than the policy saw.
+ee_ref_resample_time_range_s: [4.0, 5.0]
+ee_fast_transition_time_s: 1.5
+ee_low_transition_time_s: 2.0
+canonical_ee_positions: [
+  [0.547845, -0.00, 1.116555],
+  [0.75,      0.00, 0.35],
+  [0.50,      0.30, 0.80],
+  [0.50,     -0.30, 0.80]
+]
+canonical_ee_yaw: 0.0
+canonical_ee_pitch: -0.06
+canonical_ee_roll: 1.5707963267948966
+
+# Training base reference range. The operator command is clipped to it.
+base_ref_ranges: [
+  [-0.6, 0.6],
+  [-0.6, 0.6],
+  [-0.6, 0.6]
+]
+
+# Operator base reference from the sticks, mapping and deadband of
+# deploy/b2wz1_wbc_uan.py: ly -> vx, -lx -> vy, -rx -> wz.
+# Read once per HL step (the sim2sim changes the base reference only at HL
+# boundaries). Start low for the first supervised runs; max is base_ref_ranges.
+command_scale: [0.6, 0.6, 0.6]
+command_deadband_lin: 0.2
+command_deadband_ang: 0.2
+
+# ----------------------------------------------------------------------
+# Disk / puck: TRAINING geometry (sim2sim YAML + b2wz1_disk.xml).
+# The disk frame is derived from Z1 FK; NO disk rigid body is required.
+#
+#   disk centre = gripperStator + R_stator @ disk_center_offset_gripper
+#   disk axes   = R_stator @ disk_{x,y,z}_axis_gripper   (disk +Z = stator +Y)
+#   puck_D      = R_disk^T (puck_centre - disk_centre)   (actor observation)
+# ----------------------------------------------------------------------
+disk_center_offset_gripper: [0.100, 0.045, 0.0]
+disk_x_axis_gripper: [1.0, 0.0, 0.0]
+disk_y_axis_gripper: [0.0, 0.0, -1.0]
+disk_z_axis_gripper: [0.0, 1.0, 0.0]
+disk_thickness: 0.004
+disk_radius: 0.100
+
+puck_radius: 0.05
+puck_height: 0.08
+# Training puck mass range (randomized U(0.5, 1.5) kg).
+puck_mass_range_kg: [0.50, 1.50]
+
+# Training placement and actor-noise constants. The start gate and the
+# real contact proxy are DERIVED from these; no new thresholds:
+#   start:   |x_D|,|y_D| <= spawn_xy + obs_noise,
+#            |z_D - (rest + clearance)| <= obs_noise
+#   contact: rho_D <= disk_radius and |z_D - rest| <= obs_noise
+#   rest   = disk_thickness/2 + puck_height/2 = 0.042 m
+puck_spawn_xy_randomization: 0.01
+puck_spawn_clearance: 0.0005
+puck_obs_noise_m: 0.01
+
+# Training termination: puck/disk contact lost for this many consecutive
+# ACTIVE HL steps (0.5 s) -> puck_drop. Here: -> damping protection.
+puck_drop_no_contact_steps: 5
+
+# ----------------------------------------------------------------------
+# [REQUIRED SETUP] Operator-confirmed hardware facts. The script refuses to
+# start while any of these is null/false. See TRANSPORT_SIM2REAL_SETUP.md.
+# ----------------------------------------------------------------------
+# Measured mass of the real puck [kg]; must lie in puck_mass_range_kg.
+puck_mass_kg: null
+# true once the real puck is measured to be a cylinder of puck_radius x
+# puck_height (+/- 2 mm).
+puck_geometry_verified: false
+# true once the printed disk is measured to sit on the gripperStator exactly
+# as disk_center_offset_gripper / disk_*_axis_gripper say (URDF mount
+# xyz=[0.100, 0.043, 0.0], rpy=[-pi/2, 0, 0], 200-mm rimless disk).
+disk_mount_verified: false
+
+# ----------------------------------------------------------------------
+# Z1 SDK / adapter (retrieval sim2real values)
+# ----------------------------------------------------------------------
+z1_sdk_lib: "/home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib"
+z1_has_gripper: true
+z1_fk_ee_index: 5
+
+arm_base_offset_pos: [0.19, 0.0, 0.1027]
+arm_base_offset_rpy: [0.0, 0.0, 0.0]
+z1_fk_to_policy_ee_pos: [0.051, 0.0, 0.0]
+z1_fk_to_policy_ee_rpy: [0.0, 0.0, 0.0]
+
+arm_kps_startup: [20.0, 30.0, 30.0, 20.0, 15.0, 10.0]
+arm_kds_startup: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
+
+# Firmware gains * 25.6 / * 0.0128 must equal the training PD. Audited.
+arm_kps_runtime: [2.5, 4.5, 2.5, 2.5, 2.5, 2.5]
+arm_kds_runtime: [234.375, 312.5, 234.375, 234.375, 234.375, 234.375]
+z1_kp_protocol_scale: 25.6
+z1_kd_protocol_scale: 0.0128
+arm_kp_training: [64.0, 115.2, 64.0, 64.0, 64.0, 64.0]
+arm_kd_training: [3.0, 4.0, 3.0, 3.0, 3.0, 3.0]
+z1_arm_runtime_mode: "position_pd"
+
+z1_gripper_runtime_mode: "position_pd"
+z1_gripper_kp: 2.5
+z1_gripper_kd: 1500
+z1_gripper_travel_margin_rad: 0.0
+z1_gripper_q_offset: 0.02367
+z1_gripper_dcmotor_kp: 76.8
+z1_gripper_dcmotor_kd: 4.0
+z1_gripper_dcmotor_effort_limit: 30.0
+z1_gripper_dcmotor_saturation_effort: 30.0
+z1_gripper_dcmotor_velocity_limit: 2.0
+
+z1_debug_print: true
+
+# ----------------------------------------------------------------------
+# OptiTrack (NatNet). Network + robot body reused from the validated
+# retrieval config. Transport needs exactly TWO rigid bodies:
+#   body: the B2 (base_link pose -> base height, mocap world -> base frame)
+#   puck: the transported puck (-> puck centre in the base frame)
+# ----------------------------------------------------------------------
+mocap_local_ip: "192.168.0.17"
+mocap_server_ip: "192.168.0.118"
+mocap_join_multicast: true
+mocap_multicast_group: "239.255.42.99"
+mocap_data_port: 1511
+mocap_command_port: 1510
+mocap_up_axis: "auto"
+mocap_timeout_s: 10.0
+
+mocap_body_name: "B2"
+mocap_body_id: 9
+mocap_body_offset_local: [0.0, 0.0, 0.0]
+mocap_body_max_age_s: 0.25
+
+# [REQUIRED SETUP] Motive asset of the puck: a name and/or a streaming id.
+mocap_puck_name: null
+mocap_puck_id: null
+# [REQUIRED SETUP] Motive pivot -> puck GEOMETRIC CENTRE, in the puck asset
+# frame [m]. [0, 0, 0] only if the pivot was placed at the centre in Motive.
+mocap_puck_offset_local: null
+# One HL period: the actor never sees a puck older than the step it acts on.
+mocap_puck_max_age_s: 0.10
+
+# Root frame == base_link, as in the validated retrieval setup.
+mocap_root_frame_is_base_link: true
+mocap_root_offset_path: null
+
+perception_status_print_s: 1.0
+
+# ----------------------------------------------------------------------
+# Damping protection + manual leg recovery (retrieval values)
+# ----------------------------------------------------------------------
+damping_kd_b2w: 150.0
+damping_kd_wheel: 10.0
+damping_kp_z1: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+damping_kd_z1: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
+damping_print_period: 100
+
+damping_leg_recovery_enabled: true
+damping_recover_leg_duration_s: 4.0
+damping_recover_leg_tolerance_rad: 0.15
+damping_recover_leg_target: [
+   0.1,  -0.1,   0.1,  -0.1,
+   1.57,  1.57,  1.57,  1.57,
+  -2.65, -2.65, -2.65, -2.65
+]
+
+# ----------------------------------------------------------------------
+# Logging / debug
+# ----------------------------------------------------------------------
+debug_print_period_steps: 50
+# One CSV row per HL step (refs, raw/executed residual, commands, puck_D,
+# contact proxy, mocap ages, measured EE). Directory relative to repo root.
+hl_log_enabled: true
+hl_log_dir: "Log/transport"

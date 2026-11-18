@@ -45,7 +45,7 @@
 # ----------------------------------------------------------------------
 high_policy_path: "exported_policies/b2wz1_hl_transport_uan/high_policy.onnx"
 high_policy_sha256: "db78304602566538ea099c3f3a0679bcb9b731067d4e036374ad03cc537b70c1"
-low_policy_path: "exported_policies/b2wz1_wbc_uan_plb/policy_wbc_uan_transport.onnx"
+low_policy_path: "exported_policies/b2wz1_whl_transpor_uan/low_policy.onnx"
 low_policy_sha256: "6b5aa5de8a438c07062ab5d9acd8e9d562ccb7a72f32aad72912f7707139a517"
 
 # ----------------------------------------------------------------------

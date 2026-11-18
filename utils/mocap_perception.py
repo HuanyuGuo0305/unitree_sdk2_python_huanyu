@@ -441,6 +441,14 @@ class MocapPerceptionSystem:
 
         try:
             for name, pts in (getattr(frame, "marker_sets", None) or {}).items():
+                # Motive streams an aggregate set named "all" holding the union
+                # of every labeled marker, alongside the per-asset sets. Keeping
+                # it would draw each labeled marker TWICE -- once in its asset's
+                # colour and once in the aggregate's -- and would roughly double
+                # `count`. deploy/b2w_mocap_root_calibration.py already drops it
+                # for the same reason.
+                if str(name) == "all":
+                    continue
                 arr = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
                 if arr.size:
                     labeled[str(name)] = arr.tolist()

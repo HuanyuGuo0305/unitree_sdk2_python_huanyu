@@ -261,6 +261,49 @@ def build_ee_keypoints_plb(
     return np.concatenate([kp0, kp1, kp2], dtype=np.float32)
 
 
+class RunningStats:
+    """p50 / p99 / max of a bounded sample window, for loop diagnostics.
+
+    The old overrun detector only fired once the loop was a whole WBC step
+    (20 ms) behind, so routine millisecond-scale jitter -- the kind that makes
+    a position-PD arm tremble without ever tripping a fault -- was invisible.
+    This makes it a number.
+    """
+
+    __slots__ = ("_samples", "_count")
+
+    def __init__(self, capacity: int = 4096) -> None:
+        self._samples = deque(maxlen=int(capacity))
+        self._count = 0
+
+    def add(self, value: float) -> None:
+        self._samples.append(float(value))
+        self._count += 1
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def reset(self) -> None:
+        self._samples.clear()
+        self._count = 0
+
+    def summary(self, scale: float = 1.0, unit: str = "", digits: int = 2) -> str:
+        if not self._samples:
+            return "n=0"
+        xs = sorted(self._samples)
+        n = len(xs)
+        p50 = xs[n // 2] * scale
+        p99 = xs[min(n - 1, int(0.99 * n))] * scale
+        return (
+            f"n={n} p50={p50:.{digits}f} p99={p99:.{digits}f} "
+            f"max={xs[-1] * scale:.{digits}f}{unit}"
+        )
+
+    def summary_ms(self) -> str:
+        return self.summary(scale=1e3, unit="ms")
+
+
 class FeatureHistory:
     """Feature-major observation history.
 
@@ -608,11 +651,29 @@ class B2WZ1AbsRetrievalMocapController:
             if not os.path.isfile(path):
                 raise FileNotFoundError(f"Policy not found: {path}")
 
+        # Both sessions are pinned to ONE thread with spinning disabled.
+        # Default SessionOptions give each session its own intra-op thread
+        # pool whose workers spin-wait between calls; on this host that was
+        # measured at 16 us median but 3.0 ms worst case for low_policy.onnx.
+        # A 3 ms stall inside the 2 ms hardware tick is exactly the kind of
+        # irregular command cadence that makes a position-PD arm tremble, and
+        # these graphs are far too small to gain anything from parallelism.
+        session_options = ort.SessionOptions()
+        session_options.intra_op_num_threads = 1
+        session_options.inter_op_num_threads = 1
+        session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        session_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+
         self.low_session = ort.InferenceSession(
-            self.low_policy_path, providers=["CPUExecutionProvider"]
+            self.low_policy_path,
+            sess_options=session_options,
+            providers=["CPUExecutionProvider"],
         )
         self.high_session = ort.InferenceSession(
-            self.high_policy_path, providers=["CPUExecutionProvider"]
+            self.high_policy_path,
+            sess_options=session_options,
+            providers=["CPUExecutionProvider"],
         )
         self.low_input_name = self.low_session.get_inputs()[0].name
         self.low_output_name = self.low_session.get_outputs()[0].name
@@ -843,6 +904,11 @@ class B2WZ1AbsRetrievalMocapController:
 
         self.viz_show_pivots = bool(cfg.get("visualizer_show_mocap_pivots", True))
         self.viz_pivot_radius = float(cfg.get("visualizer_mocap_pivot_radius", 0.022))
+        # How often the marker-cloud composition may be re-announced, and how
+        # often the "stream carries no markers" warning repeats.
+        self.viz_marker_report_s = float(
+            cfg.get("visualizer_marker_report_period_s", 10.0)
+        )
         self.monitor_enabled = bool(cfg.get("visualizer_monitor_enabled", True))
         self.monitor_hz = float(cfg.get("visualizer_monitor_hz", 30.0))
         self.monitor_takeover_s = float(cfg.get("visualizer_monitor_takeover_s", 0.25))
@@ -884,13 +950,35 @@ class B2WZ1AbsRetrievalMocapController:
         self.debug_ll_obs_count = 0
         self._abs_decode_debug_printed = False
 
+        # Loop health. send_hardware_targets() is the stream the robots
+        # actually see, so its SPACING is the quantity that matters, not the
+        # loop's own bookkeeping.
+        self.stat_tick_interval = RunningStats()
+        self.stat_wbc_step = RunningStats()
+        self.stat_hardware_send = RunningStats()
+        self.tick_overrun_count = 0
+        self._last_send_time: Optional[float] = None
+
+        # High-level command health, the other half of the trembling question:
+        # how much the 10 Hz command actually moves between steps, and how
+        # often the kp0_z safety floor -- which exists only here and not in
+        # sim2sim -- is rewriting the command the policy asked for.
+        self.prev_hl_action_for_delta: Optional[np.ndarray] = None
+        self.prev_kp0_cmd: Optional[np.ndarray] = None
+        self.stat_hl_action_delta = RunningStats()
+        self.stat_hl_kp0_jump = RunningStats()
+        self.kp0_z_floor_hits = 0
+        self.hl_steps_since_report = 0
+        self._mocap_frame_mark: Optional[Tuple[int, float]] = None
+
         # Visualizer monitor.
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitor_stop = threading.Event()
         self._monitor_warned = False
         self._last_control_push = 0.0
-        self._viz_no_marker_warned = False
-        self._viz_marker_count_announced = False
+        self._viz_no_marker_warned_at = -1e9
+        self._viz_marker_signature: Optional[Tuple[Any, int]] = None
+        self._viz_marker_signature_at = -1e9
 
     # ------------------------------------------------------------------
     # Sensing
@@ -1172,20 +1260,37 @@ class B2WZ1AbsRetrievalMocapController:
         action = np.clip(
             np.asarray(action, dtype=np.float32).reshape(self.hl_action_dim), -1.0, 1.0
         )
+        if self.prev_hl_action_for_delta is not None:
+            self.stat_hl_action_delta.add(
+                float(np.max(np.abs(action - self.prev_hl_action_for_delta)))
+            )
+        self.prev_hl_action_for_delta = action.copy()
         self.current_hl_action[:] = action
 
         self.base_command[:] = (action[0:3] * self.base_cmd_scale).astype(np.float32)
+
+        # Floor applied AFTER the affine map: the action -> range mapping the
+        # policy trained with stays untouched. It is counted, though: the
+        # floor does not exist in sim2sim, and previous_hl_action still
+        # reports the RAW action[5], so while it is active the actor believes
+        # it executed a descent it did not. That is a closed-loop
+        # disagreement, not just a clamp.
+        kp0_z_unfloored = map_to_range(action[5], self.kp0_z_range)
+        if kp0_z_unfloored < self.kp0_z_cmd_min:
+            self.kp0_z_floor_hits += 1
 
         kp0_cmd = np.array(
             [
                 map_to_range(action[3], self.kp0_x_range),
                 map_to_range(action[4], self.kp0_y_range),
-                # Floor applied AFTER the affine map: the action -> range
-                # mapping the policy trained with stays untouched.
-                max(map_to_range(action[5], self.kp0_z_range), self.kp0_z_cmd_min),
+                max(kp0_z_unfloored, self.kp0_z_cmd_min),
             ],
             dtype=np.float32,
         )
+        if self.prev_kp0_cmd is not None:
+            self.stat_hl_kp0_jump.add(float(np.linalg.norm(kp0_cmd - self.prev_kp0_cmd)))
+        self.prev_kp0_cmd = kp0_cmd.copy()
+        self.hl_steps_since_report += 1
         yaw_cmd = map_to_range(action[6], self.ee_yaw_range)
         pitch_cmd = map_to_range(action[7], self.ee_pitch_range)
 
@@ -1806,11 +1911,18 @@ class B2WZ1AbsRetrievalMocapController:
         tick = 0
         while True:
             if tick % self.hardware_ticks_per_wbc_step == 0:
+                t_wbc = time.perf_counter()
                 reason = self.wbc_step()
+                self.stat_wbc_step.add(time.perf_counter() - t_wbc)
                 if reason is not None:
                     return reason
 
+            t_send = time.perf_counter()
+            if self._last_send_time is not None:
+                self.stat_tick_interval.add(t_send - self._last_send_time)
+            self._last_send_time = t_send
             self.send_hardware_targets()
+            self.stat_hardware_send.add(time.perf_counter() - t_send)
 
             deadline += self.hardware_dt
             now = time.perf_counter()
@@ -1818,6 +1930,7 @@ class B2WZ1AbsRetrievalMocapController:
                 # A whole WBC step behind. Re-anchor the wall clock rather than
                 # burst out the backlog as identical back-to-back packets. The
                 # tick counter keeps running, so the WBC decimation stays put.
+                self.tick_overrun_count += 1
                 print("[TIMING][WARN] hardware loop overrun; re-anchoring.")
                 deadline = now + self.hardware_dt
             elif deadline > now:
@@ -1849,6 +1962,107 @@ class B2WZ1AbsRetrievalMocapController:
             f"wheel_act=[{self.last_ll_action[18:22].min():+.2f},"
             f"{self.last_ll_action[18:22].max():+.2f}]"
         )
+        self.print_loop_health()
+        self.print_perception_health()
+
+    def print_loop_health(self) -> None:
+        """Loop cadence and 10 Hz command chatter -- the two tremble sources.
+
+        Read it this way:
+
+          tick_dt      spacing of the packets the robots actually receive.
+                       p50 must sit on 1/hardware_command_hz; a p99 or max
+                       far above it means the arm is being commanded on an
+                       irregular grid, which looks exactly like trembling
+                       however clean the targets themselves are.
+          wbc_step     the 50 Hz block (state read, mocap, FK, inference).
+                       Anything approaching one tick period steals from the
+                       stream.
+          dHL          max |action[t] - action[t-1]| over the 9-D high-level
+                       action. Small and smooth in sim2sim; if this is large
+                       here, the ACTOR is chattering and no amount of loop
+                       tuning will settle the arm.
+          dkp0         how far the decoded EE keypoint command jumps per
+                       10 Hz step, in centimetres. This is the step the WBC
+                       and then the real arm have to absorb.
+          z_floor      how often kp0_z_cmd_min overrode the policy. Nonzero
+                       means the deployment is running a command the actor
+                       never sees acknowledged in previous_hl_action.
+        """
+        print(
+            f"      [LOOP] tick_dt {self.stat_tick_interval.summary_ms()} "
+            f"(target {self.hardware_dt * 1e3:.2f}ms) | overruns="
+            f"{self.tick_overrun_count}"
+        )
+        print(
+            f"      [LOOP] wbc_step {self.stat_wbc_step.summary_ms()} | "
+            f"hw_send {self.stat_hardware_send.summary_ms()}"
+        )
+        if self.stat_hl_action_delta.count:
+            print(
+                "      [HL-CMD] dHL "
+                + self.stat_hl_action_delta.summary(digits=3)
+                + " | dkp0 "
+                + self.stat_hl_kp0_jump.summary(scale=1e2, unit="cm")
+                + f" | z_floor={self.kp0_z_floor_hits}/"
+                f"{self.hl_steps_since_report} steps"
+            )
+        for stat in (
+            self.stat_tick_interval,
+            self.stat_wbc_step,
+            self.stat_hardware_send,
+            self.stat_hl_action_delta,
+            self.stat_hl_kp0_jump,
+        ):
+            stat.reset()
+        self.kp0_z_floor_hits = 0
+        self.hl_steps_since_report = 0
+
+    def print_perception_health(self) -> None:
+        """Does the mocap stream actually keep up with the 10 Hz high level?
+
+        The architecture cannot be rate-limited by mocap -- the NatNet client
+        decodes on its own thread and every read is a nonblocking
+        latest-value fetch -- so what matters is AGE, not rate: how old the
+        pose the actor just consumed really was. The configured
+        mocap_*_max_age_s gates are 2.5 to 3 high-level periods wide, so a
+        channel can be badly stale and still report valid.
+        """
+        snap = self.last_perception_snapshot or {}
+        parts = []
+        for channel in ("body", "object", "retrieval"):
+            state = snap.get(channel) or {}
+            age_ms = state.get("age_ms")
+            parts.append(
+                f"{channel}="
+                + ("n/a" if age_ms is None else f"{float(age_ms):.1f}ms")
+                + ("" if state.get("valid") else "!")
+            )
+        # frames_received is a monotonic counter maintained by the NatNet
+        # receive thread, so differencing it against wall time gives the rate
+        # this process is really being fed -- which is the question, not what
+        # Motive advertises.
+        mocap = snap.get("mocap") or {}
+        frames = mocap.get("frames_received")
+        now = time.perf_counter()
+        measured = None
+        if frames is not None and self._mocap_frame_mark is not None:
+            prev_frames, prev_t = self._mocap_frame_mark
+            dt = now - prev_t
+            if dt > 1e-6:
+                measured = (int(frames) - int(prev_frames)) / dt
+        if frames is not None:
+            self._mocap_frame_mark = (int(frames), now)
+
+        advertised = getattr(self.perception.client, "frame_rate", None)
+        print(
+            "      [MOCAP] age " + " ".join(parts)
+            + " | rate measured="
+            + ("n/a" if measured is None else f"{measured:.1f}Hz")
+            + (f" advertised={advertised:g}Hz" if advertised else "")
+            + f" | hl={1.0 / self.hl_control_dt:.0f}Hz"
+            + f" | parse_err={mocap.get('parse_errors')}"
+        )
 
     # ------------------------------------------------------------------
     # MuJoCo debug view
@@ -1861,35 +2075,63 @@ class B2WZ1AbsRetrievalMocapController:
     # ------------------------------------------------------------------
 
     def _mocap_marker_cloud(self, snap: Optional[Dict[str, Any]] = None):
-        """Every raw marker in the latest mocap frame."""
+        """Every raw marker in the latest mocap frame.
+
+        The composition is reported whenever it CHANGES, not once at startup.
+        An asset silently shedding markers -- the cube losing two of four as
+        the gripper closes over it, say -- is the single most useful thing
+        this view can tell you, and a one-shot announcement hides it.
+        """
         snap = snap if snap is not None else self.last_perception_snapshot
         if not snap:
             return None
         markers = snap.get("markers")
         if not markers or not markers.get("count"):
-            # Say so once: drawing nothing looks identical to a broken
-            # visualizer, and the usual cause is a Motive setting -- rigid
-            # bodies stream on their own toggle, so poses can arrive perfectly
-            # while the marker sections are empty.
-            if not self._viz_no_marker_warned:
-                self._viz_no_marker_warned = True
+            # Drawing nothing looks identical to a broken visualizer, and the
+            # usual cause is a Motive setting -- rigid bodies stream on their
+            # own toggle, so poses can arrive perfectly while the marker
+            # sections are empty. Re-say it periodically: a single line at
+            # startup scrolls away under the per-second debug blocks.
+            now = time.monotonic()
+            if now - self._viz_no_marker_warned_at >= getattr(
+                self, "viz_marker_report_s", 10.0
+            ):
+                self._viz_no_marker_warned_at = now
                 print(
                     "[VIZ][WARN] visualizer_show_all_markers is on, but this "
                     "NatNet stream carries NO markers. Rigid-body poses are "
                     "unaffected. Enable Motive > View > Data Streaming Pane > "
                     "'Labeled Markers' and 'Unlabeled Markers'."
                 )
-            return None
+            self._viz_marker_signature = None
+            return markers
 
-        if not self._viz_marker_count_announced:
-            self._viz_marker_count_announced = True
-            labeled = markers.get("labeled") or {}
-            print(
-                f"[VIZ] drawing {markers['count']} mocap markers "
-                f"({len(labeled)} labeled set(s): "
-                + ", ".join(f"{k}={len(v)}" for k, v in sorted(labeled.items()))
-                + f"; unlabeled={len(markers.get('unlabeled') or [])})"
-            )
+        labeled = markers.get("labeled") or {}
+        unlabeled = markers.get("unlabeled") or []
+        signature = (
+            tuple(sorted((k, len(v)) for k, v in labeled.items())),
+            len(unlabeled),
+        )
+        if signature != self._viz_marker_signature:
+            # Changed -- but this runs at 50 Hz from the control loop, and a
+            # single marker flickering in and out would otherwise print on
+            # every step. Report a change at most once per period; the line
+            # always describes the CURRENT cloud, so nothing is lost but the
+            # intermediate flicker.
+            now = time.monotonic()
+            if now - self._viz_marker_signature_at >= getattr(
+                self, "viz_marker_report_s", 10.0
+            ):
+                self._viz_marker_signature = signature
+                self._viz_marker_signature_at = now
+                print(
+                    f"[VIZ] marker cloud: {markers['count']} markers | "
+                    + (
+                        ", ".join(f"{k}={len(v)}" for k, v in sorted(labeled.items()))
+                        or "no labeled sets"
+                    )
+                    + f" | unlabeled={len(unlabeled)}"
+                )
         return markers
 
     def _mocap_root_frame(self, snap: Optional[Dict[str, Any]] = None):
@@ -1958,13 +2200,23 @@ class B2WZ1AbsRetrievalMocapController:
             "gripper_center_pos_base": task.get("gripper_center_pos_base"),
         }
 
+        # The raw marker cloud and the asset pivots are world-frame points that
+        # do not depend on the robot asset solving, so they are pushed
+        # unconditionally. Only the rendered base pose and the calibrated root
+        # triad need a tracked body. Gating the cloud on body validity used to
+        # blank the whole view at exactly the moment it is most diagnostic --
+        # when the B2 asset drops out and you want to see which markers Motive
+        # still has.
+        state.update(
+            mocap_points=self._mocap_pivot_markers(),
+            mocap_markers=self._mocap_marker_cloud(),
+        )
+
         body = (self.last_perception_snapshot or {}).get("body") or {}
         if body.get("valid") and body.get("root_position_world") is not None:
             state.update(
                 base_pos_w=np.asarray(body["root_position_world"], dtype=np.float64),
                 base_quat_wxyz=np.asarray(body["root_quat_wxyz"], dtype=np.float32),
-                mocap_points=self._mocap_pivot_markers(),
-                mocap_markers=self._mocap_marker_cloud(),
                 root_frame=self._mocap_root_frame(),
             )
 
@@ -2234,6 +2486,17 @@ def main() -> None:
         help="Path to the deployment YAML.",
     )
     args = parser.parse_args()
+
+    # The 500 Hz hardware loop shares this interpreter with the NatNet
+    # receive/decode thread, the rt/lowstate DDS callback, the MuJoCo debug
+    # view and the scene monitor. CPython's default switch interval is 5 ms,
+    # so any one of them can hold the GIL across two and a half hardware
+    # ticks. 0.5 ms bounds that at a quarter of one tick. The WBC-only test
+    # deploy/b2wz1_wbc_uan.py runs the same 500 Hz send path but carries only
+    # the DDS callback alongside it -- no mocap decoder and no render thread --
+    # which is a large part of why it runs smoothly where this did not.
+    sys.setswitchinterval(5e-4)
+    print(f"[B2WZ1-ABS] GIL switch interval set to {sys.getswitchinterval() * 1e3:.2f} ms.")
 
     # Exactly once, before the Z1 SDK and the B2W adapter come up.
     ChannelFactoryInitialize(0, args.net)

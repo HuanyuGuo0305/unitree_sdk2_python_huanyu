@@ -99,7 +99,7 @@ default_arm_pos: [0.0, 1.48, -1.0, -0.54, 0.0, 1.57]
 # (unitree_mujoco/simulate_python/configs/b2wz1_hl_retrieval_abs_uan.yaml).
 default_gripper_pos: 0.0
 gripper_open_pos: -1.5707963267948966
-gripper_close_pos: -0.53
+gripper_close_pos: -0.45
 
 # ----------------------------------------------------------------------
 # B2W gains, policy order (12 legs + 4 wheels).
@@ -175,7 +175,7 @@ kp0_z_range: [0.0, 1.15]
 # action -> range mapping the policy trained with is untouched. The trained
 # range bottoms out at ground level, so a saturated-low action[5] would
 # otherwise drive the wrist into the floor.
-kp0_z_cmd_min: 0.15
+kp0_z_cmd_min: 0.0
 
 ee_yaw_range: [-1.0471975511965976, 1.0471975511965976]     # +/- 60 deg
 
@@ -286,7 +286,11 @@ z1_gripper_dcmotor_effort_limit: 30.0
 z1_gripper_dcmotor_saturation_effort: 30.0
 z1_gripper_dcmotor_velocity_limit: 2.0
 
-z1_debug_print: true
+# Keep this FALSE while the policy runs. The adapter's debug line fires every
+# 100 sends, i.e. 5 times a second from inside the 2 ms hardware tick, and
+# formatting eight numpy arrays plus a terminal write there adds jitter to the
+# very command stream being debugged.
+z1_debug_print: false
 
 # ----------------------------------------------------------------------
 # OptiTrack mocap (NatNet). Object, retrieval target and the B2W base pose
@@ -394,9 +398,24 @@ visualizer_camera_follow_smoothing: 0.15
 visualizer_show_mocap_pivots: true
 visualizer_mocap_pivot_radius: 0.022
 
-# Every raw marker in the frame. Needs marker streaming enabled in Motive.
+# Every raw marker in the frame, one colour per Motive marker set plus a
+# dimmer/smaller grey for unlabeled reflections. Needs BOTH 'Labeled Markers'
+# and 'Unlabeled Markers' enabled in Motive > View > Data Streaming Pane --
+# rigid-body poses stream on their own toggle, so the assets can track
+# perfectly while the marker sections arrive empty.
+#
+# Motive's aggregate "all" marker set is dropped before drawing: it is the
+# union of the per-asset sets, so keeping it drew every labeled marker twice.
 visualizer_show_all_markers: true
 visualizer_marker_radius: 0.012
+
+# Minimum seconds between marker-cloud composition reports, and between
+# repeats of the "stream carries no markers" warning. The composition line is
+# emitted whenever the per-set counts change -- an asset shedding markers is
+# the most useful thing this view reports -- but it is produced from the 50 Hz
+# control loop, so a flickering marker must not be allowed to print on every
+# step.
+visualizer_marker_report_period_s: 10.0
 
 # Triad at the CALIBRATED root: the gap to the white body pivot is the
 # applied mocap->base_link offset.

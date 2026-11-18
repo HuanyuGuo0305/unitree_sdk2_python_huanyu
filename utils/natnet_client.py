@@ -248,6 +248,45 @@ def _parse_marker_sets(buf: bytes, off: int, count: int) -> Tuple[dict, int]:
     return marker_sets, off
 
 
+# NatNet LabeledMarker: id(int32) x,y,z,size(4 float32) params(int16)
+# residual(float32). The params bit that matters here marks a marker Motive
+# could not label.
+_LABELED_MARKER_STRUCT = struct.Struct("<i4fhf")
+_LABELED_MARKER_SIZE = _LABELED_MARKER_STRUCT.size  # 26, no padding under "<"
+_LABELED_PARAM_UNLABELED = 0x10
+
+
+def _parse_labeled_markers(
+    buf: bytes, off: int, count: int
+) -> Tuple[Dict[int, list], list, int]:
+    """Split the LabeledMarkers section into per-model and unlabeled points.
+
+    Motive 3.x streaming NatNet 3.0+ puts EVERY marker here, and sets the
+    legacy "other markers" count to zero permanently. So the Streaming pane's
+    "Unlabeled Markers" toggle feeds this section and nothing else -- reading
+    only the MarkerSets and legacy sections means that toggle appears to do
+    nothing at all.
+    """
+    if not 0 <= count <= _MAX_MARKERS:
+        raise _ParseError(f"implausible labeled-marker count {count}")
+    if off + count * _LABELED_MARKER_SIZE > len(buf):
+        raise _ParseError("truncated labeled-marker block")
+
+    by_model: Dict[int, list] = {}
+    unlabeled: list = []
+    for _ in range(count):
+        marker_id, x, y, z, _size, params, _residual = _LABELED_MARKER_STRUCT.unpack_from(
+            buf, off
+        )
+        off += _LABELED_MARKER_SIZE
+        point = [float(x), float(y), float(z)]
+        if params & _LABELED_PARAM_UNLABELED:
+            unlabeled.append(point)
+        else:
+            by_model.setdefault((int(marker_id) >> 16) & 0xFFFF, []).append(point)
+    return by_model, unlabeled, off
+
+
 def _parse_rigid_bodies(
     buf: bytes,
     off: int,
@@ -334,6 +373,38 @@ def _parse_frame_sized(payload: bytes, up_axis: str, recv_time: float) -> "NatNe
     rigid_bodies, _ = _parse_rigid_bodies(
         payload[off:off + size], 0, n_rb, frame_number, up_axis, recv_time
     )
+    off += size
+
+    # Skeletons and Assets are stepped over by their byte size -- nothing here
+    # consumes them -- to reach LabeledMarkers, which is where Motive 3.x on
+    # NatNet 3.0+ actually puts marker data. Opportunistic, like the marker
+    # sections above: rigid-body poses are what the control path depends on,
+    # so a failure past this point must still return the frame.
+    try:
+        for _skipped in range(2):
+            _count, size, off = _read_section_header(payload, off)
+            off += size
+
+        n_labeled, size, off = _read_section_header(payload, off)
+        by_model, loose, _ = _parse_labeled_markers(
+            payload[off:off + size], 0, n_labeled
+        )
+    except (_ParseError, struct.error, ValueError, IndexError):
+        by_model, loose = {}, []
+
+    if loose:
+        # The legacy section is permanently zero on NatNet 3.0+, so in
+        # practice these ARE the unlabeled markers.
+        unlabeled = np.vstack([unlabeled, np.asarray(loose, dtype=np.float64)])
+
+    # Labeled markers are normally already present, grouped by name, in the
+    # MarkerSets section. Only synthesise sets from the per-model grouping
+    # when MarkerSets came through empty, so a marker is never drawn twice.
+    if not marker_sets and by_model:
+        marker_sets = {
+            f"model_{model_id}": np.asarray(points, dtype=np.float64)
+            for model_id, points in sorted(by_model.items())
+        }
 
     marker_sets = {k: _to_zup_pos(v, up_axis) for k, v in marker_sets.items()}
     unlabeled = _to_zup_pos(unlabeled, up_axis)

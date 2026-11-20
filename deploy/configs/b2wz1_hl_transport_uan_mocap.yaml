@@ -45,7 +45,7 @@
 # ----------------------------------------------------------------------
 high_policy_path: "exported_policies/b2wz1_hl_transport_uan/high_policy.onnx"
 high_policy_sha256: "db78304602566538ea099c3f3a0679bcb9b731067d4e036374ad03cc537b70c1"
-low_policy_path: "exported_policies/b2wz1_whl_transpor_uan/low_policy.onnx"
+low_policy_path: "exported_policies/b2wz1_hl_transport_uan/low_policy.onnx"
 low_policy_sha256: "6b5aa5de8a438c07062ab5d9acd8e9d562ccb7a72f32aad72912f7707139a517"
 
 # ----------------------------------------------------------------------
@@ -199,12 +199,29 @@ command_deadband_ang: 0.2
 
 # ----------------------------------------------------------------------
 # Disk / puck: TRAINING geometry (sim2sim YAML + b2wz1_disk.xml).
-# The disk frame is derived from Z1 FK; NO disk rigid body is required.
 #
+# Training disk frame D (also what Z1 FK reproduces):
 #   disk centre = gripperStator + R_stator @ disk_center_offset_gripper
-#   disk axes   = R_stator @ disk_{x,y,z}_axis_gripper   (disk +Z = stator +Y)
-#   puck_D      = R_disk^T (puck_centre - disk_centre)   (actor observation)
+#                 (geometric centre, MID-THICKNESS, 2 mm below the top face)
+#   disk axes   = R_stator @ disk_{x,y,z}_axis_gripper
+#                 +X_D = stator +X (along the gripper, towards the fingertips)
+#                 +Z_D = stator +Y (disk normal, towards the puck)
+#                 +Y_D = Z_D x X_D
+#                 At the DEFAULT arm pose: X_D ~ robot forward, Y_D ~ left,
+#                 Z_D ~ up (to 3.4 deg).
+#   puck_D      = R_D^T (puck_centre - disk_centre)   (actor observation)
+#
+# disk_frame_source:
+#   "mocap"  (default) D = the Motive DISK rigid body pose. Its pivot and axes
+#            must be set IN MOTIVE to the frame above. puck and disk come from
+#            the same NatNet frame: no B2-asset, Z1-FK or timing error.
+#   "fk"     D = Z1 FK of the gripperStator + the training mount above.
+#            The disk asset (mocap_disk_*) is then OPTIONAL: used for the
+#            cross-check and the view when streamed, never a fault.
+#   The other source is always computed and logged as a cross-check.
+#   Override per run: --disk-frame-source {mocap,fk} on the command line.
 # ----------------------------------------------------------------------
+disk_frame_source: "fk"
 disk_center_offset_gripper: [0.100, 0.045, 0.0]
 disk_x_axis_gripper: [1.0, 0.0, 0.0]
 disk_y_axis_gripper: [0.0, 0.0, -1.0]
@@ -214,8 +231,6 @@ disk_radius: 0.100
 
 puck_radius: 0.05
 puck_height: 0.08
-# Training puck mass range (randomized U(0.5, 1.5) kg).
-puck_mass_range_kg: [0.50, 1.50]
 
 # Training placement and actor-noise constants. The start gate and the
 # real contact proxy are DERIVED from these; no new thresholds:
@@ -234,16 +249,15 @@ puck_drop_no_contact_steps: 5
 # ----------------------------------------------------------------------
 # [REQUIRED SETUP] Operator-confirmed hardware facts. The script refuses to
 # start while any of these is null/false. See TRANSPORT_SIM2REAL_SETUP.md.
+# (The Motive puck/disk assets below are required setup as well.)
 # ----------------------------------------------------------------------
-# Measured mass of the real puck [kg]; must lie in puck_mass_range_kg.
-puck_mass_kg: null
 # true once the real puck is measured to be a cylinder of puck_radius x
 # puck_height (+/- 2 mm).
-puck_geometry_verified: false
+puck_geometry_verified: true
 # true once the printed disk is measured to sit on the gripperStator exactly
 # as disk_center_offset_gripper / disk_*_axis_gripper say (URDF mount
 # xyz=[0.100, 0.043, 0.0], rpy=[-pi/2, 0, 0], 200-mm rimless disk).
-disk_mount_verified: false
+disk_mount_verified: true
 
 # ----------------------------------------------------------------------
 # Z1 SDK / adapter (retrieval sim2real values)
@@ -284,9 +298,13 @@ z1_debug_print: true
 
 # ----------------------------------------------------------------------
 # OptiTrack (NatNet). Network + robot body reused from the validated
-# retrieval config. Transport needs exactly TWO rigid bodies:
-#   body: the B2 (base_link pose -> base height, mocap world -> base frame)
-#   puck: the transported puck (-> puck centre in the base frame)
+# retrieval config. Transport rigid bodies:
+#   body: the B2 (base_link pose -> base height / PLB; FK cross-check)
+#   puck: the transported puck (pivot = puck centre)
+#   disk: the gripper disk (pivot + axes = training disk frame D), needed
+#         when disk_frame_source is "mocap"
+# As in retrieval, every pivot is placed IN MOTIVE; *_offset_local stays
+# [0, 0, 0] unless you deliberately add a constant pivot correction here.
 # ----------------------------------------------------------------------
 mocap_local_ip: "192.168.0.17"
 mocap_server_ip: "192.168.0.118"
@@ -303,13 +321,24 @@ mocap_body_offset_local: [0.0, 0.0, 0.0]
 mocap_body_max_age_s: 0.25
 
 # [REQUIRED SETUP] Motive asset of the puck: a name and/or a streaming id.
-mocap_puck_name: null
-mocap_puck_id: null
-# [REQUIRED SETUP] Motive pivot -> puck GEOMETRIC CENTRE, in the puck asset
-# frame [m]. [0, 0, 0] only if the pivot was placed at the centre in Motive.
-mocap_puck_offset_local: null
+# Pivot = puck GEOMETRIC CENTRE (40 mm above the bottom face); orientation
+# is not used.
+mocap_puck_name: "puck"
+mocap_puck_id: 19
+mocap_puck_offset_local: [0.0, 0.0, 0.0]
 # One HL period: the actor never sees a puck older than the step it acts on.
 mocap_puck_max_age_s: 0.10
+
+# [REQUIRED SETUP, disk_frame_source "mocap"] Motive asset of the disk.
+# Markers on the gripperStator housing / disk underside or rim (rigid with
+# the disk; NOT on the top face, NOT on the moving jaw). Pivot = disk centre
+# at mid-thickness; axes = training disk frame D (see the disk section).
+# READY-WAIT prints "disk mocap-FK: dpos_D=... drpy_D=..." = the correction
+# still left between this asset and the FK disk.
+mocap_disk_name: "disk"
+mocap_disk_id: 18
+mocap_disk_offset_local: [0.0, 0.0, 0.0]
+mocap_disk_max_age_s: 0.10
 
 # Root frame == base_link, as in the validated retrieval setup.
 mocap_root_frame_is_base_link: true
@@ -343,3 +372,41 @@ debug_print_period_steps: 50
 # contact proxy, mocap ages, measured EE). Directory relative to repo root.
 hl_log_enabled: true
 hl_log_dir: "Log/transport"
+
+# ----------------------------------------------------------------------
+# MuJoCo debug visualizer (kinematic replay, no physics; retrieval pattern).
+# Scene = the sim2sim transport MJCF (xml_path of
+# unitree_mujoco_huanyu/simulate_python/configs/b2wz1_hl_transport_uan.yaml).
+#   robot           mocap root pose + joint encoders (disk mesh = Z1 FK)
+#   orange puck     the MuJoCo puck body placed at the MOCAP puck pose
+#   translucent disc + triad   MOCAP disk pose; cyan before enable,
+#                              green/red = contact proxy on/off while running
+#   magenta sphere  EE kp0 reference; red sphere + red/blue axes = EE command
+#   dots            Motive pivots (white B2, orange puck, cyan disk) + markers
+# The window stays live through startup, READY-WAIT and damping protection.
+# ----------------------------------------------------------------------
+visualizer_enabled: true
+visualizer_xml_path: "/home/huanyuguo/Workspace_huanyu/unitree_mujoco_huanyu/unitree_robots/b2wz1/b2wz1_disk_puck.xml"
+visualizer_update_hz: 30.0
+# The scene MJCF has its own floor and light.
+visualizer_show_floor: false
+visualizer_show_light: false
+visualizer_ee_target_sphere_radius: 0.025
+visualizer_ee_target_axis_len: 0.20
+visualizer_ee_target_axis_radius: 0.008
+visualizer_ee_ref_radius: 0.03
+visualizer_show_world_origin: true
+visualizer_world_origin_axis_len: 0.4
+visualizer_camera_follow: true
+visualizer_camera_follow_smoothing: 0.15
+visualizer_show_mocap_pivots: true
+visualizer_mocap_pivot_radius: 0.012
+# Needs Motive > Data Streaming > Labeled / Unlabeled Markers.
+visualizer_show_all_markers: true
+visualizer_marker_radius: 0.008
+visualizer_show_root_frame: true
+visualizer_root_frame_axis_len: 0.25
+visualizer_root_frame_axis_radius: 0.008
+visualizer_monitor_enabled: true
+visualizer_monitor_hz: 30.0
+visualizer_monitor_takeover_s: 0.25

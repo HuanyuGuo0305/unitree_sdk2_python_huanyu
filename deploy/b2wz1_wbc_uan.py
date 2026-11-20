@@ -304,6 +304,24 @@ class B2WLowLevel:
         self.low_cmd.crc = self.crc.Crc(self.low_cmd)
         self.publisher.Write(self.low_cmd)
 
+    def send_damping(self, kd_leg: float, kd_wheel: float):
+        """Damping-protection command: kp=0, zero targets, high kd on every joint."""
+        if self.low_cmd is None or self.publisher is None:
+            raise RuntimeError("B2W low-level interface is not connected.")
+
+        wheel_set = set(int(i) for i in self.wheel_idx)
+        for motor_idx in list(self.leg_idx) + list(self.wheel_idx):
+            mc = self.low_cmd.motor_cmd[int(motor_idx)]
+            mc.mode = 0x01
+            mc.q = 0.0
+            mc.kp = 0.0
+            mc.dq = 0.0
+            mc.kd = float(kd_wheel if int(motor_idx) in wheel_set else kd_leg)
+            mc.tau = 0.0
+
+        self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+        self.publisher.Write(self.low_cmd)
+
     def send(
         self,
         leg_q_target_policy: np.ndarray,
@@ -427,6 +445,8 @@ class WBCUANSim2Real:
 
         self.gripper_hold_q = float(self.cfg.get("gripper_hold_q", self.default_gripper))
 
+        self._configure_protection()
+
         # Verify Z1 firmware gains map EXACTLY to training-space nominal PD.
         self.arm_kp_fw = np.asarray(self.cfg["arm_kps_runtime"], dtype=np.float64).reshape(6)
         self.arm_kd_fw = np.asarray(self.cfg["arm_kds_runtime"], dtype=np.float64).reshape(6)
@@ -498,6 +518,34 @@ class WBCUANSim2Real:
         self.wheel_cmd = np.zeros(4, dtype=np.float32)
 
         self._init_history_buffers()
+
+    def _configure_protection(self):
+        """Damping protection settings (same keys/semantics as the retrieval/transport sim2real)."""
+        cfg = self.cfg
+        self.damping_kd_b2w = float(cfg.get("damping_kd_b2w", 150.0))
+        self.damping_kd_wheel = float(cfg.get("damping_kd_wheel", 10.0))
+        self.damping_kp_z1 = np.asarray(
+            cfg.get("damping_kp_z1", [0.0] * 6), dtype=np.float32
+        ).reshape(6)
+        self.damping_kd_z1 = np.asarray(
+            cfg.get("damping_kd_z1", [2000.0] * 6), dtype=np.float32
+        ).reshape(6)
+        self.damping_print_period = int(cfg.get("damping_print_period", 100))
+        self.leg_recovery_enabled = bool(cfg.get("damping_leg_recovery_enabled", True))
+        self.leg_recovery_duration_s = float(cfg.get("damping_recover_leg_duration_s", 4.0))
+        self.leg_recovery_tolerance_rad = float(
+            cfg.get("damping_recover_leg_tolerance_rad", 0.15)
+        )
+        # Policy-space leg order (same as default_leg_pos_policy).
+        self.leg_recovery_target = np.asarray(
+            cfg.get(
+                "damping_recover_leg_target",
+                [0.1, -0.1, 0.1, -0.1] + [1.57] * 4 + [-2.65] * 4,
+            ),
+            dtype=np.float32,
+        ).reshape(12)
+        if self.leg_recovery_duration_s <= 0.0 or self.leg_recovery_tolerance_rad <= 0.0:
+            raise ValueError("damping_recover_leg_duration_s and _tolerance_rad must be > 0.")
 
     def _init_history_buffers(self):
         self.base_ang_vel_hist = deque(maxlen=self.history_length)
@@ -842,7 +890,8 @@ class WBCUANSim2Real:
 
         A is the armed kill: it arms only after A has been observed released
         once, so the A press that started the policy cannot kill it instantly.
-        SELECT is never used by the startup gates, so it kills immediately.
+        SELECT is never used by the startup gates, so it acts immediately and
+        sends run() into damping protection (A only kills + safe-holds).
         """
         if self.b2w is None:
             return None
@@ -881,6 +930,111 @@ class WBCUANSim2Real:
         except Exception as e:
             print(f"[WARN] safe-hold failed: {e}")
 
+    # ------------------------------------------------------------------
+    # Damping protection (same semantics as the retrieval/transport sim2real)
+    # ------------------------------------------------------------------
+
+    def _send_b2w_damping_once(self):
+        assert self.b2w is not None
+        self.b2w.send_damping(self.damping_kd_b2w, self.damping_kd_wheel)
+
+    def _send_z1_damping_once(self):
+        """Hold-in-place with high kd; never forces a PASSIVE arm back into LOWCMD."""
+        assert self.z1 is not None
+        with self.z1._comm_lock:  # noqa: SLF001
+            self.z1._send_arm_command_once(  # noqa: SLF001
+                q_cmd=self.z1.q.copy(),
+                gripper_q_cmd=float(self.z1.gripper_q),
+                kp_cmd=self.damping_kp_z1,
+                kd_cmd=self.damping_kd_z1,
+                qd_cmd=np.zeros(6, dtype=np.float32),
+                tau_cmd=np.zeros(6, dtype=np.float32),
+            )
+
+    def _move_legs_to_recovery_target(self) -> bool:
+        assert self.b2w is not None
+        start_leg = self.b2w.get_state().leg_q_policy.copy()
+        target_leg = self.leg_recovery_target.copy()
+        n = max(1, int(round(self.leg_recovery_duration_s * self.control_hz)))
+        print(
+            f"[RECOVERY] leg12 -> target over {self.leg_recovery_duration_s:.2f}s | arm untouched"
+        )
+        t0 = time.perf_counter()
+        for i in range(n):
+            alpha = float(i + 1) / float(n)
+            leg_cmd = (1.0 - alpha) * start_leg + alpha * target_leg
+            self.b2w.send(leg_cmd, np.zeros(4, dtype=np.float32), use_startup_gains=True)
+            try:
+                self._send_z1_damping_once()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[RECOVERY][WARN] Z1 protection command failed: {exc!r}")
+            _sleep_until(t0 + (i + 1) * self.control_dt)
+        error = float(
+            np.max(np.abs(self.b2w.get_state().leg_q_policy - target_leg))
+        )
+        print(
+            f"[RECOVERY] max_abs_err={error:.4f} rad (tol {self.leg_recovery_tolerance_rad:.4f})"
+        )
+        return bool(np.isfinite(error) and error <= self.leg_recovery_tolerance_rad)
+
+    def _recover_legs(self) -> bool:
+        print("\n" + "=" * 82 + "\n[RECOVERY] MANUAL LEG RECOVERY -- the arm is NOT moved.\n" + "=" * 82)
+        try:
+            ok = self._move_legs_to_recovery_target()
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"[RECOVERY][ERROR] {exc!r}")
+            return False
+        print("[RECOVERY] SUCCESS." if ok else "[RECOVERY] FAILED.", "The policy will NOT resume.")
+        return ok
+
+    def _enter_damping_protection_mode(self, reason: str):
+        """Block in damping protection until Ctrl-C. The policy never resumes."""
+        if self.b2w is None or self.z1 is None:
+            return
+        print("\n" + "!" * 82)
+        print(f"[WBC][PROTECT] {reason}")
+        print("[WBC][PROTECT] B2W: kp=0, high kd. Z1: hold q, high kd.")
+        if self.leg_recovery_enabled:
+            print("[WBC][PROTECT] Release A, then press A to fold the legs down.")
+        print("[WBC][PROTECT] Press Ctrl-C to quit.")
+        print("!" * 82 + "\n")
+
+        rc = self.b2w.remote_controller
+        recovery_armed = rc.button[KeyMap.A] != 1
+        counter = 0
+        try:
+            while True:
+                loop_start = time.perf_counter()
+                for label, action in (
+                    ("B2W damping", self._send_b2w_damping_once),
+                    ("Z1 damping", self._send_z1_damping_once),
+                ):
+                    try:
+                        action()
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[PROTECT][WARN] {label} failed: {exc!r}")
+                if self.leg_recovery_enabled:
+                    pressed = rc.button[KeyMap.A] == 1
+                    if not recovery_armed:
+                        if not pressed:
+                            recovery_armed = True
+                            print("[PROTECT] A released; leg recovery armed.")
+                    elif pressed:
+                        recovery_armed = False
+                        self._recover_legs()
+                        loop_start = time.perf_counter()
+                if counter % max(1, self.damping_print_period) == 0:
+                    print(
+                        f"[PROTECT] active | z1_fsm={self.z1.get_fsm_state()} | "
+                        f"recovery_armed={int(recovery_armed)}"
+                    )
+                counter += 1
+                _sleep_until(loop_start + self.control_dt)
+        except KeyboardInterrupt:
+            print("[WBC][PROTECT] Ctrl-C received.")
+
     def run(self):
         if self.dry_run:
             print("[dry-run] configuration, ONNX shape, paths, and gain alignment are valid.")
@@ -893,6 +1047,7 @@ class WBCUANSim2Real:
 
         self._connect_hardware()
 
+        protection_reason: Optional[str] = None
         try:
             self._move_to_default()
 
@@ -909,7 +1064,9 @@ class WBCUANSim2Real:
             self.last_action[:] = 0.0
 
             self._kill_armed = False
-            print("[run] WBC active. Press SELECT (or A) on the remote to kill the policy.")
+            print(
+                "[run] WBC active. SELECT = damping protection; A = kill policy + safe hold."
+            )
             t0 = time.perf_counter()
             tick = 0
             last_report = -1.0
@@ -923,6 +1080,9 @@ class WBCUANSim2Real:
                     break
 
                 kill_btn = self._kill_requested()
+                if kill_btn == "SELECT":
+                    protection_reason = f"SELECT pressed at t={t:.2f}s"
+                    break
                 if kill_btn is not None:
                     print(f"[run] {kill_btn} pressed at t={t:.2f}s -- killing policy.")
                     break
@@ -970,8 +1130,11 @@ class WBCUANSim2Real:
             print(f"\n[run][ERROR] {type(e).__name__}: {e}")
             raise
         finally:
-            print("[run] holding current pose and stopping wheels.")
-            self._safe_hold_current(duration_s=0.5)
+            if protection_reason is not None:
+                self._enter_damping_protection_mode(protection_reason)
+            else:
+                print("[run] holding current pose and stopping wheels.")
+                self._safe_hold_current(duration_s=0.5)
 
 
 def main():

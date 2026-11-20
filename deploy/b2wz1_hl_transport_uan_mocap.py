@@ -46,11 +46,18 @@ Real-world substitutions (everything else is identical)
       EE target      = D-pad up/down/left/right = HIGH/LOW/LEFT/RIGHT, with
                        the training minimum-jerk transitions and at least the
                        training minimum hold (4 s) between switches.
-  * puck_center_D, the only non-proprioceptive actor input, is measured:
-        puck_b   = OptiTrack puck centre in the mocap base_link frame
-        disk     = Z1 FK gripperStator pose (base frame) + training mount
-        puck_D   = R_disk^T (puck_b - disk_centre_b)
-    No disk rigid body: the disk frame comes from the same FK the WBC uses.
+  * puck_center_D, the only non-proprioceptive actor input, is measured by
+    OptiTrack alone (disk_frame_source: "mocap", the default):
+        puck_W           = puck rigid body (Motive pivot = puck geometric centre)
+        (c_D^W, R_D^W)   = disk rigid body (Motive pivot = disk centre at
+                           mid-thickness, axes = training disk frame D)
+        puck_D           = R_D^W^T (puck_W - c_D^W)
+    Both poses come from the same NatNet frame, so neither the B2 asset
+    calibration, the Z1 FK/compliance nor any Z1-vs-mocap time skew enters
+    the observation. The FK disk frame (Z1 FK gripperStator + training mount,
+    what the WBC uses) is still computed every step as a CROSS-CHECK only:
+    READY-WAIT prints and the CSV logs the mocap-vs-FK disk discrepancy.
+    disk_frame_source: "fk" switches the observation back to the FK disk.
   * Puck/disk contact (training: net contact force > 0.05 N) has no sensor.
     It is replaced by a geometric proxy derived from the training geometry
     and the actor's training noise: in contact iff the puck centre is over
@@ -62,7 +69,7 @@ The actor observes no puck velocity, so no velocity estimate is computed.
 
 Faults -> damping protection (retrieval semantics)
 ---------------------------------------------------
-SELECT, Z1 PASSIVE, invalid/stale/untracked mocap (base or puck), puck drop,
+SELECT, Z1 PASSIVE, invalid/stale/untracked mocap (base, puck or disk), puck drop,
 non-finite observation/action, WBC arm target outside the SDK range, any
 exception. Protection: B2W kp=0/high kd, Z1 holds q with high kd; A then folds
 the legs. The policy never resumes.
@@ -82,6 +89,7 @@ import hashlib
 import math
 import os
 import sys
+import threading
 import time
 from collections import deque
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -96,7 +104,15 @@ for _p in (PROJECT_ROOT, _DEPLOY_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from utils.math import quat_rotate_inverse_numpy, quat_unique_wxyz  # noqa: E402
+from utils.math import (  # noqa: E402
+    euler_xyz_from_quat_wxyz,
+    quat_apply_wxyz,
+    quat_from_rotmat_wxyz,
+    quat_from_yaw_wxyz,
+    quat_rotate_inverse_numpy,
+    quat_unique_wxyz,
+)
+from utils.mocap_frames import q_to_mat  # noqa: E402
 from utils.mocap_perception import MocapBodySelector, MocapPerceptionSystem  # noqa: E402
 from utils.remote_controller import KeyMap, RemoteController  # noqa: E402
 
@@ -132,6 +148,11 @@ SIM_ONLY_KEYS = (
     "uan_nominal_torque_limits", "uan_final_torque_limits",
     "enable_arm_target_rate_limit", "arm_target_rate_limit",
 )
+
+# Where the disk frame of puck_center_D comes from.
+DISK_FRAME_SOURCES = ("mocap", "fk")
+# Free joint of the puck in the sim2sim scene MJCF (b2wz1_disk_puck.xml).
+VIZ_PUCK_FREE_JOINT = "transport_puck_freejoint"
 
 
 # ======================================================================
@@ -357,6 +378,48 @@ class DiskGeometry:
             [np.dot(rel, rot[:, 0]), np.dot(rel, rot[:, 1]), np.dot(rel, rot[:, 2])],
             dtype=np.float32,
         )
+
+
+def puck_pos_in_frame(
+    puck_pos: np.ndarray, frame_pos: np.ndarray, frame_rot: np.ndarray
+) -> np.ndarray:
+    """R^T (puck - origin): the puck centre in an arbitrary disk frame.
+
+    Used with the MOCAP disk pose (both inputs in the mocap world frame);
+    DiskGeometry.puck_pos_disk is the same projection for the FK disk.
+    """
+    rot = np.asarray(frame_rot, dtype=np.float64).reshape(3, 3)
+    rel = np.asarray(puck_pos, dtype=np.float64).reshape(3) - np.asarray(
+        frame_pos, dtype=np.float64
+    ).reshape(3)
+    return (rot.T @ rel).astype(np.float32)
+
+
+def rpy_deg_from_rotmat(rot: np.ndarray) -> np.ndarray:
+    """XYZ (roll, pitch, yaw) of a rotation matrix, in degrees."""
+    R = np.asarray(rot, dtype=np.float64).reshape(3, 3)
+    pitch = math.asin(float(np.clip(-R[2, 0], -1.0, 1.0)))
+    roll = math.atan2(float(R[2, 1]), float(R[2, 2]))
+    yaw = math.atan2(float(R[1, 0]), float(R[0, 0]))
+    return np.degrees(np.array([roll, pitch, yaw], dtype=np.float64))
+
+
+def disk_frame_discrepancy(
+    ref_pos: np.ndarray, ref_rot: np.ndarray, pos: np.ndarray, rot: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Pose of frame (pos, rot) seen from frame (ref_pos, ref_rot).
+
+    Returns (dpos in the ref frame [m], d-rpy [deg], total angle [deg]).
+    With ref = FK disk and frame = mocap disk this is exactly the correction
+    to apply to the Motive disk pivot (translation in disk axes, rotation
+    about the disk axes) for the two to agree.
+    """
+    Rr = np.asarray(ref_rot, dtype=np.float64).reshape(3, 3)
+    R = np.asarray(rot, dtype=np.float64).reshape(3, 3)
+    dpos = Rr.T @ (np.asarray(pos, dtype=np.float64).reshape(3) - np.asarray(ref_pos, dtype=np.float64).reshape(3))
+    dR = Rr.T @ R
+    angle = math.degrees(math.acos(float(np.clip((np.trace(dR) - 1.0) * 0.5, -1.0, 1.0))))
+    return dpos, rpy_deg_from_rotmat(dR), angle
 
 
 class PuckContactMonitor:
@@ -656,39 +719,43 @@ def validate_transport_setup(cfg: Dict[str, Any]) -> List[str]:
         if key in cfg:
             problems.append(f"{key}: simulation-only key must not be in the real config")
 
-    if cfg.get("mocap_puck_name") in (None, "") and cfg.get("mocap_puck_id") is None:
-        problems.append("mocap_puck_name / mocap_puck_id: puck rigid body not configured")
-    if (
-        cfg.get("mocap_puck_name") not in (None, "")
-        and cfg.get("mocap_puck_name") == cfg.get("mocap_body_name")
-    ) or (
-        cfg.get("mocap_puck_id") is not None
-        and cfg.get("mocap_puck_id") == cfg.get("mocap_body_id")
-    ):
-        problems.append("mocap_puck_*: puck must be a different rigid body from the robot body")
+    source = str(cfg.get("disk_frame_source", "mocap")).strip().lower()
+    if source not in DISK_FRAME_SOURCES:
+        problems.append(f"disk_frame_source={source!r}: must be one of {DISK_FRAME_SOURCES}")
+    # Rigid bodies the run needs besides the B2: always the puck, and the disk
+    # when the disk frame comes from mocap. With "fk" a configured disk asset
+    # is optional (cross-check / view) but still checked when present.
+    required = ["puck"] + (["disk"] if source == "mocap" else [])
+    disk_configured = cfg.get("mocap_disk_name") not in (None, "") or cfg.get("mocap_disk_id") is not None
+    assets = required + (["disk"] if source != "mocap" and disk_configured else [])
 
-    offset = cfg.get("mocap_puck_offset_local")
-    if offset is None:
-        problems.append("mocap_puck_offset_local: puck pivot->centre offset not configured")
-    else:
-        try:
-            off = np.asarray(offset, dtype=np.float64).reshape(3)
-            if not np.isfinite(off).all():
-                raise ValueError
-        except Exception:  # noqa: BLE001
-            problems.append("mocap_puck_offset_local: must be 3 finite numbers [m]")
+    for label in assets:
+        if label in required and cfg.get(f"mocap_{label}_name") in (None, "") and cfg.get(f"mocap_{label}_id") is None:
+            problems.append(
+                f"mocap_{label}_name / mocap_{label}_id: {label} rigid body not configured"
+            )
+        # The pivot is placed in Motive (as retrieval); the YAML offset is an
+        # optional extra that defaults to zero, but must be sane when given.
+        offset = cfg.get(f"mocap_{label}_offset_local")
+        if offset is not None:
+            try:
+                off = np.asarray(offset, dtype=np.float64).reshape(3)
+                if not np.isfinite(off).all():
+                    raise ValueError
+            except Exception:  # noqa: BLE001
+                problems.append(f"mocap_{label}_offset_local: must be 3 finite numbers [m]")
+        if not (0.0 < float(cfg.get(f"mocap_{label}_max_age_s", 0.0)) <= 0.1 + 1e-9):
+            problems.append(f"mocap_{label}_max_age_s: must be in (0, 0.1] s (one HL period)")
 
-    mass = cfg.get("puck_mass_kg")
-    lo, hi = (float(x) for x in cfg.get("puck_mass_range_kg", [0.5, 1.5]))
-    if mass is None:
-        problems.append("puck_mass_kg: real puck mass not configured")
-    else:
-        try:
-            m = float(mass)
-            if not (np.isfinite(m) and lo <= m <= hi):
-                problems.append(f"puck_mass_kg={m}: outside the training range [{lo}, {hi}] kg")
-        except (TypeError, ValueError):
-            problems.append("puck_mass_kg: must be a number [kg]")
+    # Every rigid body must be a different Motive asset.
+    for i, a in enumerate(["body"] + assets):
+        for b in (["body"] + assets)[i + 1:]:
+            name_a, name_b = cfg.get(f"mocap_{a}_name"), cfg.get(f"mocap_{b}_name")
+            id_a, id_b = cfg.get(f"mocap_{a}_id"), cfg.get(f"mocap_{b}_id")
+            if (name_a not in (None, "") and name_a == name_b) or (
+                id_a is not None and id_a == id_b
+            ):
+                problems.append(f"mocap_{b}_*: {b} must be a different rigid body from the {a}")
 
     if cfg.get("puck_geometry_verified") is not True:
         problems.append("puck_geometry_verified: real puck size not confirmed against training")
@@ -699,9 +766,6 @@ def validate_transport_setup(cfg: Dict[str, Any]) -> List[str]:
     if not has_offset_file and cfg.get("mocap_root_frame_is_base_link") is not True:
         problems.append("mocap root frame: neither aligned in Motive nor calibrated")
 
-    if not (0.0 < float(cfg.get("mocap_puck_max_age_s", 0.0)) <= 0.1 + 1e-9):
-        problems.append("mocap_puck_max_age_s: must be in (0, 0.1] s (one HL period)")
-
     scale = np.asarray(cfg.get("command_scale", [np.inf] * 3), dtype=np.float64).reshape(3)
     ranges = np.asarray(cfg["base_ref_ranges"], dtype=np.float64).reshape(3, 2)
     if np.any(scale < 0.0) or np.any(scale > np.minimum(-ranges[:, 0], ranges[:, 1]) + 1e-9):
@@ -710,29 +774,53 @@ def validate_transport_setup(cfg: Dict[str, Any]) -> List[str]:
 
 
 # ======================================================================
-# OptiTrack: robot body + puck only
+# OptiTrack: robot body + puck (+ disk)
 # ======================================================================
 
 
 class TransportMocapPerception(MocapPerceptionSystem):
-    """MocapPerceptionSystem with exactly two assets: the B2 and the puck.
+    """MocapPerceptionSystem with the transport assets: B2, puck and disk.
 
     Reuses the validated NatNet client, root-offset handling, staleness and
     tracking classification and base-frame transform of the parent; only the
-    asset set differs (no retrieval target).
+    asset set differs (no retrieval target). `disk_required` is True when the
+    disk frame comes from mocap; with disk_frame_source "fk" the disk asset is
+    optional (cross-check / visualisation only) and is dropped with a warning
+    if Motive does not stream it.
 
     Snapshot:
         body         validated base_link pose (mocap root)
         base_height  root z - ground_z
-        puck         puck centre: position_base, position_world, age_ms
+        puck         puck centre: position_world, quat_wxyz, position_base, age_ms
+        disk         disk centre pose: position_world, quat_wxyz, position_base,
+                     age_ms (only if a disk body is configured)
+        mocap        frame number, received / parse-error / SKIPPED frame counts
+    The raw marker cloud is NOT part of the 50-Hz snapshot (it is costly to
+    convert); the visualizer pulls it through marker_cloud() at its own rate.
+
+    Puck and disk are sampled even while the B2 body is invalid (their WORLD
+    pose does not depend on it); only position_base is then None. The
+    controller still faults on the missing base height.
     """
 
-    def __init__(self, body: MocapBodySelector, puck_body: MocapBodySelector, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        body: MocapBodySelector,
+        puck_body: MocapBodySelector,
+        disk_body: Optional[MocapBodySelector] = None,
+        disk_required: bool = True,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(body=body, object_body=puck_body, retrieval_body=None, **kwargs)
         self.puck_body = puck_body
+        self.disk_body = disk_body
+        self.disk_required = bool(disk_required and disk_body is not None)
 
-    def _selectors(self) -> Tuple[MocapBodySelector, MocapBodySelector]:
-        return (self.body, self.puck_body)
+    def _selectors(self) -> Tuple[MocapBodySelector, ...]:
+        selectors: Tuple[MocapBodySelector, ...] = (self.body, self.puck_body)
+        if self.disk_body is not None:
+            selectors = selectors + (self.disk_body,)
+        return selectors
 
     def initialize(self) -> None:
         if self._initialized:
@@ -755,17 +843,58 @@ class TransportMocapPerception(MocapPerceptionSystem):
             if rb_id is None or rb_id not in streamed:
                 missing.append(selector.label)
             self._log("  " + selector.describe() + f" -> id {rb_id}")
+        if self.disk_body is not None and not self.disk_required and self.disk_body.label in missing:
+            self._log("[WARN] optional disk asset not streamed; FK disk only, no mocap cross-check")
+            missing.remove(self.disk_body.label)
+            self._resolved.pop(self.disk_body.label, None)
+            self.disk_body = None
         if missing:
             raise RuntimeError(
                 "These rigid bodies are not being streamed by Motive: "
                 + ", ".join(missing) + f". Streamed ids are {streamed}."
             )
-        if self._resolved[self.body.label] == self._resolved[self.puck_body.label]:
-            raise RuntimeError("The robot body and the puck resolve to the SAME rigid body.")
+        labels = [s.label for s in self._selectors()]
+        for i, a in enumerate(labels):
+            for b in labels[i + 1:]:
+                if self._resolved[a] == self._resolved[b]:
+                    raise RuntimeError(
+                        f"The {a} and the {b} resolve to the SAME rigid body "
+                        f"(id {self._resolved[a]})."
+                    )
         untracked = [s.label for s in self._selectors() if not self._is_tracked(self._resolved[s.label])]
         if untracked:
             self._log("[WARN] currently UNTRACKED: " + ", ".join(untracked))
         self._initialized = True
+
+    def _world_channel(
+        self,
+        selector: MocapBodySelector,
+        p_root_w: Optional[np.ndarray],
+        q_root_w: Optional[np.ndarray],
+        now: float,
+    ) -> Dict[str, Any]:
+        """World pose of one asset (+ base-frame position when the root is known)."""
+        rb, reason, age_ms = self._sample(selector, now)
+        if rb is None:
+            state = self._invalid_channel(reason, age_ms)
+            state.update(position_world=None, quat_wxyz=None, position_base=None, frame_number=None)
+            return state
+        p_world = self._world_point(rb, selector)
+        p_base = None
+        if p_root_w is not None and q_root_w is not None:
+            p_base = (q_to_mat(q_root_w).T @ (p_world - p_root_w)).tolist()
+        return {
+            "valid": True,
+            "source": f"MOCAP:{selector.name or selector.rb_id}",
+            "reason": "OK",
+            "position_world": p_world.tolist(),
+            "quat_wxyz": rb.quat_wxyz.tolist(),
+            "position_base": p_base,
+            "age_ms": age_ms,
+            "source_age_ms": age_ms,
+            "frame_number": int(rb.frame_number),
+            "mean_marker_error_m": rb.mean_marker_error,
+        }
 
     def get_latest_snapshot(self, projected_gravity_b: Any = None) -> Dict[str, Any]:
         now = time.monotonic()
@@ -775,40 +904,52 @@ class TransportMocapPerception(MocapPerceptionSystem):
             "frame_number": int(frame.frame_number) if frame is not None else None,
             "frames_received": self.client.frame_count,
             "parse_errors": self.client.parse_error_count,
+            "frames_skipped": getattr(self.client, "skipped_frame_count", 0),
         }
+
         if body_rb is None:
             reason = f"BODY_{body_reason}"
-            puck_state = self._invalid_channel(reason, body_age_ms)
-            puck_state.update(position_base=None, position_world=None)
-            return {
-                "valid": False,
-                "body": {"valid": False, "reason": body_reason, "age_ms": body_age_ms,
-                         "root_position_world": None, "root_quat_wxyz": None},
-                "base_height": self._invalid_height(reason, body_age_ms),
-                "puck": puck_state,
-                "mocap": mocap_meta,
-            }
-
-        p_root_w, q_root_w = self.root_offset.apply(body_rb.pos, body_rb.quat_wxyz)
-        base_height = float(p_root_w[2] - self.ground_z)
-        height_valid = bool(np.isfinite(base_height))
-        puck_state = self._target_channel(self.puck_body, "position_base", p_root_w, q_root_w, now)
-        return {
-            "valid": bool(height_valid and puck_state["valid"]),
-            "body": {
+            p_root_w = q_root_w = None
+            body_state = {"valid": False, "reason": body_reason, "age_ms": body_age_ms,
+                          "position_world": None, "root_position_world": None,
+                          "root_quat_wxyz": None}
+            height_state = self._invalid_height(reason, body_age_ms)
+        else:
+            p_root_w, q_root_w = self.root_offset.apply(body_rb.pos, body_rb.quat_wxyz)
+            base_height = float(p_root_w[2] - self.ground_z)
+            height_valid = bool(np.isfinite(base_height))
+            body_state = {
                 "valid": True, "reason": "OK", "age_ms": body_age_ms,
+                "position_world": body_rb.pos.tolist(),
                 "root_position_world": p_root_w.tolist(),
                 "root_quat_wxyz": q_root_w.tolist(),
-            },
-            "base_height": {
+            }
+            height_state = {
                 "valid": height_valid,
                 "height_m": base_height if height_valid else None,
                 "reason": "OK" if height_valid else "NON_FINITE_HEIGHT",
                 "age_ms": body_age_ms,
-            },
+            }
+
+        puck_state = self._world_channel(self.puck_body, p_root_w, q_root_w, now)
+        snap: Dict[str, Any] = {
+            "body": body_state,
+            "base_height": height_state,
             "puck": puck_state,
             "mocap": mocap_meta,
         }
+        valid = bool(height_state["valid"] and puck_state["valid"])
+        if self.disk_body is not None:
+            disk_state = self._world_channel(self.disk_body, p_root_w, q_root_w, now)
+            snap["disk"] = disk_state
+            if self.disk_required:
+                valid = valid and bool(disk_state["valid"])
+        snap["valid"] = valid
+        return snap
+
+    def marker_cloud(self) -> Dict[str, Any]:
+        """Raw markers of the latest frame (visualisation only, call sparingly)."""
+        return self._marker_cloud(self.client.latest_frame())
 
 
 # ======================================================================
@@ -830,9 +971,12 @@ class B2WZ1TransportMocapController:
         z1: Any = None,
         perception: Any = None,
         connect_dds: bool = True,
+        disk_frame_source: Optional[str] = None,
     ) -> None:
         with open(cfg_path, "r") as f:
             self.cfg: Dict[str, Any] = yaml.safe_load(f)
+        if disk_frame_source is not None:  # command-line override of the YAML
+            self.cfg["disk_frame_source"] = str(disk_frame_source)
 
         problems = validate_transport_setup(self.cfg)
         if problems:
@@ -859,6 +1003,7 @@ class B2WZ1TransportMocapController:
         if connect_dds:
             self._connect_dds()
         self._reset_runtime_state()
+        self.visualizer = self._build_visualizer()
 
     # ------------------------------------------------------------------
     # Configuration
@@ -980,6 +1125,9 @@ class B2WZ1TransportMocapController:
             cfg["disk_y_axis_gripper"], cfg["disk_z_axis_gripper"],
             cfg["disk_thickness"], cfg["disk_radius"],
         )
+        self.disk_frame_source = str(cfg.get("disk_frame_source", "mocap")).strip().lower()
+        if self.disk_frame_source not in DISK_FRAME_SOURCES:
+            raise ValueError(f"disk_frame_source must be one of {DISK_FRAME_SOURCES}.")
         self.puck_radius = float(cfg["puck_radius"])
         self.puck_height = float(cfg["puck_height"])
         self.puck_rest_height = 0.5 * self.disk.thickness + 0.5 * self.puck_height
@@ -1093,6 +1241,10 @@ class B2WZ1TransportMocapController:
         self.z1_kp_effective = kp_fw * kp_scale
         self.z1_kd_effective = kd_fw * kd_scale
 
+    def _disk_asset_configured(self) -> bool:
+        cfg = self.cfg
+        return cfg.get("mocap_disk_name") not in (None, "") or cfg.get("mocap_disk_id") is not None
+
     def _build_mocap_perception(self) -> TransportMocapPerception:
         """OptiTrack stack with the base_link root-frame guarantee of retrieval."""
         cfg = self.cfg
@@ -1126,6 +1278,8 @@ class B2WZ1TransportMocapController:
         perception = TransportMocapPerception(
             body=selector("body", 0.25),
             puck_body=selector("puck", 0.10),
+            disk_body=selector("disk", 0.10) if self._disk_asset_configured() else None,
+            disk_required=self.disk_frame_source == "mocap",
             root_offset=root_offset,
             root_frame_is_base_link=motive_aligned,
             ground_z=self.ground_z,
@@ -1178,12 +1332,28 @@ class B2WZ1TransportMocapController:
         self.ll_tick = 0
         self.hl_tick = 0
         self.last_snapshot: Optional[Dict[str, Any]] = None
+        # puck_D fed to the actor, and both candidate sources (mocap / FK disk).
         self.last_puck_d: Optional[np.ndarray] = None
+        self.last_puck_d_mocap: Optional[np.ndarray] = None
+        self.last_puck_d_fk: Optional[np.ndarray] = None
+        # Mocap disk vs FK disk: (dpos in FK disk axes [m], d-rpy [deg], angle [deg]).
+        self.last_disk_check: Optional[Tuple[np.ndarray, np.ndarray, float]] = None
+        # FK disk frame D in WORLD (via the mocap root) and the Motive pivot
+        # fix: D expressed in the disk ASSET frame (origin [m], R_asset_D).
+        self.last_fk_disk_w: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self.last_asset_fix: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self.last_contact: Tuple[bool, int, bool] = (True, 0, False)
+        self.policy_active = False
         self._ee_buttons_prev = {button: 1 for button, _ in EE_TARGET_BUTTONS}
         self._t_start = time.monotonic()
         self._log_file = None
         self._log_writer = None
+
+        # Visualizer monitor (retrieval pattern).
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._monitor_stop = threading.Event()
+        self._monitor_warned = False
+        self._last_control_push = 0.0
 
     # ------------------------------------------------------------------
     # Sensing
@@ -1220,8 +1390,11 @@ class B2WZ1TransportMocapController:
     def read_perception(self) -> Dict[str, Any]:
         """Nonblocking mocap read; refreshes base height and puck_D.
 
-        The puck is resolved against the FK disk frame of THIS step, so the
-        two never mix data from different control steps.
+        mocap source: puck and disk are taken from the same NatNet stream and
+        projected in the mocap WORLD frame -- no B2 asset, no Z1 FK involved.
+        fk source:    the puck (base frame, via the B2 asset) is resolved
+        against the Z1-FK disk frame of THIS step.
+        Whichever is not the source is still computed as a cross-check.
         """
         snap = self.perception.get_latest_snapshot()
         self.last_snapshot = snap
@@ -1230,14 +1403,60 @@ class B2WZ1TransportMocapController:
         self.base_height = float(h) if h is not None and np.isfinite(h) else None
 
         puck = snap.get("puck") or {}
+        disk = snap.get("disk") or {}
+        body = snap.get("body") or {}
         self.last_puck_d = None
-        if puck.get("valid") and puck.get("position_base") is not None:
+        self.last_puck_d_mocap = None
+        self.last_puck_d_fk = None
+        self.last_disk_check = None
+        self.last_asset_fix = None
+
+        # Mocap disk frame (world).
+        disk_pos_w = disk_rot_w = None
+        if disk.get("valid") and disk.get("position_world") is not None:
+            disk_pos_w = np.asarray(disk["position_world"], dtype=np.float64).reshape(3)
+            disk_rot_w = q_to_mat(np.asarray(disk["quat_wxyz"], dtype=np.float64))
+            if puck.get("valid") and puck.get("position_world") is not None:
+                d = puck_pos_in_frame(puck["position_world"], disk_pos_w, disk_rot_w)
+                if np.isfinite(d).all():
+                    self.last_puck_d_mocap = d
+
+        # FK disk frame (base) -- what the WBC itself uses.
+        fk_pos_b = fk_rot_b = None
+        try:
+            stator_pos_b, stator_rot_b = self.z1.compute_policy_ee_pose_in_base()
+            fk_pos_b, fk_rot_b = self.disk.frame_in(stator_pos_b, stator_rot_b)
+        except Exception:  # noqa: BLE001 - only fatal when FK is the source
+            if self.disk_frame_source == "fk":
+                raise
+        if fk_pos_b is not None and puck.get("valid") and puck.get("position_base") is not None:
             puck_b = np.asarray(puck["position_base"], dtype=np.float32).reshape(3)
-            if np.isfinite(puck_b).all():
-                stator_pos_b, stator_rot_b = self.z1.compute_policy_ee_pose_in_base()
-                puck_d = self.disk.puck_pos_disk(puck_b, stator_pos_b, stator_rot_b)
-                if np.isfinite(puck_d).all():
-                    self.last_puck_d = puck_d
+            d = puck_pos_in_frame(puck_b, fk_pos_b, fk_rot_b)
+            if np.isfinite(d).all():
+                self.last_puck_d_fk = d
+
+        # Cross-check: mocap disk expressed in base_link vs the FK disk.
+        if disk_pos_w is not None and fk_pos_b is not None and body.get("valid"):
+            p_root = np.asarray(body["root_position_world"], dtype=np.float64)
+            R_root = q_to_mat(np.asarray(body["root_quat_wxyz"], dtype=np.float64))
+            self.last_disk_check = disk_frame_discrepancy(
+                fk_pos_b, fk_rot_b, R_root.T @ (disk_pos_w - p_root), R_root.T @ disk_rot_w
+            )
+            # Same comparison seen from the ASSET: where frame D sits in the
+            # asset's local coordinates = the pivot edit Motive needs.
+            fk_pos_w = p_root + R_root @ np.asarray(fk_pos_b, dtype=np.float64)
+            fk_rot_w = R_root @ np.asarray(fk_rot_b, dtype=np.float64)
+            self.last_fk_disk_w = (fk_pos_w, fk_rot_w)
+            self.last_asset_fix = (disk_rot_w.T @ (fk_pos_w - disk_pos_w), disk_rot_w.T @ fk_rot_w)
+        elif fk_pos_b is not None and body.get("valid"):
+            p_root = np.asarray(body["root_position_world"], dtype=np.float64)
+            R_root = q_to_mat(np.asarray(body["root_quat_wxyz"], dtype=np.float64))
+            self.last_fk_disk_w = (p_root + R_root @ np.asarray(fk_pos_b, dtype=np.float64),
+                                   R_root @ np.asarray(fk_rot_b, dtype=np.float64))
+
+        self.last_puck_d = (
+            self.last_puck_d_mocap if self.disk_frame_source == "mocap" else self.last_puck_d_fk
+        )
         return snap
 
     def perception_fault(self, snap: Dict[str, Any]) -> Optional[str]:
@@ -1246,8 +1465,53 @@ class B2WZ1TransportMocapController:
         if self.base_height is None:
             reasons.append("BASE_HEIGHT:" + str((snap.get("base_height") or {}).get("reason")))
         if self.last_puck_d is None:
-            reasons.append("PUCK:" + str((snap.get("puck") or {}).get("reason")))
+            puck = snap.get("puck") or {}
+            disk = snap.get("disk") or {}
+            if not puck.get("valid"):
+                reasons.append("PUCK:" + str(puck.get("reason")))
+            if self.disk_frame_source == "mocap" and not disk.get("valid"):
+                reasons.append("DISK:" + str(disk.get("reason")))
+            if puck.get("valid") and (self.disk_frame_source == "fk" or disk.get("valid")):
+                reasons.append("PUCK_D:NON_FINITE")
         return None if not reasons else "|".join(reasons)
+
+    def disk_check_status(self) -> str:
+        """One-line mocap-vs-FK disk cross-check (both puck_D and disk pose)."""
+        parts = []
+        other = self.last_puck_d_fk if self.disk_frame_source == "mocap" else self.last_puck_d_mocap
+        if other is not None:
+            label = "fk" if self.disk_frame_source == "mocap" else "mocap"
+            parts.append(f"puck_D[{label}]=({other[0]:+.4f},{other[1]:+.4f},{other[2]:+.4f})")
+        if self.last_disk_check is not None:
+            dpos, drpy, angle = self.last_disk_check
+            parts.append(
+                f"disk mocap-FK: dpos_D=({dpos[0] * 1e3:+.1f},{dpos[1] * 1e3:+.1f},"
+                f"{dpos[2] * 1e3:+.1f})mm drpy_D=({drpy[0]:+.1f},{drpy[1]:+.1f},"
+                f"{drpy[2]:+.1f})deg |{angle:.1f}deg|"
+            )
+        return " | ".join(parts) if parts else "disk cross-check n/a"
+
+    def motive_fix_status(self) -> str:
+        """The Motive disk pivot edit that makes the asset = FK frame D.
+
+        Expressed in the CURRENT asset-local coordinates (Motive's own), as
+        deploy/disk_mocap_calibration.py reports it. Contains the B2-asset and
+        Z1-FK error (a few mm / ~1 deg); use the probe tool for the final mm.
+        """
+        if self.last_asset_fix is None:
+            return "Motive disk pivot fix: n/a (needs B2 + disk tracked)"
+        from disk_mocap_calibration import axis_angle_deg, nearest_axis_label, rpy_deg  # noqa: PLC0415
+
+        origin, R = self.last_asset_fix
+        axis, angle = axis_angle_deg(R)
+        rpy = rpy_deg(R)
+        axes = ", ".join(f"{n}={nearest_axis_label(R[:, i])}" for i, n in enumerate(("X_D", "Y_D", "Z_D")))
+        return (
+            f"Motive disk pivot fix (asset-local): move pivot to ({origin[0] * 1e3:+.1f}, "
+            f"{origin[1] * 1e3:+.1f}, {origin[2] * 1e3:+.1f}) mm | rotate rpy(Rz*Ry*Rx)=("
+            f"{rpy[0]:+.1f}, {rpy[1]:+.1f}, {rpy[2]:+.1f}) deg = {angle:.1f} deg about "
+            f"({axis[0]:+.2f}, {axis[1]:+.2f}, {axis[2]:+.2f})\n             now: {axes}"
+        )
 
     def measure_ee_kp0_plb(self) -> np.ndarray:
         """Live gripperStator kp0 in PLB (IMU roll/pitch/yaw, mocap height)."""
@@ -1376,16 +1640,25 @@ class B2WZ1TransportMocapController:
         snap = self.read_perception()
         fault = self.perception_fault(snap)
         if fault is not None:
-            return False, fault
+            # Keep the disk cross-check visible: the disk can be calibrated
+            # with no puck on it.
+            return False, (f"{fault}\n             {self.disk_check_status()}"
+                           f"\n             {self.motive_fix_status()}")
         ok, gate = puck_start_gate(
             self.last_puck_d, self.puck_spawn_xy, self.puck_spawn_clearance,
             self.puck_obs_noise, self.puck_rest_height,
         )
         d = self.last_puck_d
+        disk_age = ((snap.get("disk") or {}).get("age_ms"))
         status = (
-            f"base_h={self.base_height:.4f}m | puck_D=({d[0]:+.4f},{d[1]:+.4f},{d[2]:+.4f}) "
+            f"base_h={self.base_height:.4f}m | puck_D[{self.disk_frame_source}]="
+            f"({d[0]:+.4f},{d[1]:+.4f},{d[2]:+.4f}) "
             f"| z_err={d[2] - self.puck_rest_height:+.4f}m | "
-            f"puck_age={((snap.get('puck') or {}).get('age_ms') or 0.0):.1f}ms | gate={gate}"
+            f"puck_age={((snap.get('puck') or {}).get('age_ms') or 0.0):.1f}ms"
+            + (f" disk_age={disk_age:.1f}ms" if disk_age is not None else "")
+            + f" skipped={(snap.get('mocap') or {}).get('frames_skipped', 0)}"
+            + f" | gate={gate}\n             {self.disk_check_status()}"
+            + f"\n             {self.motive_fix_status()}"
         )
         return ok, status
 
@@ -1407,6 +1680,7 @@ class B2WZ1TransportMocapController:
         self.hl_history.reset(self.build_hl_obs_frame())
         self.ll_tick = 0
         self.hl_tick = 0
+        self.policy_active = True
         self._ee_buttons_prev = {b: int(self.remote_controller.button[b] == 1) for b, _ in EE_TARGET_BUTTONS}
         print(
             "[TRANSPORT] Policy state initialized | HIGH(reset)="
@@ -1461,6 +1735,7 @@ class B2WZ1TransportMocapController:
         self.ll_tick += 1
         if self.debug_print_period_steps > 0 and self.ll_tick % self.debug_print_period_steps == 0:
             self.print_runtime_debug()
+        self.push_visualizer_state()
         return None
 
     # ------------------------------------------------------------------
@@ -1476,6 +1751,11 @@ class B2WZ1TransportMocapController:
         + [f"puck_D_{a}" for a in "xyz"] + ["puck_rho", "contact", "no_contact_steps"]
         + ["puck_age_ms", "body_age_ms", "base_height"]
         + [f"kp0_meas_{a}" for a in "xyz"]
+        # Cross-check columns: both puck_D sources and the mocap-vs-FK disk.
+        + ["disk_source", "disk_age_ms"]
+        + [f"puck_D_mocap_{a}" for a in "xyz"] + [f"puck_D_fk_{a}" for a in "xyz"]
+        + [f"disk_dpos_D_{a}_mm" for a in "xyz"]
+        + [f"disk_d{a}_deg" for a in ("roll", "pitch", "yaw")] + ["disk_dangle_deg"]
     )
 
     def open_hl_log(self) -> None:
@@ -1491,6 +1771,10 @@ class B2WZ1TransportMocapController:
     def write_hl_log_row(self) -> None:
         if self._log_writer is None:
             return
+
+        def nan3(v: Optional[np.ndarray]) -> List[float]:
+            return [float("nan")] * 3 if v is None else np.asarray(v, dtype=np.float64).tolist()
+
         t = self.task
         snap = self.last_snapshot or {}
         d = self.last_puck_d if self.last_puck_d is not None else np.full(3, np.nan)
@@ -1508,6 +1792,11 @@ class B2WZ1TransportMocapController:
             + [(snap.get("puck") or {}).get("age_ms"), (snap.get("body") or {}).get("age_ms"),
                self.base_height]
             + kp0_meas.tolist()
+            + [self.disk_frame_source, (snap.get("disk") or {}).get("age_ms")]
+            + nan3(self.last_puck_d_mocap) + nan3(self.last_puck_d_fk)
+            + (nan3(None) + nan3(None) + [float("nan")] if self.last_disk_check is None else
+               (np.asarray(self.last_disk_check[0]) * 1e3).tolist()
+               + np.asarray(self.last_disk_check[1]).tolist() + [self.last_disk_check[2]])
         )
         if self.hl_tick % 10 == 0:
             self._log_file.flush()
@@ -1536,6 +1825,13 @@ class B2WZ1TransportMocapController:
             f"kp0_ref={np.round(t.ee_kp0_ref, 3)} kp0_cmd={np.round(t.kp0_cmd, 3)} "
             f"rot_cmd={np.round(t.rot_cmd, 3)}"
         )
+        snap = self.last_snapshot or {}
+        ages = " ".join(
+            f"{k}={(snap.get(k) or {}).get('age_ms'):.1f}ms"
+            for k in ("body", "puck", "disk") if (snap.get(k) or {}).get("age_ms") is not None
+        )
+        print(f"            mocap age {ages} skipped={(snap.get('mocap') or {}).get('frames_skipped', 0)} | "
+              f"{self.disk_check_status()}")
 
     # ------------------------------------------------------------------
     # Actuation (retrieval sim2real, unchanged)
@@ -1700,6 +1996,234 @@ class B2WZ1TransportMocapController:
                 print(f"[EXIT][WARN] {exc!r}")
 
     # ------------------------------------------------------------------
+    # MuJoCo debug view (retrieval pattern)
+    #
+    # Kinematic replay of telemetry in the sim2sim transport scene
+    # (b2wz1_disk_puck.xml): robot from mocap root + joint encoders, the
+    # rendered disk mesh therefore sits where Z1 FK puts it, and the puck free
+    # body is placed at its MOCAP pose. On top:
+    #   translucent disc + triad  MOCAP disk pose (green = contact proxy on,
+    #                             red = off, cyan = policy not running)
+    #   magenta sphere            EE kp0 REFERENCE (operator target, min-jerk)
+    #   red sphere + red/blue     decoded EE COMMAND kp0 / local +X / +Z
+    #   white/orange/cyan dots    raw Motive pivots of B2 / puck / disk
+    # Two producers feed one window: the control loop at 50 Hz while the
+    # policy runs, and a monitor thread whenever the control loop is quiet
+    # (startup holds, READY-WAIT, damping protection). Steps no physics.
+    # ------------------------------------------------------------------
+
+    def _build_visualizer(self):
+        cfg = self.cfg
+        if not bool(cfg.get("visualizer_enabled", False)):
+            return None
+        from utils.mj_visualizer import MujocoDebugVisualizer  # noqa: PLC0415
+
+        visualizer = MujocoDebugVisualizer(
+            xml_path=self._resolve_path(cfg["visualizer_xml_path"]),
+            update_hz=float(cfg.get("visualizer_update_hz", 30.0)),
+            ee_target_sphere_radius=float(cfg.get("visualizer_ee_target_sphere_radius", 0.025)),
+            ee_target_axis_len=float(cfg.get("visualizer_ee_target_axis_len", 0.20)),
+            ee_target_axis_radius=float(cfg.get("visualizer_ee_target_axis_radius", 0.008)),
+            show_gripper_center=False,
+            # The transport scene MJCF already has its own floor and light.
+            show_floor=bool(cfg.get("visualizer_show_floor", False)),
+            floor_half_extent=float(cfg.get("visualizer_floor_half_extent", 3.0)),
+            show_light=bool(cfg.get("visualizer_show_light", False)),
+            ground_z=self.ground_z,
+            free_joint_names=[VIZ_PUCK_FREE_JOINT],
+        )
+        visualizer.configure_world_view(
+            show_world_origin=bool(cfg.get("visualizer_show_world_origin", True)),
+            camera_follow=bool(cfg.get("visualizer_camera_follow", True)),
+            world_origin_axis_len=float(cfg.get("visualizer_world_origin_axis_len", 0.4)),
+            camera_follow_smoothing=float(cfg.get("visualizer_camera_follow_smoothing", 0.15)),
+            show_all_markers=bool(cfg.get("visualizer_show_all_markers", True)),
+            marker_radius=float(cfg.get("visualizer_marker_radius", 0.008)),
+            show_root_frame=bool(cfg.get("visualizer_show_root_frame", True)),
+            root_frame_axis_len=float(cfg.get("visualizer_root_frame_axis_len", 0.25)),
+            root_frame_axis_radius=float(cfg.get("visualizer_root_frame_axis_radius", 0.008)),
+        )
+        self.viz_show_pivots = bool(cfg.get("visualizer_show_mocap_pivots", True))
+        self.viz_show_markers = bool(cfg.get("visualizer_show_all_markers", False))
+        self.viz_push_period_s = 1.0 / max(float(cfg.get("visualizer_update_hz", 30.0)), 1.0)
+        self.viz_pivot_radius = float(cfg.get("visualizer_mocap_pivot_radius", 0.012))
+        self.viz_ee_ref_radius = float(cfg.get("visualizer_ee_ref_radius", 0.03))
+        self.monitor_enabled = bool(cfg.get("visualizer_monitor_enabled", True))
+        self.monitor_hz = float(cfg.get("visualizer_monitor_hz", 30.0))
+        self.monitor_takeover_s = float(cfg.get("visualizer_monitor_takeover_s", 0.25))
+        return visualizer
+
+    def _gripper_q_training_for_viz(self) -> float:
+        getter = getattr(self.z1, "get_gripper_q_training", None)
+        try:
+            return float(getter()) if getter is not None else float(self.gripper_hold_pos)
+        except Exception:  # noqa: BLE001
+            return float(self.gripper_hold_pos)
+
+    def _scene_state(
+        self, snap: Dict[str, Any], b2w_joint_pos: np.ndarray, imu_quat: np.ndarray, with_task: bool
+    ) -> Dict[str, Any]:
+        """Render snapshot. World-frame drawing uses the MOCAP root pose."""
+        state: Dict[str, Any] = {
+            "base_quat_wxyz": np.asarray(imu_quat, dtype=np.float32).copy(),
+            "base_height": float(self.base_height or 0.0),
+            "ground_z": self.ground_z,
+            "b2w_joint_pos_policy": np.asarray(b2w_joint_pos, dtype=np.float32).copy(),
+            "z1_q": np.asarray(self.z1.q, dtype=np.float32).copy(),
+            "gripper_q_training": self._gripper_q_training_for_viz(),
+        }
+        body = snap.get("body") or {}
+        root_ok = bool(body.get("valid")) and body.get("root_position_world") is not None
+        if root_ok:
+            p_root = np.asarray(body["root_position_world"], dtype=np.float64)
+            q_root = np.asarray(body["root_quat_wxyz"], dtype=np.float32)
+            state.update(base_pos_w=p_root, base_quat_wxyz=q_root,
+                         root_frame={"pos": p_root.tolist(), "quat_wxyz": q_root.tolist()})
+            h = (snap.get("base_height") or {}).get("height_m")
+            if h is not None:
+                state["base_height"] = float(h)
+
+        puck = snap.get("puck") or {}
+        if puck.get("valid") and puck.get("position_world") is not None:
+            state["free_body_poses"] = {
+                VIZ_PUCK_FREE_JOINT: {"pos": puck["position_world"], "quat_wxyz": puck.get("quat_wxyz")}
+            }
+
+        disk = snap.get("disk") or {}
+        if disk.get("valid") and disk.get("position_world") is not None:
+            q_disk = np.asarray(disk["quat_wxyz"], dtype=np.float64)
+            if not self.policy_active:
+                rgba = [0.2, 0.9, 1.0, 0.35]
+            elif self.last_contact[0]:
+                rgba = [0.2, 1.0, 0.3, 0.40]
+            else:
+                rgba = [1.0, 0.2, 0.2, 0.55]
+            state["discs"] = [{
+                "pos": disk["position_world"], "mat": q_to_mat(q_disk),
+                "radius": self.disk.radius, "half_height": 0.5 * self.disk.thickness + 0.001,
+                "rgba": rgba,
+            }]
+            state["extra_frames"] = [{"pos": disk["position_world"], "quat_wxyz": q_disk.tolist(),
+                                      "length": 0.12, "radius": 0.004}]
+        if self.last_fk_disk_w is not None:
+            # TARGET for the asset triad: FK frame D (thin, long, translucent).
+            fk_pos_w, fk_rot_w = self.last_fk_disk_w
+            state.setdefault("extra_frames", []).append({
+                "pos": fk_pos_w.tolist(),
+                "quat_wxyz": quat_from_rotmat_wxyz(fk_rot_w).tolist(),
+                "length": 0.18, "radius": 0.002, "alpha": 0.45,
+            })
+
+        points = []
+        if getattr(self, "viz_show_pivots", False):
+            for channel, rgba in (("body", [1.0, 1.0, 1.0, 0.85]),
+                                  ("puck", [1.0, 0.55, 0.1, 0.9]),
+                                  ("disk", [0.2, 0.9, 1.0, 0.9])):
+                ch = snap.get(channel) or {}
+                pos = ch.get("position_world")
+                if ch.get("valid") and pos is not None:
+                    points.append({"pos": pos, "rgba": rgba,
+                                   "radius": getattr(self, "viz_pivot_radius", 0.012)})
+
+        if with_task and root_ok:
+            state["ee_cmd_plb"] = np.asarray(self.task.ee_cmd_plb, dtype=np.float32).copy()
+            # EE kp0 reference (PLB) -> world, with the same PLB the
+            # visualizer uses for the command: mocap root xy, ground z, yaw.
+            _, _, yaw = euler_xyz_from_quat_wxyz(state["base_quat_wxyz"])
+            plb_origin = np.array([state["base_pos_w"][0], state["base_pos_w"][1], self.ground_z],
+                                  dtype=np.float32)
+            ref_w = plb_origin + quat_apply_wxyz(
+                quat_from_yaw_wxyz(float(yaw)), np.asarray(self.task.ee_kp0_ref, dtype=np.float32)
+            )
+            points.append({"pos": ref_w.tolist(), "rgba": [1.0, 0.0, 1.0, 0.8],
+                           "radius": getattr(self, "viz_ee_ref_radius", 0.03)})
+        state["mocap_points"] = points or None
+        # Raw marker cloud only when it is drawn: converting it is the most
+        # expensive part of a snapshot and nothing in the control path needs it.
+        marker_cloud = getattr(self.perception, "marker_cloud", None)
+        if getattr(self, "viz_show_markers", False) and marker_cloud is not None:
+            state["mocap_markers"] = marker_cloud()
+        return state
+
+    def push_visualizer_state(self) -> None:
+        """From the control loop: the rich state (task + EE command).
+
+        Throttled to the viewer's own update rate: building the scene state
+        at the 50-Hz WBC rate only to have the viewer drop 2 of every 5
+        would cost control-thread time (and GIL) for nothing.
+        """
+        if self.visualizer is None or self.last_snapshot is None:
+            return
+        now = time.monotonic()
+        if now - self._last_control_push < self.viz_push_period_s:
+            return
+        try:
+            self.visualizer.push_state(**self._scene_state(
+                self.last_snapshot, self.b2w_joint_pos, self.base_quat_wxyz, with_task=True
+            ))
+            self._last_control_push = time.monotonic()
+        except Exception as exc:  # noqa: BLE001 - a debug view must never fault the run
+            if not self._monitor_warned:
+                self._monitor_warned = True
+                print(f"[VIZ][WARN] push failed, view may freeze: {exc!r}")
+
+    def start_monitor(self) -> None:
+        if self.visualizer is None:
+            return
+        self.visualizer.start()
+        if not self.monitor_enabled or self._monitor_thread is not None:
+            return
+        self._monitor_stop.clear()
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop, name="transport-scene-monitor", daemon=True
+        )
+        self._monitor_thread.start()
+        print(f"[TRANSPORT] MuJoCo view + scene monitor at {self.monitor_hz:g} Hz.")
+
+    def stop_monitor(self) -> None:
+        if getattr(self, "_monitor_thread", None) is not None:
+            self._monitor_stop.set()
+            self._monitor_thread.join(timeout=2.0)
+            self._monitor_thread = None
+        if getattr(self, "visualizer", None) is not None:
+            try:
+                self.visualizer.stop()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[EXIT][WARN] visualizer stop failed: {exc!r}")
+
+    def _monitor_loop(self) -> None:
+        period = 1.0 / max(self.monitor_hz, 1.0)
+        while not self._monitor_stop.is_set():
+            loop_start = time.perf_counter()
+            try:
+                if time.monotonic() - self._last_control_push >= self.monitor_takeover_s:
+                    state = self._monitor_state()
+                    if state is not None:
+                        self.visualizer.push_state(**state)
+            except Exception as exc:  # noqa: BLE001 - a debug view must never kill a run
+                if not self._monitor_warned:
+                    self._monitor_warned = True
+                    print(f"[MONITOR][WARN] disabled after error: {exc!r}")
+                return
+            remaining = period - (time.perf_counter() - loop_start)
+            if remaining > 0.0:
+                time.sleep(remaining)
+
+    def _monitor_state(self) -> Optional[Dict[str, Any]]:
+        """Phase-independent telemetry: low_state (DDS callback) + a fresh mocap read."""
+        low = self.low_state
+        if low is None or getattr(low, "tick", 0) == 0:
+            return None
+        joints = np.array(
+            [low.motor_state[self.hardware_to_policy[i]].q for i in range(self.num_b2w_dof)],
+            dtype=np.float32,
+        )
+        quat = np.asarray(low.imu_state.quaternion, dtype=np.float32).reshape(4)
+        norm = float(np.linalg.norm(quat))
+        quat = quat / norm if norm > 1e-8 else np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        return self._scene_state(self.perception.get_latest_snapshot(), joints, quat, with_task=False)
+
+    # ------------------------------------------------------------------
     # Startup (retrieval sequence; gripper held, puck gate added)
     # ------------------------------------------------------------------
 
@@ -1732,10 +2256,18 @@ class B2WZ1TransportMocapController:
         from utils.command_helper import create_zero_cmd  # noqa: PLC0415
 
         print("[TRANSPORT] Holding arm DEFAULT. Press A to stand up.")
+        print("[TRANSPORT] (Robot lying, arm at DEFAULT: the disk mocap-vs-FK check below "
+              "can be used to calibrate the Motive disk asset now.)")
+        last_print = 0.0
         while self.remote_controller.button[KeyMap.A] != 1:
             create_zero_cmd(self.low_cmd)
             self.send_b2w_cmd()
             self._hold_arm_default_lowcmd()
+            now = time.monotonic()
+            if now - last_print >= self.perception_status_print_s:
+                last_print = now
+                _, status = self.startup_readiness()
+                print(f"[ARM-HOLD] {status}")
             time.sleep(self.control_dt)
         while self.remote_controller.button[KeyMap.A] == 1:  # require release
             create_zero_cmd(self.low_cmd)
@@ -1833,8 +2365,17 @@ class B2WZ1TransportMocapController:
         print(f"Low policy  : {self.low_policy_path} (sha256 verified)")
         print("UAN         : NOT LOADED (simulation-only); Z1 firmware POSITION_PD")
         print(f"Z1 gains    : Kp={np.round(self.z1_kp_effective, 3)} Kd={np.round(self.z1_kd_effective, 3)}")
-        print(f"Puck        : mass={self.cfg['puck_mass_kg']} kg, r={self.puck_radius} h={self.puck_height}")
-        print(f"Disk        : r={self.disk.radius} t={self.disk.thickness}, frame from Z1 FK")
+        print(f"Puck        : r={self.puck_radius} h={self.puck_height} (rest z_D={self.puck_rest_height:.3f})")
+        disk_src = (
+            "MOCAP disk rigid body (Z1 FK = cross-check)" if self.disk_frame_source == "mocap"
+            else "Z1 FK + training mount (mocap disk unused)"
+        )
+        print(f"Disk        : r={self.disk.radius} t={self.disk.thickness}, frame from {disk_src}")
+        for sel in ("body", "puck_body", "disk_body"):
+            selector = getattr(self.perception, sel, None)
+            if isinstance(selector, MocapBodySelector):
+                print(f"  mocap     : {selector.describe()}")
+        print(f"Visualizer  : {'ON' if self.visualizer is not None else 'OFF'}")
         print(f"Contact     : rho<={self.disk.radius} and |z_D-{self.puck_rest_height:.3f}|<="
               f"{self.puck_obs_noise}; drop after {self.contact_monitor.drop_steps} HL steps")
         print(f"Operator    : base ref sticks x{self.command_scale.tolist()}; D-pad "
@@ -1857,6 +2398,7 @@ class B2WZ1TransportMocapController:
             self.perception.initialize()
             self.perception.start()
             perception_started = True
+            self.start_monitor()
 
             self.zero_torque_state()
             self.move_arm_to_default()
@@ -1884,6 +2426,7 @@ class B2WZ1TransportMocapController:
                     self.perception.stop()
                 except Exception as exc:  # noqa: BLE001
                     print(f"[EXIT][WARN] perception stop failed: {exc!r}")
+            self.stop_monitor()
             print("[TRANSPORT] Exit.")
 
 
@@ -1897,19 +2440,34 @@ def main() -> None:
         default="deploy/configs/b2wz1_hl_transport_uan_mocap.yaml",
         help="Path to the deployment YAML.",
     )
+    parser.add_argument(
+        "--disk-frame-source", choices=DISK_FRAME_SOURCES, default=None,
+        help="Disk frame of puck_D: 'mocap' (Motive disk asset) or 'fk' (Z1 FK + "
+             "training mount). Overrides disk_frame_source in the YAML.",
+    )
     args = parser.parse_args()
 
     # Validate the setup BEFORE any DDS / arm / mocap connection is opened.
     with open(args.config, "r") as f:
-        problems = validate_transport_setup(yaml.safe_load(f))
+        cfg = yaml.safe_load(f)
+    if args.disk_frame_source is not None:
+        cfg["disk_frame_source"] = args.disk_frame_source
+    print(f"[TRANSPORT] disk frame source: {cfg.get('disk_frame_source', 'mocap')}")
+    problems = validate_transport_setup(cfg)
     if problems:
         print("[TRANSPORT] Setup incomplete -- nothing was started:\n  - " + "\n  - ".join(problems))
         sys.exit(2)
 
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize  # noqa: PLC0415
 
+    # As retrieval: the 500-Hz loop shares the GIL with the NatNet decoder,
+    # the DDS callback, the MuJoCo view and the scene monitor. 0.5 ms bounds
+    # a GIL hold to a quarter of one hardware tick.
+    sys.setswitchinterval(5e-4)
     ChannelFactoryInitialize(0, args.net)
-    B2WZ1TransportMocapController(cfg_path=args.config).run()
+    B2WZ1TransportMocapController(
+        cfg_path=args.config, disk_frame_source=args.disk_frame_source
+    ).run()
 
 
 if __name__ == "__main__":

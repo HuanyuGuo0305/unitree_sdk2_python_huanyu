@@ -63,6 +63,32 @@ arm_q_lower: [-2.6180, 0.0, -2.8856, -1.5184, -1.3439, -2.7925]
 arm_q_upper: [ 2.6180, 2.8798, 0.0,  1.5184,  1.3439,  2.7925]
 
 # ----------------------------------------------------------------------
+# Damping protection (same semantics as b2wz1_hl_retrieval_abs_uan_mocap).
+#
+# Entered when SELECT is pressed while the RL policy is running. B2W goes
+# kp=0 / high kd; the Z1 is commanded to its current position with high kd
+# and is NEVER forced out of PASSIVE. The policy never resumes; Ctrl-C quits.
+# (A during the run still kills the policy with the 0.5 s safe hold.)
+# ----------------------------------------------------------------------
+damping_kd_b2w: 150.0
+damping_kd_wheel: 10.0
+damping_kp_z1: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+damping_kd_z1: [2000.0, 2000.0, 2000.0, 2000.0, 2000.0, 2000.0]
+damping_print_period: 100
+
+# Operator-triggered leg recovery inside protection: press A (after releasing
+# it) to fold the 12 leg joints down to the target pose (policy leg order,
+# same as default_leg_pos_policy). The arm is not moved.
+damping_leg_recovery_enabled: true
+damping_recover_leg_duration_s: 4.0
+damping_recover_leg_tolerance_rad: 0.15
+damping_recover_leg_target: [
+   0.1,  -0.1,   0.1,  -0.1,
+   1.57,  1.57,  1.57,  1.57,
+  -2.65, -2.65, -2.65, -2.65
+]
+
+# ----------------------------------------------------------------------
 # B2W low-level DDS
 # ----------------------------------------------------------------------
 b2w:

@@ -25,7 +25,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 
@@ -279,6 +279,22 @@ def _add_capsule(scene, p0, p1, radius, rgba) -> None:
     scene.ngeom += 1
 
 
+def _add_cylinder(scene, pos, mat, radius, half_height, rgba) -> None:
+    """Oriented cylinder whose axis is the local +Z column of `mat`."""
+    if scene.ngeom >= scene.maxgeom:
+        return
+    g = scene.geoms[scene.ngeom]
+    mujoco.mjv_initGeom(
+        g,
+        mujoco.mjtGeom.mjGEOM_CYLINDER,
+        np.array([radius, half_height, 0.0], dtype=np.float64),
+        np.asarray(pos, dtype=np.float64).reshape(3),
+        np.asarray(mat, dtype=np.float64).reshape(3, 3).reshape(-1),
+        np.asarray(rgba, dtype=np.float32),
+    )
+    scene.ngeom += 1
+
+
 class MujocoDebugVisualizer:
     """
     Background MuJoCo viewer that renders the current B2WZ1 + Z1 pose plus
@@ -305,6 +321,7 @@ class MujocoDebugVisualizer:
         world_origin_axis_len: float = 0.4,
         camera_follow: bool = False,
         camera_follow_smoothing: float = 0.15,
+        free_joint_names: Optional[Sequence[str]] = None,
     ):
         # The robot-only MJCF has no light and no floor, so both are injected
         # into the model here (real geometry, not scene decorations).
@@ -359,6 +376,12 @@ class MujocoDebugVisualizer:
             _joint_qpos_adr(self._m, name) for name in Z1_ARM_JOINT_NAMES
         ]
         self._gripper_qpos_adr = _joint_qpos_adr(self._m, Z1_GRIPPER_JOINT_NAME)
+        # Extra free bodies of the scene (e.g. the transport puck) whose pose
+        # is pushed from mocap. Parked out of view while no pose is pushed.
+        self._free_qpos_adr = {
+            str(name): _joint_qpos_adr(self._m, str(name))
+            for name in (free_joint_names or ())
+        }
 
         self._lock = threading.Lock()
         self._state: Optional[Dict[str, Any]] = None
@@ -514,6 +537,20 @@ class MujocoDebugVisualizer:
             d.qpos[adr] = q
 
         d.qpos[self._gripper_qpos_adr] = float(state["gripper_q_training"])
+
+        poses = state.get("free_body_poses") or {}
+        for name, adr in self._free_qpos_adr.items():
+            pose = poses.get(name)
+            if pose is not None and pose.get("pos") is not None:
+                d.qpos[adr:adr + 3] = np.asarray(pose["pos"], dtype=np.float64).reshape(3)
+                quat = pose.get("quat_wxyz")
+                d.qpos[adr + 3:adr + 7] = (
+                    np.asarray(quat, dtype=np.float64).reshape(4)
+                    if quat is not None else [1.0, 0.0, 0.0, 0.0]
+                )
+            else:
+                d.qpos[adr:adr + 3] = [0.0, 0.0, -10.0]
+                d.qpos[adr + 3:adr + 7] = [1.0, 0.0, 0.0, 0.0]
 
     @staticmethod
     def _rotmat_from_quat_wxyz(q) -> np.ndarray:
@@ -721,6 +758,31 @@ class MujocoDebugVisualizer:
                     viewer.user_scn, kp0, z_end,
                     self._ee_target_axis_radius, [0.0, 0.0, 1.0, 0.9],
                 )
+
+        # Generic oriented discs and triads pushed by the caller (world frame),
+        # e.g. the mocap-measured transport disk next to the FK-rendered one.
+        for disc in state.get("discs") or ():
+            if disc.get("pos") is None or disc.get("mat") is None:
+                continue
+            _add_cylinder(
+                viewer.user_scn,
+                disc["pos"],
+                disc["mat"],
+                float(disc.get("radius", 0.1)),
+                float(disc.get("half_height", 0.002)),
+                disc.get("rgba", [0.2, 0.9, 1.0, 0.35]),
+            )
+        for frame in state.get("extra_frames") or ():
+            if frame.get("pos") is None or frame.get("quat_wxyz") is None:
+                continue
+            self._draw_frame_triad(
+                viewer.user_scn,
+                frame["pos"],
+                frame["quat_wxyz"],
+                float(frame.get("length", 0.12)),
+                float(frame.get("radius", 0.005)),
+                float(frame.get("alpha", 0.95)),
+            )
 
         if self._show_world_origin:
             self._draw_world_origin(viewer.user_scn, ground_z)

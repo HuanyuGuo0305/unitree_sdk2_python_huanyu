@@ -636,6 +636,9 @@ class NatNetClient:
         self._frame: Optional[NatNetFrame] = None
         self._frame_count = 0
         self._parse_errors = 0
+        # Frame packets drained from the socket without being parsed because
+        # a NEWER one was already waiting behind them (see _run).
+        self._skipped_frames = 0
 
         self._data_sock: Optional[socket.socket] = None
         self._cmd_sock: Optional[socket.socket] = None
@@ -739,6 +742,12 @@ class NatNetClient:
     def parse_error_count(self) -> int:
         with self._lock:
             return self._parse_errors
+
+    @property
+    def skipped_frame_count(self) -> int:
+        """Stale frame packets discarded unparsed (non-zero = we were behind)."""
+        with self._lock:
+            return self._skipped_frames
 
     def wait_for_first_frame(self, timeout_s: float = 10.0) -> bool:
         deadline = time.monotonic() + float(timeout_s)
@@ -970,6 +979,18 @@ class NatNetClient:
             except (OSError, ValueError):
                 return
 
+            # LATENCY: drain every ready socket completely and parse ONLY the
+            # newest frame packet. Parsing each queued packet in turn (as
+            # this loop used to) lets a backlog build up whenever Python
+            # parsing falls behind Motive's rate -- the GIL is shared with
+            # the 500 Hz control loop, DDS, the MuJoCo view -- and the 1 MB
+            # socket buffer then holds up to seconds of old frames. Worse,
+            # each one was stamped "fresh" at PARSE time, so no staleness
+            # check could see it. Here recv_time is the time the newest
+            # packet was taken off the socket, and older packets are counted
+            # as skipped, never parsed.
+            newest: Optional[Tuple[bytes, float]] = None
+            skipped = 0
             for sock in ready:
                 while True:
                     try:
@@ -978,18 +999,27 @@ class NatNetClient:
                         break
                     except OSError:
                         return
-
-                    msg_id, payload = self._split_packet(data)
-                    if msg_id != NAT_FRAMEOFDATA:
+                    if len(data) < 4 or struct.unpack_from("<H", data, 0)[0] != NAT_FRAMEOFDATA:
                         continue
+                    if newest is not None:
+                        skipped += 1
+                    newest = (data, time.monotonic())
 
-                    frame = self._decode_frame(payload)
+            if newest is None:
+                if skipped:
                     with self._lock:
-                        if frame is None:
-                            self._parse_errors += 1
-                        else:
-                            self._frame = frame
-                            self._frame_count += 1
+                        self._skipped_frames += skipped
+                continue
+
+            _, payload = self._split_packet(newest[0])
+            frame = self._decode_frame(payload, recv_time=newest[1])
+            with self._lock:
+                self._skipped_frames += skipped
+                if frame is None:
+                    self._parse_errors += 1
+                else:
+                    self._frame = frame
+                    self._frame_count += 1
 
     def _send_keepalive(self) -> None:
         """
@@ -1010,8 +1040,9 @@ class NatNetClient:
         except OSError:
             pass
 
-    def _decode_frame(self, payload: bytes) -> Optional[NatNetFrame]:
-        recv_time = time.monotonic()
+    def _decode_frame(self, payload: bytes, recv_time: Optional[float] = None) -> Optional[NatNetFrame]:
+        # Receive time of the packet (not parse time), so ages are honest.
+        recv_time = time.monotonic() if recv_time is None else float(recv_time)
 
         # Once a layout has proven itself, keep using it so the per-frame cost
         # stays a single parse.

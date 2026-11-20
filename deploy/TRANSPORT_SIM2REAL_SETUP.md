@@ -15,15 +15,16 @@ the robot. It refuses to start until every `[REQUIRED SETUP]` key in the YAML is
 |---|---|---|
 | High-level policy | `high_policy_8.onnx`, 165→9, ABS commands | `b2wz1_hl_transport_uan/high_policy.onnx` (sha256 `db783046…`), 192→6, **residual** on an EE reference |
 | Frozen WBC | `policy_wbc_uan_3.onnx` (`3b7874b7…`, 2026-09-07) | `b2wz1_wbc_uan_plb/policy_wbc_uan_transport.onnx` (`6b5aa5de…`, 2026-10-27). **Different checkpoint, never run on hardware.** |
-| Mocap rigid bodies | B2, object (`cube4`), retrieval target | **B2 (reused) + puck (new).** No disk rigid body. |
+| Mocap rigid bodies | B2, object (`cube4`), retrieval target | **B2 (reused) + puck (new) + disk (new).** |
 | Gripper | binary open/close | held at the training position 0.0 (closed) for the whole run |
 | Task references | none (policy chooses) | operator: sticks = base velocity, D-pad = EE target |
 | End condition | operator / fault | operator SELECT, fault, or **puck drop** |
 
-> **Do not use `exported_policies/b2wz1_hl_transport_uan/low_policy.onnx`** (`47f19872…`). It is the
-> 2026-09-26 WBC of the superseded `high_policy_1` run. The YAML pins both policies by SHA-256 and
-> the script refuses any other file. The correct WBC was copied byte-identically from
-> `unitree_mujoco/exported_policy/b2wz1_wbc_plb_uan/policy_wbc_uan_transport.onnx`.
+> The WBC is pinned by SHA-256 (`6b5aa5de…`). `exported_policies/b2wz1_hl_transport_uan/low_policy.onnx`
+> now holds exactly that file (byte-identical to
+> `exported_policies/b2wz1_wbc_uan_plb/policy_wbc_uan_transport.onnx` and to the sim2sim
+> `unitree_mujoco_huanyu/exported_policy/b2wz1_wbc_plb_uan/policy_wbc_uan_transport.onnx`). The superseded
+> 2026-09-26 WBC (`47f19872…`) or any other checkpoint is refused at load.
 
 ---
 
@@ -47,20 +48,31 @@ filled history without appending (as in sim2sim). All HL features are sampled at
 | 9 | EE kp0 reference | 3 | HIGH (measured after settle) / LOW / LEFT / RIGHT + min-jerk | same process; **target chosen by D-pad**; HIGH measured by Z1 FK + IMU + mocap base height | PLB | m | min-jerk 1.5 s / 2.0 s (LOW) | Robot FK + mocap height + command history |
 | 10 | EE orientation reference | 3 | constant canonical [0, −0.06, π/2] | same constant | PLB yaw/pitch/roll | rad | none | Constant (as training) |
 | 11 | previous executed residual | 6 | `executed_hl_action` | same arithmetic (`TransportTask.decode`) | normalized | — | clip to [−1,1] after WBC bounds | Command history |
-| 12 | **puck centre in disk frame** | 3 | MuJoCo puck body pos vs disk frame | **OptiTrack puck centre** (in mocap base_link frame) projected on the **Z1-FK disk frame** | disk D | m | R_Dᵀ(p_puck − c_D) | **OptiTrack + FK — requires puck rigid body + calibration (§A, §B)** |
+| 12 | **puck centre in disk frame** | 3 | MuJoCo puck body pos vs disk frame | **OptiTrack puck centre** projected on the **OptiTrack disk frame** (default, `disk_frame_source: mocap`); Z1-FK disk frame as cross-check / fallback (`fk`) | disk D | m | R_Dᵀ(p_puck − c_D) | **OptiTrack — requires puck + disk rigid bodies with pivots set in Motive (§A, §B)** |
 
 PLB = yaw-only projected base frame at ground height (`ground_z`). On the robot PLB uses IMU
 roll/pitch/yaw and the **mocap base height** — the same path the validated retrieval uses.
 
 Feature 12 in detail (the only non-proprioceptive input):
 ```
-puck_b   = R_root^T (p_puck_W + R_puck·mocap_puck_offset_local − p_root_W)     # MocapPerceptionSystem, mocap root = base_link
+# disk_frame_source: "mocap" (default) -- one NatNet frame, world coordinates only
+p_puck_W           = puck asset pivot  (Motive pivot = puck geometric centre)
+(c_D^W, R_D^W)     = disk asset pose   (Motive pivot = disk centre, mid-thickness; axes = D)
+puck_D             = R_D^Wᵀ (p_puck_W − c_D^W)        # resting: z_D = 0.002 + 0.040 = 0.042 m
+
+# cross-check (always computed, logged; the observation when disk_frame_source: "fk")
+puck_b   = R_rootᵀ (p_puck_W − p_root_W)                                      # B2 asset = base_link
 (p_s,R_s)= Z1ArmAdapter.compute_policy_ee_pose_in_base()                      # gripperStator in base frame
-c_D      = p_s + R_s·[0.100, 0.045, 0.0]        R_D = R_s·[[1,0,0],[0,0,-1],[0,1,0]]ᵀ-columns   # disk +Z = stator +Y
-puck_D   = R_Dᵀ (puck_b − c_D)                  # resting on the disk: z_D = 0.002 + 0.040 = 0.042 m
+c_D      = p_s + R_s·[0.100, 0.045, 0.0]        R_D = R_s·[x:(1,0,0) y:(0,0,−1) z:(0,1,0)]   # disk +Z = stator +Y
+puck_D_fk= R_Dᵀ (puck_b − c_D)
 ```
-The projection is frame-invariant; mocap world yaw never enters (only the mocap base_link
-orientation, whose roll/pitch agree with the IMU through the existing root calibration).
+Why mocap for the disk: the observation then depends only on the puck and disk assets of the
+**same** NatNet frame. The B2 asset calibration (≈ 15 mm of puck_D per degree, see B2), Z1
+FK/backlash/compliance under the disk + puck load, and the skew between the Z1 state and the mocap
+frame during fast arm motion all drop out. A disk tilt error of θ only moves puck_D by
+≈ 0.042·θ (0.7 mm per degree). Disk frame D (training): origin = disk centre at mid-thickness;
++X_D = stator +X (towards the fingertips), +Z_D = disk normal (stator +Y, towards the puck),
++Y_D = Z_D × X_D. At the DEFAULT arm pose X_D ≈ robot forward, Y_D ≈ left, Z_D ≈ up.
 
 **No velocity observation exists for the puck**, so no velocity is estimated or differenced.
 Training adds U(±0.01 m) noise to feature 12; this bounds how much measurement error the policy
@@ -110,23 +122,39 @@ base_command = base reference (no learned base residual)
 
 | Object | Rigid body? | Category | YAML keys | Used quantity | → observation |
 |---|---|---|---|---|---|
-| B2 base | **Yes** — existing asset `B2` (id 9) | **Reuse** from retrieval, unchanged | `mocap_body_name/id`, `mocap_root_frame_is_base_link: true` | base_link pose | base height (PLB, HIGH kp0, feature 9) and world→base transform for the puck (feature 12) |
-| Puck | **Yes — new** | **New, required** | `mocap_puck_name`, `mocap_puck_id`, `mocap_puck_offset_local`, `mocap_puck_max_age_s: 0.10` | puck **centre position** only (orientation unused) | feature 12 |
-| Disk on the gripper | **No** | Optional (one-time calibration aid only, no code path) | — | disk frame comes from Z1 FK + training mount | feature 12 |
+| B2 base | **Yes** — existing asset `B2` (id 9) | **Reuse** from retrieval, unchanged | `mocap_body_name/id`, `mocap_root_frame_is_base_link: true` | base_link pose | base height (PLB, HIGH kp0, feature 9); FK cross-check of feature 12 |
+| Puck | **Yes — new** | **New, required** | `mocap_puck_name`, `mocap_puck_id`, `mocap_puck_max_age_s: 0.10` (pivot set in Motive; `mocap_puck_offset_local` stays `[0,0,0]`) | puck **centre position** (orientation only drawn) | feature 12 |
+| Disk on the gripper | **Yes — new** | **New, required** with `disk_frame_source: mocap` | `mocap_disk_name`, `mocap_disk_id`, `mocap_disk_max_age_s: 0.10` (pivot + axes set in Motive) | disk centre **pose** = frame D | feature 12 |
 | Retrieval target / cube | No | Not used | — | — | — |
 
-Why no disk rigid body: the deploy FK chain reproduces the training MJCF disk to 0.0001 mm
-(test `TestZ1ForwardKinematics`, 64 random arm poses), and the WBC itself already relies on this
-FK. A disk rigid body would add markers right where the puck slides. Add one temporarily only if
-the §E.4 disk-centre check fails and you need to separate FK/compliance error from calibration error.
+The deploy FK chain still reproduces the training MJCF disk to 0.0001 mm (test
+`TestZ1ForwardKinematics`) and is evaluated every step as a cross-check: READY-WAIT, the debug print
+and the CSV show `disk mocap-FK: dpos_D=(…)mm drpy_D=(…)deg`, the pose of the Motive disk asset seen
+from the FK disk, in disk axes. With a good asset this stays within a few mm / ~1°; a constant
+offset is a pivot/axis error of the asset (fix it in Motive by exactly that amount); an offset that
+changes with the arm pose is FK/compliance/backlash, which the mocap source is immune to.
+
+**Disk rigid body — physical setup**
+1. ≥ 4 markers, asymmetric, on parts **rigid with the disk**: the gripperStator housing, the disk
+   **underside** or the rim edge. Never on the top face (the puck slides there) and never on the
+   moving jaw. Check visibility at HIGH/LOW/LEFT/RIGHT.
+2. Pivot = disk centre at **mid-thickness** (2 mm below the top face). E.g. place a temporary
+   marker at the top-face centre, set the pivot to it in Motive, then translate it 2 mm along −Z_D.
+3. Orientation = D: +X towards the fingertips along the gripper, +Z the disk normal (up, towards
+   the puck). Easiest: with the arm at DEFAULT and the robot squared to the Motive world axes, the
+   disk is level to 3.4°; create the asset there and then refine with the READY-WAIT `drpy_D`
+   readout (rotate the asset by minus that amount in Motive's pivot/orientation editor).
+4. Name it (e.g. `disk`) → `mocap_disk_name` / `mocap_disk_id`; must differ from `B2` and the puck.
 
 **Puck rigid body — physical setup**
 1. ≥ 4 markers in an **asymmetric** pattern on the **top face** of the puck (not the side: side
    markers would collide with nothing, but top markers stay visible from overhead cameras while the
    disk tilts). Keep marker bases inside the top face; nothing may protrude below the bottom face.
-2. Weigh the puck **with markers**; that mass goes into `puck_mass_kg` and must be in [0.50, 1.50] kg.
+2. Training randomized the puck mass over [0.50, 1.50] kg (markers included); the script no longer
+   checks the mass.
 3. Create the asset in Motive **with the puck standing upright on the floor**, so the asset frame's
-   +Z is the cylinder axis (Motive aligns a new asset to the world axes).
+   +Z is the cylinder axis, and move the **pivot to the geometric centre** (40 mm above the bottom
+   face) in Motive — `mocap_puck_offset_local` stays `[0, 0, 0]`, as in retrieval.
 4. Name it (e.g. `puck`) and note its streaming ID; it must differ from `B2` (id 9). Put the name in
    `mocap_puck_name` and the ID in `mocap_puck_id` (name is preferred; ID is the fallback).
 5. Enable Rigid Bodies (and, for debugging, Labeled/Unlabeled Markers) in Motive streaming —
@@ -140,20 +168,21 @@ the §E.4 disk-centre check fails and you need to separate FK/compliance error f
 |---|---|---|---|---|---|
 | B1 | OptiTrack world / ground plane | base height and PLB z are absolute | 9, 12 (via base frame), WBC EE command | `ground_z: 0.0` | **Reuse**: the retrieval setup. Re-run Motive ground-plane calibration if cameras moved. |
 | B2 | B2 asset = base_link | every base-frame quantity | 9, 12 | `mocap_root_frame_is_base_link: true` (or `mocap_root_offset_path` from `deploy/b2w_mocap_root_calibration.py`) | **Reuse** from retrieval, but transport is far less tolerant: the disk centre is 0.86 m from base_link at HIGH, so a 1° roll/pitch/**yaw** error of the B2 asset vs base_link moves puck_D by ≈ 15 mm (more than the ±10 mm training noise). Retrieval only needed cm accuracy. If §E.4 shows a constant offset, re-run `deploy/b2w_mocap_root_calibration.py` and switch to `mocap_root_offset_path`. |
-| B3 | Puck pivot → puck geometric centre | feature 12 must be the puck **centre** | 12 | `mocap_puck_offset_local` [m, puck asset frame] | §E.3 spin test and §E.4 centre test |
-| B4 | Disk mount = training mount | disk frame is computed, not measured | 12, contact proxy | `disk_mount_verified: true` after checking; geometry keys must stay at training values | measure (below) + §E.4 |
+| B3 | Puck pivot → puck geometric centre | feature 12 must be the puck **centre** | 12 | set in Motive (`mocap_puck_offset_local: [0,0,0]`) | §E.3 spin test and §E.4 centre test |
+| B4 | Disk asset pivot/axes = frame D (mocap source); disk mount = training mount | feature 12 is measured in D | 12, contact proxy | set in Motive; `disk_mount_verified: true` | READY-WAIT `disk mocap-FK` readout + §E.4 |
 | B5 | Z1 FK / arm base offset | disk frame and HIGH | 9, 12, WBC | `arm_base_offset_pos`, `z1_fk_to_policy_ee_pos` (reused from retrieval) | Model consistency verified offline (0.0001 mm). Physical accuracy (backlash, link compliance under the disk+puck load) only via §E.4. |
 | B6 | Puck geometry | rest height 0.042 m and contact proxy | 12, proxy, start gate | `puck_geometry_verified: true` | calipers: radius 50 ± 2 mm, height 80 ± 2 mm |
 
-**B3 procedure (puck centre offset)** — asset created upright (§A step 3):
+**B3 procedure (puck centre pivot)** — asset created upright (§A step 3). Measure the offset as
+below, then move the Motive pivot by it (rather than writing it into the YAML):
 * z: stand the puck upright on the calibrated floor. Its centre is at z = 0.040 m. Read the pivot
   world z `p_z` in Motive. `offset_z = 0.040 − p_z` (negative if the pivot is above the centre).
 * x, y: keep the puck upright and rotate it about its own axis in place (against a fixed V-block or
   corner) through ≥ 4 angles; the pivot traces a circle around the axis. The circle centre minus
   the pivot, expressed in the asset frame, is `(offset_x, offset_y)`. Alternatively put one marker
   exactly at the top-face centre and set the Motive pivot to that marker; then `offset = [0, 0, −(0.040 + marker-centre height above the top face)]`.
-* Write `mocap_puck_offset_local: [offset_x, offset_y, offset_z]`. `[0, 0, 0]` is only correct if
-  the Motive pivot was placed exactly at the geometric centre.
+* Apply `[offset_x, offset_y, offset_z]` to the pivot in Motive. (`mocap_puck_offset_local` still
+  exists as an escape hatch and is added on top of the Motive pivot.)
 
 **B4 procedure (disk mount)** — the training disk is a 200-mm rimless disk, 4 mm thick, whose
 lower-face centre sits at `[0.100, 0.043, 0.000]` m in the gripperStator frame with
@@ -164,10 +193,11 @@ attached (no wobble under a 1.5 kg puck), and that the closed gripper does not t
 `disk_mount_verified: true`. If the real mount differs, **do not edit** `disk_center_offset_gripper`
 / `disk_*_axis_gripper` to match: the policy was trained on this geometry; fix the mount instead.
 
-**Error budget vs. training noise (±10 mm on feature 12):** mocap ≲ 0.5 mm; puck offset (B3)
-≲ 2 mm if done as above; base-asset rotation (B2) ≈ 15 mm per degree; Z1 FK/compliance unknown
-until §E.4. Target total ≤ 5 mm at the disk centre (these targets are engineering guidance, not
-values the policy was validated against).
+**Error budget vs. training noise (±10 mm on feature 12), mocap source:** mocap ≲ 0.5 mm; puck
+pivot (B3) ≲ 2 mm if done as above; disk pivot position ≈ 1:1; disk axis error ≈ 0.7 mm per degree
+(puck at the centre). The B2 asset and Z1 FK no longer enter. (FK source instead: base-asset
+rotation ≈ 15 mm per degree + FK/compliance.) Target total ≤ 5 mm at the disk centre (engineering
+guidance, not values the policy was validated against).
 
 ---
 
@@ -177,7 +207,7 @@ values the policy was validated against).
 |---|---|---|
 | Disk | rimless, radius 0.100 m, thickness 0.004 m, rigidly merged into gripperStator at the mount above | same; no rim (the policy never saw one) |
 | Puck shape | solid cylinder r = 0.050 m, h = 0.080 m, axis ∥ disk normal | same ±2 mm; flat bottom face |
-| Puck mass | U(0.50, 1.50) kg | measured incl. markers, in range → `puck_mass_kg` |
+| Puck mass | U(0.50, 1.50) kg | incl. markers, keep in range (not checked by the script) |
 | Puck–disk friction | μ_s ~ U(0.3, 1.0), μ_d ≤ μ_s | must lie in range. **For first tests use a high-friction pair (μ ≳ 0.8)**: in sim2sim the policy retains the puck 98.8 % for μ > 0.78 vs 7.8 % for μ < 0.54 (`transport_experiment/docs/ALIGNMENT_REPORT.md`). Measure μ_s as tan(θ) of the tilt angle at which the puck starts to slide on the dismounted disk. |
 | Restitution | ~0 | non-bouncy materials |
 | Initial placement | disk centre ±10 mm, resting, zero velocity | the start gate requires `|x_D|,|y_D| ≤ 20 mm` and `|z_D − 0.0425| ≤ 10 mm` (spawn ±10 mm + obs noise 10 mm) |
@@ -198,11 +228,12 @@ the disk.
 | Unitree DDS NIC (CLI arg) | e.g. `enxa0cec819e15f` | reuse retrieval |
 | Motive server / local NIC | `192.168.0.118` / `192.168.0.17`, multicast `239.255.42.99`, ports 1511/1510 | reuse retrieval YAML |
 | Up axis | `auto` | reuse |
-| Rigid bodies streamed | `B2` (9) + puck (new) | §A |
-| Freshness | body 0.25 s (retrieval), **puck 0.10 s (= one HL period)**; age = local receive time | YAML |
+| Rigid bodies streamed | `B2` (9) + puck (new) + disk (new) | §A |
+| Freshness | body 0.25 s (retrieval), **puck and disk 0.10 s (= one HL period)**; age = local receive time | YAML |
+| MuJoCo view | `visualizer_*`; scene `unitree_mujoco_huanyu/unitree_robots/b2wz1/b2wz1_disk_puck.xml` (the sim2sim `xml_path`) | YAML |
 | Time sync | none needed: freshness uses the receiving PC's monotonic clock; no cross-clock timestamps | — |
 | Z1 SDK | `z1_sdk_lib: /home/huanyuguo/Workspace_huanyu/z1_sdk_huanyu/lib` (robot PC); z1 controller running as for retrieval | reuse |
-| Models | high `exported_policies/b2wz1_hl_transport_uan/high_policy.onnx`, WBC `exported_policies/b2wz1_wbc_uan_plb/policy_wbc_uan_transport.onnx` (both sha256-pinned) | this commit |
+| Models | high `exported_policies/b2wz1_hl_transport_uan/high_policy.onnx`, WBC `exported_policies/b2wz1_hl_transport_uan/low_policy.onnx` (both sha256-pinned) | this commit |
 | Python deps | same env as retrieval (`numpy`, `onnxruntime`, `pyyaml`, `unitree_sdk2py`, Z1 SDK) | reuse |
 | Logs | `Log/transport/transport_<date>.csv`, one row per HL step | new |
 
@@ -221,8 +252,10 @@ needed: `base_h`, `puck_D`, `z_err = z_D − 0.042`, `puck_age`, and the gate ve
    `PUCK:UNTRACKED` (or `STALE`) and the gate must not pass.
 3. **Puck centre (B3) — spin test**: with the puck on the disk centre, rotate it by hand about its
    own axis without translating it. `puck_D` x/y must change by < 2 mm. Larger → fix `mocap_puck_offset_local` x/y.
-4. **Disk centre / FK / base calibration (B2, B4, B5)**: mark the physical disk centre. Place the
-   puck there. Expect `puck_D = (0 ± 3, 0 ± 3, 42 ± 3) mm`, i.e. `z_err` within ±3 mm. Repeat at
+4. **Disk centre / disk asset (B4)**: mark the physical disk centre. Place the
+   puck there. Expect `puck_D = (0 ± 3, 0 ± 3, 42 ± 3) mm`, i.e. `z_err` within ±3 mm, and the
+   `disk mocap-FK` line within a few mm / ~1° (a larger constant value = fix the Motive disk pivot/axes
+   by that amount; puck_D[fk] is printed alongside for comparison). Repeat at
    the 4 cardinal points 60 mm from the centre: `puck_D` xy must read (±60, 0)/(0, ±60) mm ± 3 mm.
    At the DEFAULT arm pose the disk frame is (to 3.4°) the robot frame: **x_D = forward,
    y_D = left, z_D = up** (in stator terms x_D = +X, y_D = −Z, z_D = +Y). A wrong sign means a
@@ -326,12 +359,12 @@ the full startup/protection sequence on the robot.
 | Item | Required? | Current status | Action needed | Validation |
 |---|---|---|---|---|
 | Transport WBC on hardware (Step 0) | Yes | Requires on-robot validation | run `b2wz1_wbc_uan.py` with `policy_wbc_uan_transport.onnx`, disk mounted | stands/tracks like the validated WBC; note disk tilt at HIGH |
-| Puck rigid body in Motive | Yes | Requires physical setup | markers on top face, asset created upright, streaming on | Motive tracks it over all EE poses |
-| `mocap_puck_name` / `mocap_puck_id` | Yes | Implemented, requires configuration (null) | enter Motive name and/or ID (≠ B2/9) | init log lists both assets; §E.2 |
-| `mocap_puck_offset_local` | Yes | Requires calibration (null) | §B3 | §E.3 spin test < 2 mm |
-| `puck_mass_kg` | Yes | Implemented, requires configuration (null) | weigh incl. markers, must be 0.5–1.5 kg | config gate |
-| `puck_geometry_verified` | Yes | Requires physical setup (false) | r = 50 ± 2 mm, h = 80 ± 2 mm | calipers |
-| `disk_mount_verified` | Yes | Requires physical setup (false) | §B4 | §E.4 |
+| Puck rigid body in Motive | Yes | Requires physical setup | markers on top face, asset created upright, pivot at the centre (§B3), streaming on | Motive tracks it over all EE poses |
+| `mocap_puck_name` / `mocap_puck_id` | Yes | Implemented, requires configuration (null) | enter Motive name and/or ID (≠ B2/9) | init log lists the assets; §E.2 |
+| Disk rigid body in Motive | Yes (mocap source) | Requires physical setup | §A disk setup: markers rigid with the disk, pivot mid-thickness centre, axes = D | READY-WAIT `disk mocap-FK` small; §E.4 |
+| `mocap_disk_name` / `mocap_disk_id` | Yes (mocap source) | Implemented, requires configuration (null) | enter Motive name and/or ID (≠ B2, ≠ puck) | init log; §E.2 |
+| `puck_geometry_verified` | Yes | Done (true) | r = 50 ± 2 mm, h = 80 ± 2 mm | calipers |
+| `disk_mount_verified` | Yes | Done (true) | §B4 | §E.4 |
 | Puck–disk friction in [0.3, 1.0] (≥ 0.8 first) | Yes | Blocked by missing information (unmeasured) | tilt test | tan θ_slip |
 | B2 rigid body = base_link | Yes | Reused from existing deployment | re-check only if markers moved | §E.4 consistent offset |
 | Motive ground plane / network / NIC | Yes | Reused from existing deployment | none | §E.2 |

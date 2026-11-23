@@ -15,28 +15,39 @@ Control stack (loop shape of deploy/b2wz1_wbc_uan.py, as retrieval)
 UAN is simulation-only (see b2wz1_hl_retrieval_abs_uan_mocap.py): the real arm
 runs the Z1 firmware PD the UAN was fitted against; the gains are audited.
 
-Source of truth
----------------
-Every high-level quantity reproduces
+Source of truth (synchronized 2026-11-20, NO-SETTLE policy)
+------------------------------------------------------------
+    IsaacLab_huanyu/.../direct/b2wz1_hl_transport_UAN/b2wz1_hl_env.py
     unitree_mujoco/simulate_python/deploy_mujoco/b2wz1_hl_transport_uan.py
-(and its bit-exact headless twin transport_experiment/sim.py):
+    (TransportSim2Sim; validated sim2sim of the same checkpoint)
 
   * actor frame (64-D), 3 frames FEATURE-MAJOR = 192-D:
         ang_vel_b(3) proj_gravity_b(3) leg_q_rel(12) arm_q_rel(6)
         leg_qd(12) arm_qd(6) wheel_qd(4) base_vel_ref(3) ee_kp0_ref(3)
-        ee_rot_ref[yaw,pitch,roll](3) executed_residual(6) puck_center_D(3)
-  * residual decode:
+        ee_ypr_ref[yaw,pitch,roll](3) prev_normalized_action(6) puck_center_base(3)
+    prev_normalized_action = clamp(a_(t-1), -1, 1): the policy action of the
+        immediately completed HL step, BEFORE residual scaling / WBC clipping
+        (zero after reset). NOT the executed residual (reward-only now).
+    puck_center_base = R_WB^T (p_puck,W - p_base,W) with the FULL base
+        orientation (roll/pitch/yaw), base = base_link (root link) origin.
+  * residual decode (_decode_hl_action_to_ll_commands):
+        a       = clamp(raw, -1, 1)
         kp0_cmd = clip(kp0_ref + a[0:3] * 0.10 m,  kp0 ranges)
-        rot_cmd = clip(rot_ref + a[3:6] * 45 deg,  yaw/pitch/roll ranges)
-        executed = clip([(kp0_cmd-kp0_ref)/0.10, (rot_cmd-rot_ref)/45deg], -1, 1)
+        ypr_cmd = clip(ypr_ref + a[3:6] * 45 deg,  yaw/pitch/roll ranges)
         base_command = base reference (no learned base residual)
-    During the 0.5-s settle the residual is masked and kp0 is held at the
-    measured EE; after it the EE kp0 is measured again and becomes HIGH.
+    There is NO settle: the residual is active from the first HL step.
   * EE pose -> 9-D WBC keypoints with the training adapter
     build_keypoints_from_kp0_yaw_pitch_roll_plb (yaw/pitch define local +X,
     roll about +X). NOT the retrieval ABS keypoint builder.
-  * reference process: obs_t(ref_t) -> a_t -> execute -> contact check ->
-    advance refs (min-jerk 1.5 s / LOW 2.0 s) -> obs_{t+1}.
+  * reset: HIGH (kp0 AND yaw/pitch/roll, PLB) = gripperStator pose of the
+    reset state (default joints, nominal base pose). That pose is the same in
+    every training episode, so it is a CONSTANT (training_high_kp0 /
+    training_high_ypr, bit-exact from the MuJoCo reset). Its orientation is
+    the EE orientation reference of the whole run. HIGH is held for at least
+    one EE interval; the base reference is taken at reset.
+  * reference process: obs_t(ref_t, a_(t-1)) -> a_t -> execute at ref_t ->
+    contact check -> advance refs (min-jerk 1.5 s / LOW 2.0 s) ->
+    obs_(t+1)(ref_(t+1), a_t).
 
 Real-world substitutions (everything else is identical)
 --------------------------------------------------------
@@ -46,30 +57,27 @@ Real-world substitutions (everything else is identical)
       EE target      = D-pad up/down/left/right = HIGH/LOW/LEFT/RIGHT, with
                        the training minimum-jerk transitions and at least the
                        training minimum hold (4 s) between switches.
-  * puck_center_D, the only non-proprioceptive actor input, is measured by
-    OptiTrack alone (disk_frame_source: "mocap", the default):
-        puck_W           = puck rigid body (Motive pivot = puck geometric centre)
-        (c_D^W, R_D^W)   = disk rigid body (Motive pivot = disk centre at
-                           mid-thickness, axes = training disk frame D)
-        puck_D           = R_D^W^T (puck_W - c_D^W)
-    Both poses come from the same NatNet frame, so neither the B2 asset
-    calibration, the Z1 FK/compliance nor any Z1-vs-mocap time skew enters
-    the observation. The FK disk frame (Z1 FK gripperStator + training mount,
-    what the WBC uses) is still computed every step as a CROSS-CHECK only:
-    READY-WAIT prints and the CSV logs the mocap-vs-FK disk discrepancy.
-    disk_frame_source: "fk" switches the observation back to the FK disk.
+  * puck_center_base, the only non-proprioceptive actor input, is measured by
+    OptiTrack: puck rigid body (Motive pivot = puck geometric centre) and the
+    B2 rigid body (Motive pivot/axes = base_link), BOTH taken from the SAME
+    NatNet frame, so there is no time skew between them:
+        puck_base = R_root^T (puck_W - p_root)
+    The B2 asset calibration therefore enters the actor observation directly
+    (READY gates: mocap-vs-IMU tilt, live-vs-training HIGH EE pose).
   * Puck/disk contact (training: net contact force > 0.05 N) has no sensor.
-    It is replaced by a geometric proxy derived from the training geometry
-    and the actor's training noise: in contact iff the puck centre is over
-    the disk (rho_D <= disk_radius) and at resting height
-    (|z_D - 0.042| <= 0.01 m). Training's 5-step debounce is kept; a drop
-    ends the run in damping protection.
+    It is replaced by a geometric proxy in the disk frame D (disk_frame_source:
+    "fk" = Z1 FK + training mount, or "mocap" = Motive disk asset; the other
+    is a logged cross-check): in contact iff the puck centre is over the disk
+    (rho_D <= disk_radius) and at resting height (|z_D - 0.042| <= 0.01 m).
+    Training's 5-step debounce is kept (no settle mask); a drop ends the run
+    in damping protection. puck_D is NOT an actor input any more.
 
 The actor observes no puck velocity, so no velocity estimate is computed.
 
 Faults -> damping protection (retrieval semantics)
 ---------------------------------------------------
-SELECT, Z1 PASSIVE, invalid/stale/untracked mocap (base, puck or disk), puck drop,
+SELECT, Z1 PASSIVE, invalid/stale/untracked mocap (base, puck or disk when it
+is the D source), base/puck from different NatNet frames, puck drop,
 non-finite observation/action, WBC arm target outside the SDK range, any
 exception. Protection: B2W kp=0/high kd, Z1 holds q with high kd; A then folds
 the legs. The policy never resumes.
@@ -149,8 +157,18 @@ SIM_ONLY_KEYS = (
     "enable_arm_target_rate_limit", "arm_target_rate_limit",
 )
 
-# Where the disk frame of puck_center_D comes from.
+# Keys of the superseded settle / canonical-orientation policy. A YAML that
+# still carries them was written for different observation semantics.
+LEGACY_SEMANTICS_KEYS = (
+    "reset_settle_time_s", "canonical_ee_yaw", "canonical_ee_pitch", "canonical_ee_roll",
+)
+
+# Where the disk frame of puck_D (contact proxy / start gate) comes from.
 DISK_FRAME_SOURCES = ("mocap", "fk")
+# Where the episode HIGH pose comes from:
+#   "training" the reset EE pose of training (constant, bit-exact sim2sim);
+#   "measured" the live EE pose at enable (FK + IMU + mocap base height).
+HIGH_POSE_SOURCES = ("training", "measured")
 # Free joint of the puck in the sim2sim scene MJCF (b2wz1_disk_puck.xml).
 VIZ_PUCK_FREE_JOINT = "transport_puck_freejoint"
 
@@ -220,10 +238,46 @@ def build_keypoints_from_kp0_yaw_pitch_roll_plb(
     return np.concatenate([kp0, kp1, kp2]).astype(np.float32)
 
 
-def minimum_jerk_blend(tau: float) -> float:
-    """Fifth-order smoothstep with zero velocity/acceleration at both ends."""
-    tau = float(np.clip(tau, 0.0, 1.0))
-    return tau**3 * (10.0 - 15.0 * tau + 6.0 * tau**2)
+def minimum_jerk_blend(tau: float) -> np.float32:
+    """Fifth-order smoothstep, float32 exactly as Isaac / sim2sim."""
+    tau = np.float32(min(max(float(tau), 0.0), 1.0))
+    return np.float32(tau ** 3 * (np.float32(10.0) - np.float32(15.0) * tau + np.float32(6.0) * tau ** 2))
+
+
+def ee_ypr_from_axes_plb(v_x: np.ndarray, v_z: np.ndarray) -> np.ndarray:
+    """Isaac _measure_ee_ypr_plb: exact inverse of the keypoint adapter.
+
+    v_x / v_z = EE local +x / +z expressed in PLB. Returns [yaw, pitch, roll].
+    """
+    v_x = np.asarray(v_x, dtype=np.float64).reshape(3)
+    v_z = np.asarray(v_z, dtype=np.float64).reshape(3)
+    yaw = math.atan2(v_x[1], v_x[0])
+    pitch = math.asin(float(np.clip(v_x[2], -1.0, 1.0)))
+    ez = np.array([0.0, 0.0, 1.0])
+    z0 = ez - v_x[2] * v_x
+    z0 = z0 / max(float(np.linalg.norm(z0)), 1.0e-6)
+    y0 = np.cross(z0, v_x)
+    roll = math.atan2(-float(np.dot(v_z, y0)), float(np.dot(v_z, z0)))
+    return np.array([yaw, pitch, roll], dtype=np.float64)
+
+
+def keypoint_axes_rotmat(yaw: float, pitch: float, roll: float) -> np.ndarray:
+    """PLB rotation whose x / z columns are the adapter's local +X / +Z."""
+    kp = build_keypoints_from_kp0_yaw_pitch_roll_plb(np.zeros(3), yaw, pitch, roll, 1.0, 1.0)
+    x = kp[3:6].astype(np.float64)
+    z = kp[6:9].astype(np.float64)
+    x /= max(np.linalg.norm(x), 1e-12)
+    z -= np.dot(z, x) * x
+    z /= max(np.linalg.norm(z), 1e-12)
+    return np.stack([x, np.cross(z, x), z], axis=1)
+
+
+def tilt_angle_deg(gravity_a: np.ndarray, gravity_b: np.ndarray) -> float:
+    """Angle between two projected-gravity vectors (IMU vs mocap base tilt)."""
+    a = np.asarray(gravity_a, dtype=np.float64).reshape(3)
+    b = np.asarray(gravity_b, dtype=np.float64).reshape(3)
+    c = float(np.dot(a, b) / max(np.linalg.norm(a) * np.linalg.norm(b), 1e-12))
+    return math.degrees(math.acos(float(np.clip(c, -1.0, 1.0))))
 
 
 class FeatureHistory:
@@ -283,16 +337,20 @@ def build_transport_hl_obs_frame(
     wheel_vel: np.ndarray,
     base_velocity_ref: np.ndarray,
     ee_kp0_ref: np.ndarray,
-    ee_rot_ref: np.ndarray,
-    executed_action: np.ndarray,
-    puck_pos_disk: np.ndarray,
+    ee_ypr_ref: np.ndarray,
+    prev_normalized_action: np.ndarray,
+    puck_pos_base: np.ndarray,
 ) -> np.ndarray:
-    """The 64-D actor frame, in sim2sim build_hl_obs_frame order."""
+    """The 64-D actor frame, in Isaac _build_hl_obs_frames / sim2sim order.
+
+    prev_normalized_action: clamp(a_(t-1), -1, 1) of the completed HL step.
+    puck_pos_base:          R_WB^T (p_puck - p_base), FULL base orientation.
+    """
     parts = (
         (base_ang_vel_b, 3), (projected_gravity_b, 3), (leg_pos_rel, 12),
         (arm_pos_rel, 6), (leg_vel, 12), (arm_vel, 6), (wheel_vel, 4),
-        (base_velocity_ref, 3), (ee_kp0_ref, 3), (ee_rot_ref, 3),
-        (executed_action, 6), (puck_pos_disk, 3),
+        (base_velocity_ref, 3), (ee_kp0_ref, 3), (ee_ypr_ref, 3),
+        (prev_normalized_action, 6), (puck_pos_base, 3),
     )
     obs = np.concatenate(
         [np.asarray(v, dtype=np.float32).reshape(n) for v, n in parts], dtype=np.float32
@@ -426,8 +484,8 @@ class PuckContactMonitor:
     """Geometric stand-in for the training puck/disk contact-force detector.
 
     Training: contact = net disk/puck force > 0.05 N; puck_drop after
-    `drop_steps` consecutive ACTIVE HL steps without contact; the settle
-    interval clears the counter. A puck lying on the disk has its centre over
+    `drop_steps` consecutive HL steps without contact (no settle phase: every
+    completed HL step counts). A puck lying on the disk has its centre over
     the disk at the resting height, so the proxy is
 
         contact  <=>  rho_D <= disk_radius  and  |z_D - rest| <= z_tolerance
@@ -458,10 +516,10 @@ class PuckContactMonitor:
         rho = float(np.hypot(p[0], p[1]))
         return rho <= self.disk_radius and abs(float(p[2]) - self.rest_height) <= self.z_tolerance
 
-    def update(self, puck_d: Optional[np.ndarray], settling: bool) -> Tuple[bool, int, bool]:
+    def update(self, puck_d: Optional[np.ndarray]) -> Tuple[bool, int, bool]:
         """One completed HL transition -> (contact, no_contact_steps, drop)."""
         contact = self.in_contact(puck_d)
-        if settling or contact:
+        if contact:
             self.no_contact_steps = 0
         else:
             self.no_contact_steps += 1
@@ -492,11 +550,19 @@ def puck_start_gate(
 
 
 class TransportTask:
-    """Reference process + residual decoder of the transport sim2sim.
+    """Reference process + residual decoder of the NO-SETTLE transport env.
 
-    Pure state machine, no hardware. Arithmetic and ordering are those of
-    b2wz1_hl_transport_uan.py; only the SOURCE of the references differs
-    (operator instead of the training sampler).
+    Pure state machine, no hardware. Arithmetic (float32) and ordering are
+    those of Isaac B2WZ1HLTransportUANEnv and the sim2sim TransportSim2Sim
+    (TransportReferenceProcess + decode_hl_action); only the SOURCE of the
+    references differs (operator instead of the training sampler).
+
+    Action bookkeeping per HL step (Isaac _pre_physics_step):
+        raw_action        policy output as received
+        normalized_action clamp(raw, -1, 1) = a_t; decoder input AND the
+                          previous-action term of the NEXT observation
+        executed_action   ((cmd - ref) / scale).clamp(-1, 1) after WBC
+                          absolute clipping; reward/diagnostics only
     """
 
     def __init__(self, cfg: Dict[str, Any], hl_control_dt: float) -> None:
@@ -523,9 +589,8 @@ class TransportTask:
         self.canonical_positions = f32("canonical_ee_positions")
         if self.canonical_positions.shape != (4, 3):
             raise ValueError("canonical_ee_positions must have shape [4,3].")
-        self.canonical_yaw = float(cfg["canonical_ee_yaw"])
-        self.canonical_pitch = float(cfg["canonical_ee_pitch"])
-        self.canonical_roll = float(cfg["canonical_ee_roll"])
+        if np.any(self.canonical_positions < self.pos_min) or np.any(self.canonical_positions > self.pos_max):
+            raise ValueError("canonical_ee_positions must lie inside the WBC kp0 bounds.")
         self.base_ref_ranges = f32("base_ref_ranges")
         self.base_cmd_scale = f32("base_cmd_scale").reshape(3)
         if self.base_ref_ranges.shape != (3, 2):
@@ -536,24 +601,20 @@ class TransportTask:
             raise ValueError("base_ref_ranges must stay inside frozen-WBC base bounds.")
 
         dt = self.hl_control_dt
-        self.settle_steps = int(round(float(cfg["reset_settle_time_s"]) / dt))
         self.fast_steps = int(round(float(cfg["ee_fast_transition_time_s"]) / dt))
         self.low_steps = int(round(float(cfg["ee_low_transition_time_s"]) / dt))
         self.min_hold_steps = int(round(float(cfg["ee_ref_resample_time_range_s"][0]) / dt))
-        if min(self.settle_steps, self.fast_steps, self.low_steps, self.min_hold_steps) <= 0:
-            raise ValueError("Settle / transition / hold times must be positive.")
+        if min(self.fast_steps, self.low_steps, self.min_hold_steps) <= 0:
+            raise ValueError("Transition / hold times must be positive.")
         if max(self.fast_steps, self.low_steps) > self.min_hold_steps:
             raise ValueError("EE transitions must not exceed the minimum EE hold period.")
-        self.reset(self.canonical_positions[0])
+        self.reset(self.canonical_positions[0], np.zeros(3, dtype=np.float32), np.zeros(3, dtype=np.float32))
 
     # ------------------------------------------------------------------
     @property
-    def settling(self) -> bool:
-        return self.settle_steps_remaining > 0
-
-    @property
     def rot_ref(self) -> np.ndarray:
-        return np.array([self.ee_yaw_ref, self.ee_pitch_ref, self.ee_roll_ref], dtype=np.float32)
+        """EE orientation reference [yaw, pitch, roll] (constant per run)."""
+        return self.ee_ypr_ref.copy()
 
     def _keypoints(self, kp0: np.ndarray, rot: np.ndarray) -> np.ndarray:
         return build_keypoints_from_kp0_yaw_pitch_roll_plb(
@@ -561,39 +622,43 @@ class TransportTask:
         )
 
     def _sync_commands_from_references(self) -> None:
-        """Zero-residual path (sim2sim sync_ll_commands_from_references)."""
+        """Zero-residual path (Isaac _sync_ll_commands_from_references; reset only)."""
         self.base_command = self.base_velocity_ref.copy()
         self.kp0_cmd = self.ee_kp0_ref.copy()
-        self.rot_cmd = self.rot_ref.copy()
+        self.rot_cmd = self.ee_ypr_ref.copy()
         self.ee_cmd_plb = self._keypoints(self.kp0_cmd, self.rot_cmd)
 
-    def _set_high_from_measured(self, measured_kp0: np.ndarray) -> None:
-        measured = np.asarray(measured_kp0, dtype=np.float32).reshape(3).copy()
-        if not np.isfinite(measured).all():
-            raise FloatingPointError(f"Non-finite measured EE kp0: {measured}")
-        self.episode_high_kp0 = measured.copy()
-        self.ee_kp0_ref = measured.copy()
+    def reset(self, high_kp0: np.ndarray, high_ypr: np.ndarray, operator_base_ref: np.ndarray) -> None:
+        """Isaac _reset_command_references(high_kp0, high_ypr) for one env.
+
+        HIGH (position AND orientation) is clipped to the WBC command bounds,
+        becomes the first EE target (no transition) and its orientation the
+        reference of the whole run. The base reference is taken NOW (Isaac
+        samples it at reset). The previous action is zero.
+        """
+        kp0 = np.asarray(high_kp0, dtype=np.float32).reshape(3)
+        ypr = np.asarray(high_ypr, dtype=np.float32).reshape(3)
+        if not (np.isfinite(kp0).all() and np.isfinite(ypr).all()):
+            raise FloatingPointError(f"Non-finite HIGH pose: kp0={kp0} ypr={ypr}")
+        kp0 = np.maximum(np.minimum(kp0, self.pos_max), self.pos_min).astype(np.float32)
+        ypr = np.maximum(np.minimum(ypr, self.rot_max), self.rot_min).astype(np.float32)
+        self.episode_high_kp0 = kp0.copy()
+        self.ee_kp0_ref = kp0.copy()
+        self.ee_ypr_ref = ypr.copy()
         self.current_target = EE_TARGET_HIGH
-        self.transition_start = measured.copy()
-        self.transition_target = measured.copy()
+        self.transition_start = kp0.copy()
+        self.transition_target = kp0.copy()
         self.transition_step = 0
         self.transition_total = 1
-        self._sync_commands_from_references()
-
-    def reset(self, measured_kp0: np.ndarray) -> None:
-        """sim2sim reset_command_references + set_episode_high_from_measured_ee."""
-        self.base_velocity_ref = np.zeros(3, dtype=np.float32)
-        self.ee_yaw_ref = self.canonical_yaw
-        self.ee_pitch_ref = self.canonical_pitch
-        self.ee_roll_ref = self.canonical_roll
-        self.settle_steps_remaining = self.settle_steps
         self.steps_since_switch = 0
         self.pending_target: Optional[int] = None
         self.last_event = "reset"
         self.raw_action = np.zeros(6, dtype=np.float32)
-        self.effective_action = np.zeros(6, dtype=np.float32)
+        self.normalized_action = np.zeros(6, dtype=np.float32)
         self.executed_action = np.zeros(6, dtype=np.float32)
-        self._set_high_from_measured(measured_kp0)
+        self.raw_out_of_range_count = 0
+        self.base_velocity_ref = self.clip_base_reference(operator_base_ref)
+        self._sync_commands_from_references()
 
     def request_target(self, index: int) -> None:
         index = int(index)
@@ -608,7 +673,11 @@ class TransportTask:
         return np.clip(v, self.base_ref_ranges[:, 0], self.base_ref_ranges[:, 1]).astype(np.float32)
 
     def _start_transition(self, index: int) -> None:
-        """sim2sim sample_ee_pose_reference for an operator-chosen target."""
+        """Isaac _sample_ee_pose_reference for an operator-chosen target.
+
+        Starts at the reference last exposed to the actor (no jump); only the
+        POSITION moves, the orientation reference is the episode HIGH one.
+        """
         self.current_target = int(index)
         target = (
             self.episode_high_kp0.copy()
@@ -619,43 +688,24 @@ class TransportTask:
         self.transition_target = target.astype(np.float32)
         self.transition_step = 0
         self.transition_total = self.low_steps if index == EE_TARGET_LOW else self.fast_steps
-        self.ee_kp0_ref = self.transition_start.copy()
-        self.ee_yaw_ref = self.canonical_yaw
-        self.ee_pitch_ref = self.canonical_pitch
-        self.ee_roll_ref = self.canonical_roll
         self.steps_since_switch = 0
 
     def _advance_interpolation(self) -> None:
         total = max(int(self.transition_total), 1)
         self.transition_step = min(int(self.transition_step) + 1, total)
-        blend = minimum_jerk_blend(float(self.transition_step) / float(total))
+        blend = minimum_jerk_blend(np.float32(self.transition_step) / np.float32(total))
         self.ee_kp0_ref = (
             self.transition_start + blend * (self.transition_target - self.transition_start)
         ).astype(np.float32)
 
-    def advance(
-        self, measure_kp0: Callable[[], np.ndarray], operator_base_ref: np.ndarray
-    ) -> str:
-        """sim2sim advance_command_references_after_transition.
+    def advance(self, operator_base_ref: np.ndarray) -> str:
+        """Isaac _advance_command_references_for_next_step.
 
         Called after a completed 10-Hz transition and before the next actor
-        observation. Returns a short event string for logging.
+        observation (never right after reset). Order as Isaac: interpolation
+        step, base reference, then a new EE target (starting at the current
+        reference). Returns a short event string for logging.
         """
-        if self.settling:
-            self.settle_steps_remaining -= 1
-            if self.settle_steps_remaining > 0:
-                self.last_event = "settle"
-                return self.last_event
-            # Settle complete: HIGH = live settled EE kp0, then the first
-            # base reference and the first EE target (pending or HIGH).
-            self._set_high_from_measured(measure_kp0())
-            self.base_velocity_ref = self.clip_base_reference(operator_base_ref)
-            target = EE_TARGET_HIGH if self.pending_target is None else self.pending_target
-            self.pending_target = None
-            self._start_transition(target)
-            self.last_event = f"settled -> {EE_TARGET_NAMES[target]}"
-            return self.last_event
-
         self.steps_since_switch += 1
         self._advance_interpolation()
         self.base_velocity_ref = self.clip_base_reference(operator_base_ref)
@@ -675,34 +725,32 @@ class TransportTask:
         return self.last_event
 
     def decode(self, action: np.ndarray) -> None:
-        """sim2sim decode_hl_action, line for line."""
-        action = np.asarray(action, dtype=np.float32).reshape(6,)
-        if not np.isfinite(action).all():
-            raise FloatingPointError(f"Non-finite high-level action: {action}")
-        self.raw_action = np.clip(action, -1.0, 1.0).astype(np.float32)
-        self.effective_action = self.raw_action.copy()
-        if self.settling:
-            self.effective_action[:] = 0.0
+        """Isaac _pre_physics_step + _decode_hl_action_to_ll_commands.
+
+        Decoded against the CURRENT references; no reference update here.
+        """
+        raw = np.asarray(action, dtype=np.float32).reshape(6,)
+        if not np.isfinite(raw).all():
+            raise FloatingPointError(f"Non-finite high-level action: {raw}")
+        if np.any(np.abs(raw) > 1.0 + 1e-4):
+            self.raw_out_of_range_count += 1
+        a = np.clip(raw, np.float32(-1.0), np.float32(1.0)).astype(np.float32)
+        self.raw_action = raw.copy()
+        self.normalized_action = a
 
         self.base_command = self.base_velocity_ref.copy()
 
-        pos_raw = self.ee_kp0_ref + self.effective_action[0:3] * self.pos_scale
-        kp0_cmd = np.clip(pos_raw, self.pos_min, self.pos_max).astype(np.float32)
-        if self.settling:
-            kp0_cmd = self.ee_kp0_ref.copy()
+        pos_ref = self.ee_kp0_ref.astype(np.float32)
+        rot_ref = self.ee_ypr_ref.astype(np.float32)
+        pos_raw = (pos_ref + (a[0:3] * self.pos_scale).astype(np.float32)).astype(np.float32)
+        rot_raw = (rot_ref + (a[3:6] * self.rot_scale).astype(np.float32)).astype(np.float32)
+        kp0_cmd = np.maximum(np.minimum(pos_raw, self.pos_max), self.pos_min).astype(np.float32)
+        rot_cmd = np.maximum(np.minimum(rot_raw, self.rot_max), self.rot_min).astype(np.float32)
 
-        rot_ref = self.rot_ref
-        rot_raw = rot_ref + self.effective_action[3:6] * self.rot_scale
-        rot_cmd = np.clip(rot_raw, self.rot_min, self.rot_max).astype(np.float32)
-
-        self.executed_action = np.clip(
-            np.concatenate([
-                (kp0_cmd - self.ee_kp0_ref) / self.pos_scale,
-                (rot_cmd - rot_ref) / self.rot_scale,
-            ]),
-            -1.0,
-            1.0,
-        ).astype(np.float32)
+        self.executed_action = np.concatenate([
+            np.clip((kp0_cmd - pos_ref) / self.pos_scale, -1.0, 1.0),
+            np.clip((rot_cmd - rot_ref) / self.rot_scale, -1.0, 1.0),
+        ]).astype(np.float32)
         self.kp0_cmd = kp0_cmd
         self.rot_cmd = rot_cmd
         self.ee_cmd_plb = self._keypoints(kp0_cmd, rot_cmd)
@@ -718,6 +766,41 @@ def validate_transport_setup(cfg: Dict[str, Any]) -> List[str]:
     for key in SIM_ONLY_KEYS:
         if key in cfg:
             problems.append(f"{key}: simulation-only key must not be in the real config")
+    for key in LEGACY_SEMANTICS_KEYS:
+        if key in cfg:
+            problems.append(
+                f"{key}: belongs to the superseded settle/canonical-orientation policy; "
+                "the no-settle policy takes HIGH from training_high_kp0/_ypr"
+            )
+    sha = str(cfg.get("high_policy_sha256") or "").strip().lower()
+    if sha and sha in {str(s).strip().lower() for s in cfg.get("legacy_high_policy_sha256") or []}:
+        problems.append(
+            "high_policy_sha256: pins a LEGACY transport policy (settle / disk-frame puck / "
+            "executed residual); its 192-D input means something else here"
+        )
+
+    for key in ("training_high_kp0", "training_high_ypr"):
+        try:
+            v = np.asarray(cfg.get(key), dtype=np.float64).reshape(3)
+            if not np.isfinite(v).all():
+                raise ValueError
+        except Exception:  # noqa: BLE001
+            problems.append(f"{key}: must be 3 finite numbers (MuJoCo/Isaac reset EE pose)")
+    if str(cfg.get("high_pose_source", "")).strip().lower() not in HIGH_POSE_SOURCES:
+        problems.append(f"high_pose_source: must be one of {HIGH_POSE_SOURCES}")
+    for key in ("high_pose_max_deviation_m", "high_pose_max_deviation_deg"):
+        try:
+            if not float(cfg.get(key)) > 0.0:
+                raise ValueError
+        except Exception:  # noqa: BLE001
+            problems.append(f"{key}: must be a positive number")
+    tilt = cfg.get("mocap_imu_max_tilt_deg")
+    if tilt is not None:
+        try:
+            if not float(tilt) > 0.0:
+                raise ValueError
+        except Exception:  # noqa: BLE001
+            problems.append("mocap_imu_max_tilt_deg: must be positive (or null to disable)")
 
     source = str(cfg.get("disk_frame_source", "mocap")).strip().lower()
     if source not in DISK_FRAME_SOURCES:
@@ -788,10 +871,14 @@ class TransportMocapPerception(MocapPerceptionSystem):
     optional (cross-check / visualisation only) and is dropped with a warning
     if Motive does not stream it.
 
+    Every body of one snapshot is sampled from the SAME NatNet frame (see
+    _sample_in), so puck position_base pairs poses of one capture instant.
+
     Snapshot:
-        body         validated base_link pose (mocap root)
+        body         validated base_link pose (mocap root), frame_number
         base_height  root z - ground_z
-        puck         puck centre: position_world, quat_wxyz, position_base, age_ms
+        puck         puck centre: position_world, quat_wxyz, position_base
+                     (= R_root^T (puck_W - p_root): the ACTOR input), age_ms
         disk         disk centre pose: position_world, quat_wxyz, position_base,
                      age_ms (only if a disk body is configured)
         mocap        frame number, received / parse-error / SKIPPED frame counts
@@ -866,15 +953,39 @@ class TransportMocapPerception(MocapPerceptionSystem):
             self._log("[WARN] currently UNTRACKED: " + ", ".join(untracked))
         self._initialized = True
 
+    def _sample_in(
+        self, frame: Any, selector: MocapBodySelector, now: float
+    ) -> Tuple[Optional[Any], str, Optional[float]]:
+        """Parent _sample() classification, but on ONE pinned NatNet frame.
+
+        The parent re-reads the client's latest frame per body, so the B2 and
+        the puck can come from two consecutive frames. puck_center_base
+        combines both poses, hence every body of a snapshot is taken from the
+        same frame (one capture instant, one receive time).
+        """
+        rb_id = self._resolved.get(selector.label)
+        if rb_id is None:
+            return None, "NOT_CONFIGURED", None
+        rb = None if frame is None else frame.rigid_bodies.get(int(rb_id))
+        if rb is None:
+            return None, "NOT_IN_STREAM", None
+        age_ms = 1000.0 * rb.age_s(now)
+        if not rb.tracking_valid:
+            return None, "UNTRACKED", age_ms
+        if rb.age_s(now) > selector.max_age_s:
+            return None, "STALE", age_ms
+        return rb, "OK", age_ms
+
     def _world_channel(
         self,
+        frame: Any,
         selector: MocapBodySelector,
         p_root_w: Optional[np.ndarray],
         q_root_w: Optional[np.ndarray],
         now: float,
     ) -> Dict[str, Any]:
         """World pose of one asset (+ base-frame position when the root is known)."""
-        rb, reason, age_ms = self._sample(selector, now)
+        rb, reason, age_ms = self._sample_in(frame, selector, now)
         if rb is None:
             state = self._invalid_channel(reason, age_ms)
             state.update(position_world=None, quat_wxyz=None, position_base=None, frame_number=None)
@@ -898,8 +1009,8 @@ class TransportMocapPerception(MocapPerceptionSystem):
 
     def get_latest_snapshot(self, projected_gravity_b: Any = None) -> Dict[str, Any]:
         now = time.monotonic()
-        frame = self.client.latest_frame()
-        body_rb, body_reason, body_age_ms = self._sample(self.body, now)
+        frame = self.client.latest_frame()  # pinned: every body below comes from it
+        body_rb, body_reason, body_age_ms = self._sample_in(frame, self.body, now)
         mocap_meta = {
             "frame_number": int(frame.frame_number) if frame is not None else None,
             "frames_received": self.client.frame_count,
@@ -923,6 +1034,7 @@ class TransportMocapPerception(MocapPerceptionSystem):
                 "position_world": body_rb.pos.tolist(),
                 "root_position_world": p_root_w.tolist(),
                 "root_quat_wxyz": q_root_w.tolist(),
+                "frame_number": int(body_rb.frame_number),
             }
             height_state = {
                 "valid": height_valid,
@@ -931,7 +1043,7 @@ class TransportMocapPerception(MocapPerceptionSystem):
                 "age_ms": body_age_ms,
             }
 
-        puck_state = self._world_channel(self.puck_body, p_root_w, q_root_w, now)
+        puck_state = self._world_channel(frame, self.puck_body, p_root_w, q_root_w, now)
         snap: Dict[str, Any] = {
             "body": body_state,
             "base_height": height_state,
@@ -940,7 +1052,7 @@ class TransportMocapPerception(MocapPerceptionSystem):
         }
         valid = bool(height_state["valid"] and puck_state["valid"])
         if self.disk_body is not None:
-            disk_state = self._world_channel(self.disk_body, p_root_w, q_root_w, now)
+            disk_state = self._world_channel(frame, self.disk_body, p_root_w, q_root_w, now)
             snap["disk"] = disk_state
             if self.disk_required:
                 valid = valid and bool(disk_state["valid"])
@@ -983,7 +1095,6 @@ class B2WZ1TransportMocapController:
             raise ValueError(
                 "Transport hardware setup is incomplete -- refusing to start:\n  - "
                 + "\n  - ".join(problems)
-                + "\nSee deploy/TRANSPORT_SIM2REAL_SETUP.md."
             )
 
         self._configure_timing()
@@ -1140,6 +1251,18 @@ class B2WZ1TransportMocapController:
             z_tolerance=self.puck_obs_noise,
             drop_steps=int(cfg["puck_drop_no_contact_steps"]),
         )
+
+        # Episode HIGH pose (see HIGH_POSE_SOURCES) and the READY gates that
+        # check the live robot against it.
+        self.training_high_kp0 = np.asarray(cfg["training_high_kp0"], dtype=np.float32).reshape(3)
+        self.training_high_ypr = np.asarray(cfg["training_high_ypr"], dtype=np.float32).reshape(3)
+        self.high_pose_source = str(cfg.get("high_pose_source", "training")).strip().lower()
+        if self.high_pose_source not in HIGH_POSE_SOURCES:
+            raise ValueError(f"high_pose_source must be one of {HIGH_POSE_SOURCES}.")
+        self.high_pose_max_dev_m = float(cfg["high_pose_max_deviation_m"])
+        self.high_pose_max_dev_rad = math.radians(float(cfg["high_pose_max_deviation_deg"]))
+        tilt = cfg.get("mocap_imu_max_tilt_deg")
+        self.mocap_imu_max_tilt_deg = None if tilt is None else float(tilt)
 
         self.command_scale = np.asarray(cfg["command_scale"], dtype=np.float32).reshape(3)
         self.command_deadband_lin = float(cfg["command_deadband_lin"])
@@ -1332,7 +1455,18 @@ class B2WZ1TransportMocapController:
         self.ll_tick = 0
         self.hl_tick = 0
         self.last_snapshot: Optional[Dict[str, Any]] = None
-        # puck_D fed to the actor, and both candidate sources (mocap / FK disk).
+        # Actor input: puck centre in the full base_link frame (mocap B2 + puck,
+        # same NatNet frame). None = unavailable -> perception fault.
+        self.last_puck_base: Optional[np.ndarray] = None
+        # Base tilt disagreement IMU vs mocap B2 asset [deg] (None = n/a).
+        self.last_tilt_deg: Optional[float] = None
+        # Diagnostics: inference latency [ms] and the measured HIGH deviation.
+        self.hl_infer_ms = 0.0
+        self.ll_infer_ms = 0.0
+        self.hl_infer_ms_max = 0.0
+        self.ll_infer_ms_max = 0.0
+        self.last_high_deviation: Optional[Tuple[float, float]] = None
+        # puck_D (contact proxy / start gate), and both candidate sources.
         self.last_puck_d: Optional[np.ndarray] = None
         self.last_puck_d_mocap: Optional[np.ndarray] = None
         self.last_puck_d_fk: Optional[np.ndarray] = None
@@ -1405,11 +1539,29 @@ class B2WZ1TransportMocapController:
         puck = snap.get("puck") or {}
         disk = snap.get("disk") or {}
         body = snap.get("body") or {}
+        self.last_puck_base = None
+        self.last_tilt_deg = None
         self.last_puck_d = None
         self.last_puck_d_mocap = None
         self.last_puck_d_fk = None
         self.last_disk_check = None
         self.last_asset_fix = None
+
+        # ACTOR INPUT: puck centre in the full base_link frame,
+        #   R_root^T (puck_W - p_root), computed by the perception from the
+        #   B2 and puck poses of one NatNet frame (Isaac _puck_center_pos_base).
+        if puck.get("valid") and body.get("valid") and puck.get("position_base") is not None:
+            pb = np.asarray(puck["position_base"], dtype=np.float32).reshape(3)
+            if np.isfinite(pb).all():
+                self.last_puck_base = pb
+        # Cross-check of the mocap base orientation (used for puck_base) with
+        # the IMU (used for projected gravity): only gravity direction, yaw
+        # is arbitrary between the two.
+        if body.get("valid") and body.get("root_quat_wxyz") is not None:
+            R_root = q_to_mat(np.asarray(body["root_quat_wxyz"], dtype=np.float64))
+            self.last_tilt_deg = tilt_angle_deg(
+                R_root.T @ np.array([0.0, 0.0, -1.0]), self.projected_gravity_b
+            )
 
         # Mocap disk frame (world).
         disk_pos_w = disk_rot_w = None
@@ -1464,6 +1616,13 @@ class B2WZ1TransportMocapController:
         reasons = []
         if self.base_height is None:
             reasons.append("BASE_HEIGHT:" + str((snap.get("base_height") or {}).get("reason")))
+        puck = snap.get("puck") or {}
+        body = snap.get("body") or {}
+        if self.last_puck_base is None and self.base_height is not None and puck.get("valid"):
+            reasons.append("PUCK_BASE:NON_FINITE")
+        fn_body, fn_puck = body.get("frame_number"), puck.get("frame_number")
+        if fn_body is not None and fn_puck is not None and int(fn_body) != int(fn_puck):
+            reasons.append(f"FRAME_MISMATCH:body={fn_body},puck={fn_puck}")
         if self.last_puck_d is None:
             puck = snap.get("puck") or {}
             disk = snap.get("disk") or {}
@@ -1513,21 +1672,41 @@ class B2WZ1TransportMocapController:
             f"({axis[0]:+.2f}, {axis[1]:+.2f}, {axis[2]:+.2f})\n             now: {axes}"
         )
 
-    def measure_ee_kp0_plb(self) -> np.ndarray:
-        """Live gripperStator kp0 in PLB (IMU roll/pitch/yaw, mocap height)."""
+    def measure_ee_pose_plb(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Live gripperStator pose in PLB: (kp0, [yaw, pitch, roll]).
+
+        Isaac _measure_ee_kp0_plb + _measure_ee_ypr_plb on the robot: Z1 FK,
+        IMU roll/pitch/yaw, mocap base height. The EE axes come back out of
+        the measured keypoints (kp1 - kp0 = dx * local +X, kp2 - kp0 = dz *
+        local +Z), then the exact inverse of the keypoint adapter.
+        """
         from utils.z1_helper import compute_ee_current_kp_plb  # noqa: PLC0415
 
         if self.base_height is None:
             raise RuntimeError("Base height is unknown: no valid mocap body frame.")
-        kps = compute_ee_current_kp_plb(
+        kps = np.asarray(compute_ee_current_kp_plb(
             base_quat_wxyz=self.base_quat_wxyz,
             base_height=float(self.base_height),
             ground_z=self.ground_z,
             z1_adapter=self.z1,
             kp_dx=self.ee_kp_dx,
             kp_dz=self.ee_kp_dz,
-        )
-        return np.asarray(kps[0:3], dtype=np.float32)
+        ), dtype=np.float64).reshape(3, 3)
+        v_x = (kps[1] - kps[0]) / self.ee_kp_dx
+        v_z = (kps[2] - kps[0]) / self.ee_kp_dz
+        return kps[0].astype(np.float32), ee_ypr_from_axes_plb(v_x, v_z).astype(np.float32)
+
+    def measure_ee_kp0_plb(self) -> np.ndarray:
+        return self.measure_ee_pose_plb()[0]
+
+    def high_pose_deviation(self) -> Tuple[float, float, np.ndarray, np.ndarray]:
+        """Live EE pose vs the training HIGH: (|dpos| m, rotation angle rad, kp0, ypr)."""
+        kp0, ypr = self.measure_ee_pose_plb()
+        dpos = float(np.linalg.norm(kp0.astype(np.float64) - self.training_high_kp0))
+        R_live = keypoint_axes_rotmat(*ypr)
+        R_train = keypoint_axes_rotmat(*self.training_high_ypr)
+        c = (np.trace(R_live.T @ R_train) - 1.0) * 0.5
+        return dpos, math.acos(float(np.clip(c, -1.0, 1.0))), kp0, ypr
 
     # ------------------------------------------------------------------
     # Operator commands
@@ -1562,7 +1741,8 @@ class B2WZ1TransportMocapController:
     # ------------------------------------------------------------------
 
     def build_hl_obs_frame(self) -> np.ndarray:
-        if self.last_puck_d is None:
+        """Actor frame at the CURRENT state, ref_t and a_(t-1) (Isaac order)."""
+        if self.last_puck_base is None:
             raise RuntimeError("Refusing to build the actor observation without a valid puck.")
         return build_transport_hl_obs_frame(
             base_ang_vel_b=self.base_ang_vel_b,
@@ -1574,19 +1754,35 @@ class B2WZ1TransportMocapController:
             wheel_vel=self.b2w_joint_vel[12:16],
             base_velocity_ref=self.task.base_velocity_ref,
             ee_kp0_ref=self.task.ee_kp0_ref,
-            ee_rot_ref=self.task.rot_ref,
-            executed_action=self.task.executed_action,
-            puck_pos_disk=self.last_puck_d,
+            ee_ypr_ref=self.task.ee_ypr_ref,
+            prev_normalized_action=self.task.normalized_action,
+            puck_pos_base=self.last_puck_base,
         )
 
     def run_high_level_policy(self, *, append_frame: bool) -> None:
+        """obs_t -> a_t -> decode against ref_t (Isaac step / _pre_physics_step).
+
+        The history gets exactly one frame per HL step, built BEFORE decode,
+        so its previous-action term is a_(t-1) (never shifted twice).
+        """
         if append_frame:
             self.hl_history.append(self.build_hl_obs_frame())
         obs = self.hl_history.flat()
+        if obs.shape != (self.hl_obs_dim,) or not np.isfinite(obs).all():
+            raise FloatingPointError(f"Invalid actor observation (shape {obs.shape}).")
+        t0 = time.perf_counter()
         action = self.high_session.run(
             [self.high_output_name], {self.high_input_name: obs[None, :]}
         )[0][0].astype(np.float32)
-        self.task.decode(action)
+        self.hl_infer_ms = 1e3 * (time.perf_counter() - t0)
+        self.hl_infer_ms_max = max(self.hl_infer_ms_max, self.hl_infer_ms)
+        if action.shape != (self.hl_action_dim,):
+            raise RuntimeError(f"HL policy returned shape {action.shape}.")
+        warned = self.task.raw_out_of_range_count > 0
+        self.task.decode(action)  # raises on non-finite; clamps exactly as Isaac
+        if self.task.raw_out_of_range_count > 0 and not warned:
+            print(f"[TRANSPORT][WARN] HL output outside [-1,1] ({np.round(action, 4)}); clamped as in "
+                  "training, but the Beta export should already be inside -- check the checkpoint.")
         self.hl_tick += 1
 
     # ------------------------------------------------------------------
@@ -1610,9 +1806,12 @@ class B2WZ1TransportMocapController:
     def run_low_level_policy(self) -> None:
         self.ll_history.append(self.build_ll_obs_frame())
         obs = self.ll_history.flat()
+        t0 = time.perf_counter()
         action = self.low_session.run(
             [self.low_output_name], {self.low_input_name: obs[None, :]}
         )[0][0].astype(np.float32)
+        self.ll_infer_ms = 1e3 * (time.perf_counter() - t0)
+        self.ll_infer_ms_max = max(self.ll_infer_ms_max, self.ll_infer_ms)
         if action.shape != (self.ll_action_dim,) or not np.isfinite(action).all():
             raise FloatingPointError(f"Invalid WBC action: {action}")
         self.last_ll_action[:] = action
@@ -1648,12 +1847,32 @@ class B2WZ1TransportMocapController:
             self.last_puck_d, self.puck_spawn_xy, self.puck_spawn_clearance,
             self.puck_obs_noise, self.puck_rest_height,
         )
+        gates = [] if ok else [gate]
+        # The live EE pose must be close to the training HIGH (= reset pose):
+        # a large error means a wrong arm pose, base height or FK, which would
+        # also corrupt every EE observation of the run.
+        dpos, dang, _, _ = self.high_pose_deviation()
+        self.last_high_deviation = (dpos, dang)
+        if not (dpos <= self.high_pose_max_dev_m and dang <= self.high_pose_max_dev_rad):
+            gates.append(f"EE vs training HIGH: {dpos * 1e3:.1f}mm/{math.degrees(dang):.1f}deg > "
+                         f"{self.high_pose_max_dev_m * 1e3:.0f}mm/{math.degrees(self.high_pose_max_dev_rad):.0f}deg")
+        # The mocap B2 orientation rotates puck_base: it must agree with the IMU.
+        if self.mocap_imu_max_tilt_deg is not None and (
+            self.last_tilt_deg is None or not self.last_tilt_deg <= self.mocap_imu_max_tilt_deg
+        ):
+            gates.append(f"mocap-vs-IMU tilt {self.last_tilt_deg} deg > {self.mocap_imu_max_tilt_deg} deg")
+        ok = not gates
+        gate = "OK" if ok else "; ".join(gates)
         d = self.last_puck_d
+        pb = self.last_puck_base
         disk_age = ((snap.get("disk") or {}).get("age_ms"))
         status = (
-            f"base_h={self.base_height:.4f}m | puck_D[{self.disk_frame_source}]="
+            f"base_h={self.base_height:.4f}m | puck_base=({pb[0]:+.4f},{pb[1]:+.4f},{pb[2]:+.4f}) "
+            f"| puck_D[{self.disk_frame_source}]="
             f"({d[0]:+.4f},{d[1]:+.4f},{d[2]:+.4f}) "
             f"| z_err={d[2] - self.puck_rest_height:+.4f}m | "
+            f"EE-HIGH={dpos * 1e3:.1f}mm/{math.degrees(dang):.2f}deg "
+            f"tilt(mocap-IMU)={self.last_tilt_deg if self.last_tilt_deg is None else round(self.last_tilt_deg, 2)}deg | "
             f"puck_age={((snap.get('puck') or {}).get('age_ms') or 0.0):.1f}ms"
             + (f" disk_age={disk_age:.1f}ms" if disk_age is not None else "")
             + f" skipped={(snap.get('mocap') or {}).get('frames_skipped', 0)}"
@@ -1663,13 +1882,18 @@ class B2WZ1TransportMocapController:
         return ok, status
 
     def initialize_policy_state_and_history(self) -> None:
-        """sim2sim reset_episode: measured HIGH hold, zero action, filled histories."""
+        """Isaac _reset_idx / sim2sim reset(): HIGH first, base reference now,
+        zero previous action, both histories filled with the reset frame."""
         self.read_robot_state()
         ready, status = self.startup_readiness()
         if not ready:
             raise RuntimeError(f"Not ready at policy initialization: {status}")
 
-        self.task.reset(self.measure_ee_kp0_plb())
+        if self.high_pose_source == "training":
+            high_kp0, high_ypr = self.training_high_kp0.copy(), self.training_high_ypr.copy()
+        else:
+            high_kp0, high_ypr = self.measure_ee_pose_plb()
+        self.task.reset(high_kp0, high_ypr, self.read_operator_base_reference())
         self.contact_monitor.reset()
         self.last_ll_action[:] = 0.0
         self.leg_target[:] = self.default_leg_pos_policy
@@ -1683,17 +1907,20 @@ class B2WZ1TransportMocapController:
         self.policy_active = True
         self._ee_buttons_prev = {b: int(self.remote_controller.button[b] == 1) for b, _ in EE_TARGET_BUTTONS}
         print(
-            "[TRANSPORT] Policy state initialized | HIGH(reset)="
+            f"[TRANSPORT] Policy state initialized | HIGH[{self.high_pose_source}] kp0="
             + np.array2string(self.task.episode_high_kp0, precision=4)
+            + " ypr=" + np.array2string(self.task.ee_ypr_ref, precision=4)
+            + " base_ref=" + np.array2string(self.task.base_velocity_ref, precision=3)
             + f" | {status}"
         )
 
     def wbc_step(self) -> Optional[str]:
         """One 50 Hz step. Returns a protection reason, or None to continue.
 
-        HL boundary order = sim2sim main loop:
+        HL boundary order = Isaac step() / sim2sim hl_step():
             contact check on the completed transition -> advance references
-            -> actor obs + inference + decode -> WBC.
+            (ref_(t+1)) -> actor obs (ref_(t+1), a_t) + inference + decode
+            -> WBC. Right after reset the filled history is used as is.
         """
         self.read_robot_state()
         if self.remote_controller.button[KeyMap.select] == 1:
@@ -1714,14 +1941,14 @@ class B2WZ1TransportMocapController:
                 # directly (sim2sim infer_first_hl_and_ll_after_reset).
                 self.run_high_level_policy(append_frame=False)
             else:
-                contact, count, drop = self.contact_monitor.update(self.last_puck_d, self.task.settling)
+                contact, count, drop = self.contact_monitor.update(self.last_puck_d)
                 self.last_contact = (contact, count, drop)
                 if drop:
                     return (
                         f"PUCK DROP: no disk contact for {count} HL steps "
                         f"(puck_D={np.round(self.last_puck_d, 4).tolist()})"
                     )
-                event = self.task.advance(self.measure_ee_kp0_plb, self.read_operator_base_reference())
+                event = self.task.advance(self.read_operator_base_reference())
                 if event:
                     print(f"[TRANSPORT] hl={self.hl_tick} {event}")
                 self.run_high_level_policy(append_frame=True)
@@ -1743,14 +1970,19 @@ class B2WZ1TransportMocapController:
     # ------------------------------------------------------------------
 
     HL_LOG_HEADER = (
-        ["t_s", "hl_tick", "settling", "ee_target", "event"]
+        ["t_s", "hl_tick", "ee_target", "event"]
         + [f"base_ref_{a}" for a in ("vx", "vy", "wz")]
         + [f"kp0_ref_{a}" for a in "xyz"] + ["yaw_ref", "pitch_ref", "roll_ref"]
-        + [f"raw_{i}" for i in range(6)] + [f"exec_{i}" for i in range(6)]
+        # raw policy output, clamped a_t (= next obs' previous action), executed residual
+        + [f"raw_{i}" for i in range(6)] + [f"norm_{i}" for i in range(6)] + [f"exec_{i}" for i in range(6)]
         + [f"kp0_cmd_{a}" for a in "xyz"] + ["yaw_cmd", "pitch_cmd", "roll_cmd"]
+        + [f"base_cmd_{a}" for a in ("vx", "vy", "wz")]
+        # actor puck input (base frame) and the contact-proxy puck_D
+        + [f"puck_base_{a}" for a in "xyz"]
         + [f"puck_D_{a}" for a in "xyz"] + ["puck_rho", "contact", "no_contact_steps"]
-        + ["puck_age_ms", "body_age_ms", "base_height"]
-        + [f"kp0_meas_{a}" for a in "xyz"]
+        + ["puck_age_ms", "body_age_ms", "body_frame", "puck_frame", "base_height", "tilt_mocap_imu_deg"]
+        + [f"kp0_meas_{a}" for a in "xyz"] + ["yaw_meas", "pitch_meas", "roll_meas"]
+        + ["hl_infer_ms", "ll_infer_ms"]
         # Cross-check columns: both puck_D sources and the mocap-vs-FK disk.
         + ["disk_source", "disk_age_ms"]
         + [f"puck_D_mocap_{a}" for a in "xyz"] + [f"puck_D_fk_{a}" for a in "xyz"]
@@ -1769,6 +2001,7 @@ class B2WZ1TransportMocapController:
         print(f"[TRANSPORT] HL log: {path}")
 
     def write_hl_log_row(self) -> None:
+        """One row per HL step, written right after decode (cheap: no extra I/O)."""
         if self._log_writer is None:
             return
 
@@ -1779,19 +2012,22 @@ class B2WZ1TransportMocapController:
         snap = self.last_snapshot or {}
         d = self.last_puck_d if self.last_puck_d is not None else np.full(3, np.nan)
         try:
-            kp0_meas = self.measure_ee_kp0_plb()
+            kp0_meas, ypr_meas = self.measure_ee_pose_plb()
         except Exception:  # noqa: BLE001 - logging must never fault the run
-            kp0_meas = np.full(3, np.nan)
+            kp0_meas, ypr_meas = np.full(3, np.nan), np.full(3, np.nan)
+        body, puck = snap.get("body") or {}, snap.get("puck") or {}
         self._log_writer.writerow(
-            [f"{time.monotonic() - self._t_start:.4f}", self.hl_tick, int(t.settling),
+            [f"{time.monotonic() - self._t_start:.4f}", self.hl_tick,
              EE_TARGET_NAMES[t.current_target], t.last_event]
-            + t.base_velocity_ref.tolist() + t.ee_kp0_ref.tolist() + t.rot_ref.tolist()
-            + t.raw_action.tolist() + t.executed_action.tolist()
-            + t.kp0_cmd.tolist() + t.rot_cmd.tolist()
+            + t.base_velocity_ref.tolist() + t.ee_kp0_ref.tolist() + t.ee_ypr_ref.tolist()
+            + t.raw_action.tolist() + t.normalized_action.tolist() + t.executed_action.tolist()
+            + t.kp0_cmd.tolist() + t.rot_cmd.tolist() + t.base_command.tolist()
+            + nan3(self.last_puck_base)
             + d.tolist() + [float(np.hypot(d[0], d[1])), int(self.last_contact[0]), self.last_contact[1]]
-            + [(snap.get("puck") or {}).get("age_ms"), (snap.get("body") or {}).get("age_ms"),
-               self.base_height]
-            + kp0_meas.tolist()
+            + [puck.get("age_ms"), body.get("age_ms"), body.get("frame_number"), puck.get("frame_number"),
+               self.base_height, self.last_tilt_deg]
+            + np.asarray(kp0_meas).tolist() + np.asarray(ypr_meas).tolist()
+            + [round(self.hl_infer_ms, 3), round(self.ll_infer_ms, 3)]
             + [self.disk_frame_source, (snap.get("disk") or {}).get("age_ms")]
             + nan3(self.last_puck_d_mocap) + nan3(self.last_puck_d_fk)
             + (nan3(None) + nan3(None) + [float("nan")] if self.last_disk_check is None else
@@ -1813,25 +2049,30 @@ class B2WZ1TransportMocapController:
     def print_runtime_debug(self) -> None:
         t = self.task
         d = self.last_puck_d if self.last_puck_d is not None else np.full(3, np.nan)
+        pb = self.last_puck_base if self.last_puck_base is not None else np.full(3, np.nan)
         print(
             f"[TRANSPORT] ll={self.ll_tick:06d} hl={self.hl_tick:05d} "
-            f"settle={int(t.settling)} tgt={EE_TARGET_NAMES[t.current_target]} | "
+            f"tgt={EE_TARGET_NAMES[t.current_target]} | "
+            f"puck_base=({pb[0]:+.3f},{pb[1]:+.3f},{pb[2]:+.3f}) "
             f"puck_D=({d[0]:+.3f},{d[1]:+.3f},{d[2]:+.3f}) rho={np.hypot(d[0], d[1]):.3f} "
             f"contact={int(self.last_contact[0])} nc={self.last_contact[1]} | "
             f"base_ref={np.round(t.base_velocity_ref, 2)} base_h={self.base_height:.3f}"
         )
         print(
-            f"            raw={np.round(t.raw_action, 2)} exec={np.round(t.executed_action, 2)} "
+            f"            raw={np.round(t.raw_action, 2)} a={np.round(t.normalized_action, 2)} "
+            f"exec={np.round(t.executed_action, 2)} "
             f"kp0_ref={np.round(t.ee_kp0_ref, 3)} kp0_cmd={np.round(t.kp0_cmd, 3)} "
-            f"rot_cmd={np.round(t.rot_cmd, 3)}"
+            f"ypr_cmd={np.round(t.rot_cmd, 3)}"
         )
         snap = self.last_snapshot or {}
         ages = " ".join(
             f"{k}={(snap.get(k) or {}).get('age_ms'):.1f}ms"
             for k in ("body", "puck", "disk") if (snap.get(k) or {}).get("age_ms") is not None
         )
-        print(f"            mocap age {ages} skipped={(snap.get('mocap') or {}).get('frames_skipped', 0)} | "
-              f"{self.disk_check_status()}")
+        tilt = "n/a" if self.last_tilt_deg is None else f"{self.last_tilt_deg:.2f}"
+        print(f"            mocap age {ages} skipped={(snap.get('mocap') or {}).get('frames_skipped', 0)} "
+              f"tilt(mocap-IMU)={tilt}deg | infer HL {self.hl_infer_ms:.2f}ms (max {self.hl_infer_ms_max:.2f}) "
+              f"WBC {self.ll_infer_ms:.2f}ms (max {self.ll_infer_ms_max:.2f}) | {self.disk_check_status()}")
 
     # ------------------------------------------------------------------
     # Actuation (retrieval sim2real, unchanged)
@@ -2292,9 +2533,11 @@ class B2WZ1TransportMocapController:
     def hold_default_until_ready_and_A(self) -> None:
         """Hold DEFAULT; the operator places the puck; A starts only when ready.
 
-        Ready = valid base + puck mocap AND puck_D inside the training spawn
-        region (centre +/- 1 cm, resting height) widened by the actor's
-        training noise. Re-checked on a fresh snapshot at the A press.
+        Ready = valid base + puck mocap (one NatNet frame) AND puck_D inside the
+        training spawn region (centre +/- 1 cm, resting height) widened by the
+        actor's training noise AND live EE pose within high_pose_max_deviation
+        of the training HIGH AND mocap-vs-IMU tilt within mocap_imu_max_tilt_deg.
+        Re-checked on a fresh snapshot at the A press.
         """
         print("[TRANSPORT] Holding DEFAULT. Place the puck at the disk centre.")
         print("[TRANSPORT] Press A when the gate reads OK to ENABLE the transport policy.")
@@ -2365,6 +2608,12 @@ class B2WZ1TransportMocapController:
         print(f"Low policy  : {self.low_policy_path} (sha256 verified)")
         print("UAN         : NOT LOADED (simulation-only); Z1 firmware POSITION_PD")
         print(f"Z1 gains    : Kp={np.round(self.z1_kp_effective, 3)} Kd={np.round(self.z1_kd_effective, 3)}")
+        print("Actor obs   : NO-SETTLE semantics | prev action = clamped a_(t-1) | "
+              "puck = R_root^T(puck - root), B2+puck from one NatNet frame")
+        print(f"HIGH pose   : {self.high_pose_source} | training kp0={np.round(self.training_high_kp0, 4).tolist()} "
+              f"ypr={np.round(self.training_high_ypr, 4).tolist()} | READY gate "
+              f"{self.high_pose_max_dev_m * 1e3:.0f}mm/{math.degrees(self.high_pose_max_dev_rad):.0f}deg, "
+              f"mocap-IMU tilt <= {self.mocap_imu_max_tilt_deg} deg")
         print(f"Puck        : r={self.puck_radius} h={self.puck_height} (rest z_D={self.puck_rest_height:.3f})")
         disk_src = (
             "MOCAP disk rigid body (Z1 FK = cross-check)" if self.disk_frame_source == "mocap"

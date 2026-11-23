@@ -12,7 +12,9 @@
 #   frozen WBC          50 Hz -> leg / arm / wheel targets
 #   hardware           500 Hz -> zero-order hold of the WBC targets
 #
-# Source of truth for every HL quantity below:
+# Source of truth for every HL quantity below (synchronized 2026-11-20,
+# NO-SETTLE policy):
+#   IsaacLab_huanyu/.../direct/b2wz1_hl_transport_UAN/b2wz1_hl_env.py
 #   unitree_mujoco/simulate_python/configs/b2wz1_hl_transport_uan.yaml
 #   unitree_mujoco/simulate_python/deploy_mujoco/b2wz1_hl_transport_uan.py
 #
@@ -22,17 +24,24 @@
 # and the real Z1 runs the firmware PD that UAN was fitted against.
 #
 # Every key marked [REQUIRED SETUP] is a hardware fact this repository does
-# not know. The script REFUSES TO START until each one is filled in. See
-# deploy/TRANSPORT_SIM2REAL_SETUP.md.
+# not know. The script REFUSES TO START until each one is filled in.
 # ======================================================================
 
 # ----------------------------------------------------------------------
 # ONNX policies, pinned by SHA-256 (the script verifies both on load).
 #
-# high: exported_policies/b2wz1_hl_transport_uan/high_policy.onnx
-#       == unitree_mujoco/exported_policy/b2wz1_hl_transport_uan/high_policy_2.onnx
-#       == Isaac run 2026-10-27_14-31-10_single_beta_6d_four_pose_pos_rate_0p1
-#       192 -> 6, observation normalizer and Beta-mean inside the graph.
+# high: exported_policies/b2wz1_hl_transport_uan/high_policy.onnx (c1497583...)
+#       == unitree_mujoco/exported_policy/b2wz1_hl_transport_uan/high_policy.onnx
+#       == Isaac run 2026-11-20_16-42-06_single_beta_6d_four_pose_pos_rate_0p1
+#          (<run>/exported/policy.onnx)
+#       192 -> 6, observation normalizer and Beta-mean -> 2u-1 inside the
+#       graph: the output is already in (-1, 1); the script only applies the
+#       training clamp.
+#
+#   The OLD high_policy.onnx previously committed at that path
+#   (db783046..., run 2026-10-27_14-31-10) has the SAME 192 -> 6 shape but
+#   was trained with the settle / disk-frame puck / executed-residual
+#   observation. It is listed in legacy_high_policy_sha256 and refused.
 #
 # low:  the frozen WBC THAT RUN WAS TRAINED ON (ll_load_run
 #       2026-10-27_12-47-31_uan_model_4000_multipose20260907), copied
@@ -44,7 +53,10 @@
 #   2026-09-07 WBC validated by deploy/b2wz1_wbc_uan.py and retrieval.
 # ----------------------------------------------------------------------
 high_policy_path: "exported_policies/b2wz1_hl_transport_uan/high_policy.onnx"
-high_policy_sha256: "db78304602566538ea099c3f3a0679bcb9b731067d4e036374ad03cc537b70c1"
+high_policy_sha256: "c149758318c8bb01dc27fe7ad64c9f53de86b37c3bb2b32a6d299a3a103a8848"
+legacy_high_policy_sha256:
+  - "db78304602566538ea099c3f3a0679bcb9b731067d4e036374ad03cc537b70c1"  # 2026-10-27_14-31-10 (settle)
+  - "1a0d36ea25c7bc66fdb8a7eb948462bfb6c59f355b9a8fdb22a06ced88d5c9a7"  # 2026-10-26_17-38-10 (settle)
 low_policy_path: "exported_policies/b2wz1_hl_transport_uan/low_policy.onnx"
 low_policy_sha256: "6b5aa5de8a438c07062ab5d9acd8e9d562ccb7a72f32aad72912f7707139a517"
 
@@ -164,23 +176,43 @@ ee_rot_action_residual_scale: [0.7853981633974483, 0.7853981633974483, 0.7853981
 
 # Task references. Training samples HIGH/LOW/LEFT/RIGHT; on the robot the
 # OPERATOR selects them (D-pad: up=HIGH, down=LOW, left=LEFT, right=RIGHT).
-# HIGH is the EE kp0 MEASURED after the 0.5-s settle, exactly as training.
-reset_settle_time_s: 0.5
+# There is NO settle: the residual is active from the first HL step.
+#
+# HIGH (position AND [yaw, pitch, roll], PLB) = the gripperStator pose of the
+# training RESET state (default joints, base at [0, 0, 0.6017], level), i.e.
+# Isaac _measure_ee_kp0_plb/_ypr_plb before any physics step. Base pose and
+# joints are not randomized at reset, so this is one constant for every
+# episode. Values = float32 of the MuJoCo TransportSim2Sim.reset() measurement
+# (bit-exact; seed-independent). Its orientation is the EE orientation
+# reference of the whole run (all four targets).
+training_high_kp0: [0.5478449463844299, -1.7694179124091187e-19, 1.1165549755096436]
+training_high_ypr: [-3.475701264565128e-18, 0.05999999865889549, 1.5700000524520874]
+# "training" (default): use the constant above -> the policy sees exactly the
+#             HIGH reference it was trained with; the WBC starts with the
+#             small EE error between the standing robot and the reset pose,
+#             as in training.
+# "measured": use the live EE pose at enable (FK + IMU + mocap base height),
+#             as the pre-2026-11-20 deployment did.
+high_pose_source: "training"
+# READY gate: the live EE pose (default arm, standing) must be within this of
+# the training HIGH, otherwise A does not enable the policy. Catches a wrong
+# arm pose, base height or FK before the policy runs.
+high_pose_max_deviation_m: 0.05
+high_pose_max_deviation_deg: 8.0
 # Training resamples the EE target every U(4,5) s. The lower bound is enforced
 # as the minimum time between operator target switches, so no transition is
 # ever requested more often than the policy saw.
 ee_ref_resample_time_range_s: [4.0, 5.0]
 ee_fast_transition_time_s: 1.5
 ee_low_transition_time_s: 2.0
+# PLB kp0 targets HIGH, LOW, LEFT, RIGHT. Entry 0 is only a placeholder:
+# HIGH is replaced by training_high_kp0 (or the measured pose).
 canonical_ee_positions: [
-  [0.547845, -0.00, 1.116555],
-  [0.75,      0.00, 0.35],
-  [0.50,      0.30, 0.80],
-  [0.50,     -0.30, 0.80]
+  [0.547845, 0.00, 1.116555],
+  [0.75,     0.00, 0.35],
+  [0.50,     0.30, 0.80],
+  [0.50,    -0.30, 0.80]
 ]
-canonical_ee_yaw: 0.0
-canonical_ee_pitch: -0.06
-canonical_ee_roll: 1.5707963267948966
 
 # Training base reference range. The operator command is clipped to it.
 base_ref_ranges: [
@@ -209,7 +241,11 @@ command_deadband_ang: 0.2
 #                 +Y_D = Z_D x X_D
 #                 At the DEFAULT arm pose: X_D ~ robot forward, Y_D ~ left,
 #                 Z_D ~ up (to 3.4 deg).
-#   puck_D      = R_D^T (puck_centre - disk_centre)   (actor observation)
+#   puck_D      = R_D^T (puck_centre - disk_centre)
+#
+# puck_D is NO LONGER an actor input (the no-settle policy observes the puck
+# in the base frame, see the OptiTrack section). It drives the contact proxy
+# (puck drop) and the start gate only.
 #
 # disk_frame_source:
 #   "mocap"  (default) D = the Motive DISK rigid body pose. Its pivot and axes
@@ -248,7 +284,7 @@ puck_drop_no_contact_steps: 5
 
 # ----------------------------------------------------------------------
 # [REQUIRED SETUP] Operator-confirmed hardware facts. The script refuses to
-# start while any of these is null/false. See TRANSPORT_SIM2REAL_SETUP.md.
+# start while any of these is null/false.
 # (The Motive puck/disk assets below are required setup as well.)
 # ----------------------------------------------------------------------
 # true once the real puck is measured to be a cylinder of puck_radius x
@@ -299,7 +335,12 @@ z1_debug_print: true
 # ----------------------------------------------------------------------
 # OptiTrack (NatNet). Network + robot body reused from the validated
 # retrieval config. Transport rigid bodies:
-#   body: the B2 (base_link pose -> base height / PLB; FK cross-check)
+#   body: the B2 (base_link pose -> base height / PLB; FK cross-check) AND,
+#         with the puck, the ACTOR input
+#             puck_center_base = R_root^T (puck_W - p_root)
+#         (full roll/pitch/yaw of the B2 asset; both from ONE NatNet frame).
+#         Its pivot/axes calibration therefore enters the observation
+#         directly: ~1 deg of axis error = ~1.5 cm at the puck.
 #   puck: the transported puck (pivot = puck centre)
 #   disk: the gripper disk (pivot + axes = training disk frame D), needed
 #         when disk_frame_source is "mocap"
@@ -346,6 +387,10 @@ mocap_root_offset_path: null
 
 perception_status_print_s: 1.0
 
+# READY gate: tilt between the mocap B2 orientation (rotates puck_base) and
+# the IMU (projected gravity) [deg]. null disables the gate.
+mocap_imu_max_tilt_deg: 3.0
+
 # ----------------------------------------------------------------------
 # Damping protection + manual leg recovery (retrieval values)
 # ----------------------------------------------------------------------
@@ -368,8 +413,9 @@ damping_recover_leg_target: [
 # Logging / debug
 # ----------------------------------------------------------------------
 debug_print_period_steps: 50
-# One CSV row per HL step (refs, raw/executed residual, commands, puck_D,
-# contact proxy, mocap ages, measured EE). Directory relative to repo root.
+# One CSV row per HL step (refs, raw / clamped / executed action, commands,
+# puck_base, puck_D, contact proxy, mocap ages + frame numbers, IMU-mocap
+# tilt, measured EE pose, inference ms). Directory relative to repo root.
 hl_log_enabled: true
 hl_log_dir: "Log/transport"
 

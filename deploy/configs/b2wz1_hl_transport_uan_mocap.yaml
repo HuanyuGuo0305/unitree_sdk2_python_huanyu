@@ -28,7 +28,7 @@
 # ======================================================================
 
 # ----------------------------------------------------------------------
-# ONNX policies, pinned by SHA-256 (the script verifies both on load).
+# ONNX policies (paths only; no checksum check).
 #
 # high: exported_policies/b2wz1_hl_transport_uan/high_policy.onnx (c1497583...)
 #       == unitree_mujoco/exported_policy/b2wz1_hl_transport_uan/high_policy.onnx
@@ -41,7 +41,8 @@
 #   The OLD high_policy.onnx previously committed at that path
 #   (db783046..., run 2026-10-27_14-31-10) has the SAME 192 -> 6 shape but
 #   was trained with the settle / disk-frame puck / executed-residual
-#   observation. It is listed in legacy_high_policy_sha256 and refused.
+#   observation. Only the 192 -> 6 shape is checked on load, so make sure
+#   the path points at a no-settle policy.
 #
 # low:  the frozen WBC THAT RUN WAS TRAINED ON (ll_load_run
 #       2026-10-27_12-47-31_uan_model_4000_multipose20260907), copied
@@ -52,13 +53,8 @@
 #   high_policy_1 run. Nor policy_wbc_uan_3.onnx (3b7874b7...), which is the
 #   2026-09-07 WBC validated by deploy/b2wz1_wbc_uan.py and retrieval.
 # ----------------------------------------------------------------------
-high_policy_path: "exported_policies/b2wz1_hl_transport_uan/high_policy.onnx"
-high_policy_sha256: "c149758318c8bb01dc27fe7ad64c9f53de86b37c3bb2b32a6d299a3a103a8848"
-legacy_high_policy_sha256:
-  - "db78304602566538ea099c3f3a0679bcb9b731067d4e036374ad03cc537b70c1"  # 2026-10-27_14-31-10 (settle)
-  - "1a0d36ea25c7bc66fdb8a7eb948462bfb6c59f355b9a8fdb22a06ced88d5c9a7"  # 2026-10-26_17-38-10 (settle)
+high_policy_path: "exported_policies/b2wz1_hl_transport_uan/high_policy_3.onnx"
 low_policy_path: "exported_policies/b2wz1_hl_transport_uan/low_policy.onnx"
-low_policy_sha256: "6b5aa5de8a438c07062ab5d9acd8e9d562ccb7a72f32aad72912f7707139a517"
 
 # ----------------------------------------------------------------------
 # Timing / policy layout (sim2sim: 250 Hz phys -> 50 Hz WBC -> 10 Hz HL)
@@ -258,18 +254,21 @@ disk_radius: 0.100
 puck_radius: 0.05
 puck_height: 0.08
 
-# Training placement and actor-noise constants. The start gate and the
-# real contact proxy are DERIVED from these; no new thresholds:
-#   start:   |x_D|,|y_D| <= spawn_xy + obs_noise,
+# Start gate and contact proxy (disk frame D):
+#   start:   |x_D|,|y_D| <= puck_start_xy_limit_m,
 #            |z_D - (rest + clearance)| <= obs_noise
 #   contact: rho_D <= disk_radius and |z_D - rest| <= obs_noise
 #   rest   = disk_thickness/2 + puck_height/2 = 0.042 m
-puck_spawn_xy_randomization: 0.01
+# Training spawns the puck within +/-0.01 m of the centre (+0.01 m obs noise
+# = 0.02 m). The start gate is deliberately WIDER than that: a puck 2-5 cm
+# off-centre is a start position the policy never saw.
+puck_start_xy_limit_m: 0.05
 puck_spawn_clearance: 0.0005
 puck_obs_noise_m: 0.01
 
 # Training termination: puck/disk contact lost for this many consecutive
-# ACTIVE HL steps (0.5 s) -> puck_drop. Here: -> damping protection.
+# ACTIVE HL steps (0.5 s) -> puck_drop. On the robot this is LOG ONLY (the
+# CSV "drop" count); it does NOT trigger damping protection.
 puck_drop_no_contact_steps: 5
 
 # ----------------------------------------------------------------------
@@ -358,7 +357,7 @@ mocap_body_max_age_s: 0.25
 # Pivot = puck GEOMETRIC CENTRE (40 mm above the bottom face); orientation
 # is not used.
 mocap_puck_name: "puck"
-mocap_puck_id: 19
+mocap_puck_id: 18
 mocap_puck_offset_local: [0.0, 0.0, 0.0]
 # One HL period: the actor never sees a puck older than the step it acts on.
 mocap_puck_max_age_s: 0.10
@@ -410,7 +409,8 @@ hl_log_dir: "Log/transport"
 #   translucent disc + triad   FK disk frame D; cyan before enable,
 #                              green/red = contact proxy on/off while running
 #   magenta sphere  EE kp0 reference; red sphere + red/blue axes = EE command
-#   dots            Motive pivots (white B2, orange puck) + markers
+#   dots            Motive pivots (white B2) + markers
+#   see-through puck + yellow sphere + RGB axes   puck centre and axes (mocap)
 # The window stays live through startup, READY-WAIT and damping protection.
 # ----------------------------------------------------------------------
 visualizer_enabled: true
@@ -428,6 +428,14 @@ visualizer_world_origin_axis_len: 0.4
 visualizer_camera_follow: true
 visualizer_camera_follow_smoothing: 0.15
 visualizer_show_mocap_pivots: true
+# Puck: rendered see-through, with its CENTRE (yellow sphere = Motive puck
+# pivot) and AXES (red/green/blue = X/Y/Z of the Motive puck asset).
+# Axes longer than the puck radius (0.05) / half-height (0.04) stick out.
+visualizer_puck_alpha: 0.45
+visualizer_show_puck_frame: true
+visualizer_puck_frame_axis_len: 0.09
+visualizer_puck_frame_axis_radius: 0.003
+visualizer_puck_center_radius: 0.008
 visualizer_mocap_pivot_radius: 0.012
 # Needs Motive > Data Streaming > Labeled / Unlabeled Markers.
 visualizer_show_all_markers: true

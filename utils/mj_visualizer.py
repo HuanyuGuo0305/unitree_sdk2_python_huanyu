@@ -322,6 +322,7 @@ class MujocoDebugVisualizer:
         camera_follow: bool = False,
         camera_follow_smoothing: float = 0.15,
         free_joint_names: Optional[Sequence[str]] = None,
+        geom_alpha: Optional[Dict[str, float]] = None,
     ):
         # The robot-only MJCF has no light and no floor, so both are injected
         # into the model here (real geometry, not scene decorations).
@@ -332,6 +333,17 @@ class MujocoDebugVisualizer:
             ground_z=ground_z,
             ground_half_extent=floor_half_extent,
         )
+        # Optional per-geom transparency (e.g. a see-through puck so a frame
+        # drawn at its centre stays visible). Applied to the geom rgba AND its
+        # material, since a material colour takes precedence when rendering.
+        for geom_name, alpha in (geom_alpha or {}).items():
+            gid = mujoco.mj_name2id(self._m, mujoco.mjtObj.mjOBJ_GEOM, str(geom_name))
+            if gid < 0:
+                raise ValueError(f"geom_alpha: geom {geom_name!r} not in {xml_path}")
+            self._m.geom_rgba[gid, 3] = float(alpha)
+            mat_id = int(self._m.geom_matid[gid])
+            if mat_id >= 0:
+                self._m.mat_rgba[mat_id, 3] = float(alpha)
         self._d = mujoco.MjData(self._m)
 
         self._update_hz = float(update_hz)

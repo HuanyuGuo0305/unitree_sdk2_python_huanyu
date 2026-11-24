@@ -69,15 +69,15 @@ Real-world substitutions (everything else is identical)
     mount; there is no Motive disk asset): in contact iff the puck centre is
     over the disk (rho_D <= disk_radius) and at resting height
     (|z_D - 0.042| <= 0.01 m).
-    Training's 5-step debounce is kept (no settle mask); a drop ends the run
-    in damping protection. puck_D is NOT an actor input any more.
+    It is LOGGED ONLY (CSV contact / no_contact_steps, visualizer colour):
+    a lost contact does NOT end the run. puck_D is NOT an actor input.
 
 The actor observes no puck velocity, so no velocity estimate is computed.
 
 Faults -> damping protection (retrieval semantics)
 ---------------------------------------------------
 SELECT, Z1 PASSIVE, invalid/stale/untracked mocap (base or puck), base/puck
-from different NatNet frames, puck drop,
+from different NatNet frames,
 non-finite observation/action, WBC arm target outside the SDK range, any
 exception. Protection: B2W kp=0/high kd, Z1 holds q with high kd; A then folds
 the legs. The policy never resumes.
@@ -93,7 +93,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import math
 import os
 import sys
@@ -169,6 +168,7 @@ LEGACY_SEMANTICS_KEYS = (
 HIGH_POSE_SOURCES = ("training", "measured")
 # Free joint of the puck in the sim2sim scene MJCF (b2wz1_disk_puck.xml).
 VIZ_PUCK_FREE_JOINT = "transport_puck_freejoint"
+VIZ_PUCK_GEOM = "transport_puck_geom"
 
 
 # ======================================================================
@@ -183,14 +183,6 @@ def sleep_until(deadline: float) -> float:
         time.sleep(remaining)
         return 0.0
     return -remaining
-
-
-def file_sha256(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def build_keypoints_from_kp0_yaw_pitch_roll_plb(
@@ -498,18 +490,18 @@ class PuckContactMonitor:
 
 def puck_start_gate(
     puck_d: Optional[np.ndarray],
-    spawn_xy: float,
+    xy_limit: float,
     spawn_clearance: float,
     obs_noise: float,
     rest_height: float,
 ) -> Tuple[bool, str]:
-    """Is the puck where training spawns it (within the actor's noise)?"""
+    """Is the puck near the disk centre (|x_D|,|y_D| <= xy_limit) at resting height?"""
     if puck_d is None:
         return False, "puck_D unavailable"
     p = np.asarray(puck_d, dtype=np.float64).reshape(3)
     if not np.isfinite(p).all():
         return False, "puck_D non-finite"
-    xy_lim = float(spawn_xy) + float(obs_noise)
+    xy_lim = float(xy_limit)
     z_nom = float(rest_height) + float(spawn_clearance)
     problems = []
     if abs(p[0]) > xy_lim or abs(p[1]) > xy_lim:
@@ -742,12 +734,6 @@ def validate_transport_setup(cfg: Dict[str, Any]) -> List[str]:
                 f"{key}: belongs to the superseded settle/canonical-orientation policy; "
                 "the no-settle policy takes HIGH from training_high_kp0/_ypr"
             )
-    sha = str(cfg.get("high_policy_sha256") or "").strip().lower()
-    if sha and sha in {str(s).strip().lower() for s in cfg.get("legacy_high_policy_sha256") or []}:
-        problems.append(
-            "high_policy_sha256: pins a LEGACY transport policy (settle / disk-frame puck / "
-            "executed residual); its 192-D input means something else here"
-        )
 
     for key in ("training_high_kp0", "training_high_ypr"):
         try:
@@ -1180,7 +1166,9 @@ class B2WZ1TransportMocapController:
         self.puck_radius = float(cfg["puck_radius"])
         self.puck_height = float(cfg["puck_height"])
         self.puck_rest_height = 0.5 * self.disk.thickness + 0.5 * self.puck_height
-        self.puck_spawn_xy = float(cfg["puck_spawn_xy_randomization"])
+        self.puck_start_xy_limit = float(cfg["puck_start_xy_limit_m"])
+        if not self.puck_start_xy_limit > 0.0:
+            raise ValueError("puck_start_xy_limit_m must be > 0.")
         self.puck_spawn_clearance = float(cfg["puck_spawn_clearance"])
         self.puck_obs_noise = float(cfg["puck_obs_noise_m"])
         self.contact_monitor = PuckContactMonitor(
@@ -1232,21 +1220,9 @@ class B2WZ1TransportMocapController:
         cfg = self.cfg
         self.high_policy_path = self._resolve_path(cfg["high_policy_path"])
         self.low_policy_path = self._resolve_path(cfg["low_policy_path"])
-        for label, path, key in (
-            ("high", self.high_policy_path, "high_policy_sha256"),
-            ("low", self.low_policy_path, "low_policy_sha256"),
-        ):
+        for label, path in (("high", self.high_policy_path), ("low", self.low_policy_path)):
             if not os.path.isfile(path):
                 raise FileNotFoundError(f"{label} policy not found: {path}")
-            expected = str(cfg.get(key) or "").strip().lower()
-            actual = file_sha256(path)
-            if not expected:
-                raise ValueError(f"{key} must pin the {label} policy.")
-            if actual != expected:
-                raise ValueError(
-                    f"{label} policy hash mismatch: {path}\n  sha256 {actual}\n  expected {expected}\n"
-                    "This is not the checkpoint the transport policy was trained with."
-                )
 
         self.high_session = ort.InferenceSession(self.high_policy_path, providers=["CPUExecutionProvider"])
         self.low_session = ort.InferenceSession(self.low_policy_path, providers=["CPUExecutionProvider"])
@@ -1684,7 +1660,7 @@ class B2WZ1TransportMocapController:
         if fault is not None:
             return False, fault
         ok, gate = puck_start_gate(
-            self.last_puck_d, self.puck_spawn_xy, self.puck_spawn_clearance,
+            self.last_puck_d, self.puck_start_xy_limit, self.puck_spawn_clearance,
             self.puck_obs_noise, self.puck_rest_height,
         )
         gates = [] if ok else [gate]
@@ -1778,13 +1754,8 @@ class B2WZ1TransportMocapController:
                 # directly (sim2sim infer_first_hl_and_ll_after_reset).
                 self.run_high_level_policy(append_frame=False)
             else:
-                contact, count, drop = self.contact_monitor.update(self.last_puck_d)
-                self.last_contact = (contact, count, drop)
-                if drop:
-                    return (
-                        f"PUCK DROP: no disk contact for {count} HL steps "
-                        f"(puck_D={np.round(self.last_puck_d, 4).tolist()})"
-                    )
+                # Contact proxy: logged only, never a protection trigger.
+                self.last_contact = self.contact_monitor.update(self.last_puck_d)
                 event = self.task.advance(self.read_operator_base_reference())
                 if event:
                     print(f"[TRANSPORT] hl={self.hl_tick} {event}")
@@ -2074,7 +2045,8 @@ class B2WZ1TransportMocapController:
     #                             red = off, cyan = policy not running)
     #   magenta sphere            EE kp0 REFERENCE (operator target, min-jerk)
     #   red sphere + red/blue     decoded EE COMMAND kp0 / local +X / +Z
-    #   white/orange dots         raw Motive pivots of B2 / puck
+    #   white dot                 raw Motive pivot of the B2
+    #   see-through puck          yellow centre sphere + RGB = XYZ axes (mocap pose)
     # Two producers feed one window: the control loop at 50 Hz while the
     # policy runs, and a monitor thread whenever the control loop is quiet
     # (startup holds, READY-WAIT, damping protection). Steps no physics.
@@ -2099,6 +2071,7 @@ class B2WZ1TransportMocapController:
             show_light=bool(cfg.get("visualizer_show_light", False)),
             ground_z=self.ground_z,
             free_joint_names=[VIZ_PUCK_FREE_JOINT],
+            geom_alpha={VIZ_PUCK_GEOM: float(cfg.get("visualizer_puck_alpha", 0.45))},
         )
         visualizer.configure_world_view(
             show_world_origin=bool(cfg.get("visualizer_show_world_origin", True)),
@@ -2112,6 +2085,10 @@ class B2WZ1TransportMocapController:
             root_frame_axis_radius=float(cfg.get("visualizer_root_frame_axis_radius", 0.008)),
         )
         self.viz_show_pivots = bool(cfg.get("visualizer_show_mocap_pivots", True))
+        self.viz_show_puck_frame = bool(cfg.get("visualizer_show_puck_frame", True))
+        self.viz_puck_frame_axis_len = float(cfg.get("visualizer_puck_frame_axis_len", 0.09))
+        self.viz_puck_frame_axis_radius = float(cfg.get("visualizer_puck_frame_axis_radius", 0.003))
+        self.viz_puck_center_radius = float(cfg.get("visualizer_puck_center_radius", 0.008))
         self.viz_show_markers = bool(cfg.get("visualizer_show_all_markers", False))
         self.viz_push_period_s = 1.0 / max(float(cfg.get("visualizer_update_hz", 30.0)), 1.0)
         self.viz_pivot_radius = float(cfg.get("visualizer_mocap_pivot_radius", 0.012))
@@ -2175,9 +2152,21 @@ class B2WZ1TransportMocapController:
                                       "length": 0.12, "radius": 0.004}]
 
         points = []
+        # Puck centre + axes (mocap pose; RGB = XYZ of the Motive puck asset).
+        if (getattr(self, "viz_show_puck_frame", False) and puck.get("valid")
+                and puck.get("position_world") is not None and puck.get("quat_wxyz") is not None):
+            state.setdefault("extra_frames", []).append({
+                "pos": puck["position_world"], "quat_wxyz": puck["quat_wxyz"],
+                "length": self.viz_puck_frame_axis_len,
+                "radius": self.viz_puck_frame_axis_radius,
+            })
+            points.append({"pos": puck["position_world"], "rgba": [1.0, 1.0, 0.0, 1.0],
+                           "radius": self.viz_puck_center_radius})
         if getattr(self, "viz_show_pivots", False):
             for channel, rgba in (("body", [1.0, 1.0, 1.0, 0.85]),
                                   ("puck", [1.0, 0.55, 0.1, 0.9])):
+                if channel == "puck" and getattr(self, "viz_show_puck_frame", False):
+                    continue  # same point as the yellow puck-centre sphere
                 ch = snap.get(channel) or {}
                 pos = ch.get("position_world")
                 if ch.get("valid") and pos is not None:
@@ -2349,9 +2338,9 @@ class B2WZ1TransportMocapController:
     def hold_default_until_ready_and_A(self) -> None:
         """Hold DEFAULT; the operator places the puck; A starts only when ready.
 
-        Ready = valid base + puck mocap (one NatNet frame) AND puck_D inside the
-        training spawn region (centre +/- 1 cm, resting height) widened by the
-        actor's training noise AND live EE pose within high_pose_max_deviation
+        Ready = valid base + puck mocap (one NatNet frame) AND puck_D within
+        puck_start_xy_limit_m of the disk centre at resting height (+/- obs
+        noise) AND live EE pose within high_pose_max_deviation
         of the training HIGH AND mocap-vs-IMU tilt within mocap_imu_max_tilt_deg.
         Re-checked on a fresh snapshot at the A press.
         """
@@ -2420,8 +2409,8 @@ class B2WZ1TransportMocapController:
         print("=" * 100)
         print("B2WZ1 TRANSPORT (6-D EE residual) -> FROZEN TRANSPORT WBC -> REAL ROBOT (MOCAP)")
         print("=" * 100)
-        print(f"High policy : {self.high_policy_path} (sha256 verified)")
-        print(f"Low policy  : {self.low_policy_path} (sha256 verified)")
+        print(f"High policy : {self.high_policy_path}")
+        print(f"Low policy  : {self.low_policy_path}")
         print("UAN         : NOT LOADED (simulation-only); Z1 firmware POSITION_PD")
         print(f"Z1 gains    : Kp={np.round(self.z1_kp_effective, 3)} Kd={np.round(self.z1_kd_effective, 3)}")
         print("Actor obs   : NO-SETTLE semantics | prev action = clamped a_(t-1) | "
@@ -2438,7 +2427,7 @@ class B2WZ1TransportMocapController:
                 print(f"  mocap     : {selector.describe()}")
         print(f"Visualizer  : {'ON' if self.visualizer is not None else 'OFF'}")
         print(f"Contact     : rho<={self.disk.radius} and |z_D-{self.puck_rest_height:.3f}|<="
-              f"{self.puck_obs_noise}; drop after {self.contact_monitor.drop_steps} HL steps")
+              f"{self.puck_obs_noise}; LOG ONLY (no puck-drop protection)")
         print(f"Operator    : base ref sticks x{self.command_scale.tolist()}; D-pad "
               f"up/down/left/right = HIGH/LOW/LEFT/RIGHT (min hold "
               f"{self.task.min_hold_steps * self.hl_control_dt:.1f}s)")

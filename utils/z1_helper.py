@@ -1286,6 +1286,14 @@ class Z1ArmAdapter:
         self._last_applied_kp = None
         self._last_applied_kd = None
         self.lowcmd.setGripperGain(float(self.gripper_kp), float(self.gripper_kd))
+        # The gripper TARGET goes out with the very first LOWCMD packet: the
+        # priming sends below would otherwise carry the stale gripper command
+        # (the position measured in PASSIVE at connect), which lets the jaw
+        # drift open before the ramp starts.
+        self.arm.gripperQ = target_gripper
+        self.arm.gripperQd = 0.0
+        self.arm.gripperTau = 0.0
+        self.arm.setGripperCmd(self.arm.gripperQ, self.arm.gripperQd, self.arm.gripperTau)
         time.sleep(0.02)
 
         for _ in range(10):
@@ -1330,6 +1338,8 @@ class Z1ArmAdapter:
             self.arm.qd = qd_cmd_safe
             self.arm.tau = tau_ff
             self.arm.gripperQ = target_gripper
+            self.arm.gripperQd = 0.0
+            self.arm.gripperTau = 0.0
 
             self.arm.setArmCmd(self.arm.q, self.arm.qd, self.arm.tau)
             self.arm.setGripperCmd(

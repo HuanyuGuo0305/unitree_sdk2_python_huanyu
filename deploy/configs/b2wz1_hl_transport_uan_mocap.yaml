@@ -84,7 +84,7 @@ hl_action_dim: 6
 arm_default_transition_s: 4.0
 squat_transition_s: 2.0
 default_transition_s: 2.0
-z1_runtime_settle_s: 0.5
+z1_runtime_settle_s: 0.0
 
 # ----------------------------------------------------------------------
 # Robot defaults, POLICY order (identical to retrieval and to the sim2sim
@@ -241,23 +241,13 @@ command_deadband_ang: 0.2
 #                 +Y_D = Z_D x X_D
 #                 At the DEFAULT arm pose: X_D ~ robot forward, Y_D ~ left,
 #                 Z_D ~ up (to 3.4 deg).
-#   puck_D      = R_D^T (puck_centre - disk_centre)
+#   puck_D      = R_D^T (puck_base - disk_centre_base)
 #
-# puck_D is NO LONGER an actor input (the no-settle policy observes the puck
-# in the base frame, see the OptiTrack section). It drives the contact proxy
-# (puck drop) and the start gate only.
-#
-# disk_frame_source:
-#   "mocap"  (default) D = the Motive DISK rigid body pose. Its pivot and axes
-#            must be set IN MOTIVE to the frame above. puck and disk come from
-#            the same NatNet frame: no B2-asset, Z1-FK or timing error.
-#   "fk"     D = Z1 FK of the gripperStator + the training mount above.
-#            The disk asset (mocap_disk_*) is then OPTIONAL: used for the
-#            cross-check and the view when streamed, never a fault.
-#   The other source is always computed and logged as a cross-check.
-#   Override per run: --disk-frame-source {mocap,fk} on the command line.
+# D is ALWAYS Z1 FK of the gripperStator + the training mount above; there
+# is no Motive disk asset. puck_D is NOT an actor input (the no-settle policy
+# observes the puck in the base frame, see the OptiTrack section). It drives
+# the contact proxy (puck drop) and the start gate only.
 # ----------------------------------------------------------------------
-disk_frame_source: "fk"
 disk_center_offset_gripper: [0.100, 0.045, 0.0]
 disk_x_axis_gripper: [1.0, 0.0, 0.0]
 disk_y_axis_gripper: [0.0, 0.0, -1.0]
@@ -285,7 +275,7 @@ puck_drop_no_contact_steps: 5
 # ----------------------------------------------------------------------
 # [REQUIRED SETUP] Operator-confirmed hardware facts. The script refuses to
 # start while any of these is null/false.
-# (The Motive puck/disk assets below are required setup as well.)
+# (The Motive puck asset below is required setup as well.)
 # ----------------------------------------------------------------------
 # true once the real puck is measured to be a cylinder of puck_radius x
 # puck_height (+/- 2 mm).
@@ -320,8 +310,12 @@ arm_kd_training: [3.0, 4.0, 3.0, 3.0, 3.0, 3.0]
 z1_arm_runtime_mode: "position_pd"
 
 z1_gripper_runtime_mode: "position_pd"
-z1_gripper_kp: 2.5
-z1_gripper_kd: 1500
+# Transport never moves the gripper and no observation contains it: it only
+# has to STAY CLOSED. SDK default firmware gripper gains (8x stiffer than the
+# retrieval 2.5 / 1500, which let the jaw sag open when the arm swings to
+# DEFAULT). Used for startup, READY-WAIT and the policy run.
+z1_gripper_kp: 20.0
+z1_gripper_kd: 2000
 z1_gripper_travel_margin_rad: 0.0
 z1_gripper_q_offset: 0.02367
 z1_gripper_dcmotor_kp: 76.8
@@ -342,8 +336,7 @@ z1_debug_print: true
 #         Its pivot/axes calibration therefore enters the observation
 #         directly: ~1 deg of axis error = ~1.5 cm at the puck.
 #   puck: the transported puck (pivot = puck centre)
-#   disk: the gripper disk (pivot + axes = training disk frame D), needed
-#         when disk_frame_source is "mocap"
+# (No disk asset: the disk frame D comes from Z1 FK.)
 # As in retrieval, every pivot is placed IN MOTIVE; *_offset_local stays
 # [0, 0, 0] unless you deliberately add a constant pivot correction here.
 # ----------------------------------------------------------------------
@@ -369,17 +362,6 @@ mocap_puck_id: 19
 mocap_puck_offset_local: [0.0, 0.0, 0.0]
 # One HL period: the actor never sees a puck older than the step it acts on.
 mocap_puck_max_age_s: 0.10
-
-# [REQUIRED SETUP, disk_frame_source "mocap"] Motive asset of the disk.
-# Markers on the gripperStator housing / disk underside or rim (rigid with
-# the disk; NOT on the top face, NOT on the moving jaw). Pivot = disk centre
-# at mid-thickness; axes = training disk frame D (see the disk section).
-# READY-WAIT prints "disk mocap-FK: dpos_D=... drpy_D=..." = the correction
-# still left between this asset and the FK disk.
-mocap_disk_name: "disk"
-mocap_disk_id: 18
-mocap_disk_offset_local: [0.0, 0.0, 0.0]
-mocap_disk_max_age_s: 0.10
 
 # Root frame == base_link, as in the validated retrieval setup.
 mocap_root_frame_is_base_link: true
@@ -414,7 +396,7 @@ damping_recover_leg_target: [
 # ----------------------------------------------------------------------
 debug_print_period_steps: 50
 # One CSV row per HL step (refs, raw / clamped / executed action, commands,
-# puck_base, puck_D, contact proxy, mocap ages + frame numbers, IMU-mocap
+# puck_base, puck_D (FK disk), contact proxy, mocap ages + frame numbers, IMU-mocap
 # tilt, measured EE pose, inference ms). Directory relative to repo root.
 hl_log_enabled: true
 hl_log_dir: "Log/transport"
@@ -425,10 +407,10 @@ hl_log_dir: "Log/transport"
 # unitree_mujoco_huanyu/simulate_python/configs/b2wz1_hl_transport_uan.yaml).
 #   robot           mocap root pose + joint encoders (disk mesh = Z1 FK)
 #   orange puck     the MuJoCo puck body placed at the MOCAP puck pose
-#   translucent disc + triad   MOCAP disk pose; cyan before enable,
+#   translucent disc + triad   FK disk frame D; cyan before enable,
 #                              green/red = contact proxy on/off while running
 #   magenta sphere  EE kp0 reference; red sphere + red/blue axes = EE command
-#   dots            Motive pivots (white B2, orange puck, cyan disk) + markers
+#   dots            Motive pivots (white B2, orange puck) + markers
 # The window stays live through startup, READY-WAIT and damping protection.
 # ----------------------------------------------------------------------
 visualizer_enabled: true
